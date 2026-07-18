@@ -78,8 +78,7 @@ def test_prune_retained_clears_old_tools() -> None:
 
 def test_retain_prune_only_under_pressure() -> None:
     """Under budget: size prune ok, retain-prune must not wipe history."""
-    budget = ContextBudget(
-        max_chars=500_000,
+    budget = ContextBudget.from_max_chars(500_000,
         threshold_percent=90,
         tool_result_max_chars=50_000,
         retain_recent_tool_messages=2,
@@ -95,7 +94,7 @@ def test_retain_prune_only_under_pressure() -> None:
 
 
 def test_needs_compaction_threshold_percent() -> None:
-    budget = ContextBudget(max_chars=1000, threshold_percent=50)
+    budget = ContextBudget.from_max_chars(1000, threshold_percent=50)
     small = [Message(role=Role.USER, content="hi")]
     assert not needs_compaction(small, budget)
     big = _msgs_with_big_tools(5, 500)
@@ -103,8 +102,7 @@ def test_needs_compaction_threshold_percent() -> None:
 
 
 def test_fold_keeps_system_and_recent() -> None:
-    budget = ContextBudget(
-        max_chars=8_000,
+    budget = ContextBudget.from_max_chars(8_000,
         threshold_percent=30,
         keep_recent_messages=4,
         tool_result_max_chars=200,
@@ -125,7 +123,7 @@ def test_fold_keeps_system_and_recent() -> None:
 
 
 def test_suppress_blocks_auto_compact() -> None:
-    budget = ContextBudget(max_chars=1000, threshold_percent=20, tool_result_max_chars=50)
+    budget = ContextBudget.from_max_chars(1000, threshold_percent=20, tool_result_max_chars=50)
     msgs = _msgs_with_big_tools(10, 400)
     sup = CompactionSuppressor()
     sup.mark_sticky_failure()
@@ -189,8 +187,7 @@ def test_memory_flush_writes_store(tmp_path: Path) -> None:
 
 
 def test_segments_mode_writes_files(tmp_path: Path) -> None:
-    budget = ContextBudget(
-        max_chars=5_000,
+    budget = ContextBudget.from_max_chars(5_000,
         threshold_percent=25,
         keep_recent_messages=4,
         tool_result_max_chars=100,
@@ -217,7 +214,8 @@ def test_mode_transcript_hint() -> None:
 
 
 def test_disabled_budget_noop() -> None:
-    budget = ContextBudget(enabled=False, max_chars=10, threshold_percent=10)
+    budget = ContextBudget.from_max_chars(10, enabled=False, threshold_percent=10)
+
     msgs = _msgs_with_big_tools(5, 2000)
     result = ContextCompactor(budget=budget).ensure(msgs)
     assert not result.did_compact
@@ -352,8 +350,7 @@ def test_rewind_from_checkpoint(tmp_path: Path) -> None:
 def test_thrash_cooldown_allows_prune_and_recovers() -> None:
     """Thrash must not freeze prune forever; cool-down then allow fold again."""
     c = ContextCompactor(
-        budget=ContextBudget(
-            max_chars=2_000,
+        budget=ContextBudget.from_max_chars(2_000,
             threshold_percent=30,
             tool_result_max_chars=200,
             retain_recent_tool_messages=2,
@@ -407,7 +404,7 @@ def test_summary_end_marker_and_protect_decay() -> None:
 
     assert "END OF CONTEXT SUMMARY" in SUMMARY_END_MARKER
     c = ContextCompactor(
-        budget=ContextBudget(max_chars=2000, threshold_percent=20, protect_first_n=3),
+        budget=ContextBudget.from_max_chars(2000, threshold_percent=20, protect_first_n=3),
         flush_config=MemoryFlushConfig(enabled=False),
     )
     assert c._effective_protect_first_n() == 3
@@ -474,8 +471,7 @@ def test_fold_reinjects_p0_when_middle_dropped() -> None:
         "1. [critical]: rethink auth path\n"
         "── end shadow P0 ──"
     )
-    budget = ContextBudget(
-        max_chars=3_000,
+    budget = ContextBudget.from_max_chars(3_000,
         threshold_percent=20,
         keep_recent_messages=2,
         tool_result_max_chars=80,
@@ -549,8 +545,7 @@ def test_retain_then_fold_reinjects_short_p0() -> None:
                 name="search_replace",
             )
         )
-    budget = ContextBudget(
-        max_chars=2_500,
+    budget = ContextBudget.from_max_chars(2_500,
         threshold_percent=25,
         keep_recent_messages=2,
         tool_result_max_chars=120,
@@ -596,8 +591,7 @@ def test_cjk_weighted_budget() -> None:
 
 
 def test_fold_writes_checkpoint(tmp_path: Path) -> None:
-    budget = ContextBudget(
-        max_chars=3_000,
+    budget = ContextBudget.from_max_chars(3_000,
         threshold_percent=25,
         keep_recent_messages=2,
         tool_result_max_chars=80,
@@ -649,8 +643,7 @@ def test_loop_compacts_before_sample(tmp_path: Path) -> None:
             seen_sizes.append(estimate_chars(messages))
             return SampleResult(content="done early")
 
-    budget = ContextBudget(
-        max_chars=5_000,
+    budget = ContextBudget.from_max_chars(5_000,
         threshold_percent=40,
         keep_recent_messages=4,
         tool_result_max_chars=150,
@@ -672,3 +665,60 @@ def test_loop_compacts_before_sample(tmp_path: Path) -> None:
     assert seen_sizes
     systems = [m.content or "" for m in result.messages if m.role is Role.SYSTEM]
     assert systems and "KEEP_SYSTEM" in systems[0]
+
+
+def test_runner_binds_model_window_from_sampler(tmp_path: Path) -> None:
+    """AgentTurnRunner residual: ModelConfig.context_window → compactor budget."""
+    from codedoggy.model.types import ModelConfig
+    from codedoggy.tools import ToolRegistryBuilder
+    from codedoggy.turn.runner import AgentTurnRunner, _bind_compactor_model_window
+    from codedoggy.turn.types import SampleResult
+
+    class FakeClient:
+        def __init__(self) -> None:
+            self.config = ModelConfig(
+                provider="openai_compat",
+                model="t",
+                base_url="http://localhost",
+                context_window=32_000,
+                max_tokens=2_048,
+            )
+
+        def complete(self, messages, tools=None):
+            from codedoggy.model.types import CompletionResult
+
+            return CompletionResult(content="hi", model="t")
+
+    class FakeSampler:
+        def __init__(self) -> None:
+            self.client = FakeClient()
+
+        def sample(self, messages, tools):
+            return SampleResult(content="hi")
+
+    budget = ContextBudget(context_window=8_192, completion_reserve=512)
+    compactor = ContextCompactor(
+        budget=budget, flush_config=MemoryFlushConfig(enabled=False)
+    )
+    _bind_compactor_model_window(compactor, FakeSampler())
+    assert compactor.budget.context_window == 32_000
+    assert compactor.budget.completion_reserve == 2_048
+
+    # Full run path also binds
+    tools = ToolRegistryBuilder.new().finalize()
+    runner = AgentTurnRunner(
+        sampler=FakeSampler(),
+        tools=tools,
+        context_compactor=ContextCompactor(
+            budget=ContextBudget(context_window=4_096),
+            flush_config=MemoryFlushConfig(enabled=False),
+        ),
+    )
+    from codedoggy.session import Session
+
+    s = Session.create(tmp_path)
+    s.bind_turn_runner(runner)
+    r = s.handle_prompt("ping")
+    assert r.status.value == "completed"
+    assert runner.context_compactor.budget.context_window == 32_000
+    s.close()

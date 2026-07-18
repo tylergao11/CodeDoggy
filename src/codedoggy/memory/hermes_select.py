@@ -100,14 +100,44 @@ class HermesMemorySelector:
         )
         if not query:
             return []
-        exclude = None
+        extra = request.extra or {}
+        # Roles: default user+assistant — exclude raw tool dumps from FTS hits
+        # unless the caller explicitly requests other roles.
+        roles = extra.get("roles")
+        if roles is None:
+            roles = ["user", "assistant"]
+        elif not roles:
+            roles = None  # explicit empty → no role filter
+        else:
+            roles = [str(r) for r in roles]
+
+        cwd = extra.get("cwd")
+        cwd_s = str(cwd) if cwd else None
+
+        # Optional hard filter to one session (extra.session_id), else None.
+        session_filter = extra.get("session_id")
+        if isinstance(session_filter, str) and session_filter.strip():
+            session_filter = session_filter.strip()
+        else:
+            session_filter = None
+
+        # include_current_session=False → cross-session only (exclude current).
+        # When True, prior turns of the same session_id may match (no exclude).
+        exclude: str | None = None
         if not self.include_current_session and request.session_id:
             exclude = request.session_id
+            # Filtering *to* the excluded session is empty — drop the filter.
+            if session_filter == exclude:
+                session_filter = None
+
         try:
             hits = self.session_store.search(
                 query,
                 limit=request.max_session_hits,
                 exclude_session_id=exclude,
+                session_id=session_filter,
+                cwd=cwd_s,
+                roles=roles,
             )
         except Exception:  # noqa: BLE001
             return []

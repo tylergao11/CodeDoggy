@@ -71,14 +71,23 @@ class EventDebouncer:
                     except OSError:
                         key = str(p)
                     prev = self._pending.get(key)
-                    if prev is not None and prev.kind is FileEventKind.Removed:
-                        continue
+                    # Atomic save: Removed then Created → net Modified/Created
+                    # (never keep Removed if a later create/modify arrives).
                     if event.kind is FileEventKind.Removed:
                         self._pending[key] = FileEvent.removed(p)
                     elif event.kind is FileEventKind.Created:
-                        self._pending[key] = FileEvent.created(p)
+                        if prev is not None and prev.kind is FileEventKind.Removed:
+                            # Atomic rewrite: treat as modified
+                            self._pending[key] = FileEvent.modified(p)
+                        else:
+                            self._pending[key] = FileEvent.created(p)
                     else:
-                        self._pending[key] = FileEvent.modified(p)
+                        if prev is not None and prev.kind is FileEventKind.Removed:
+                            self._pending[key] = FileEvent.modified(p)
+                        elif prev is not None and prev.kind is FileEventKind.Created:
+                            self._pending[key] = FileEvent.created(p)
+                        else:
+                            self._pending[key] = FileEvent.modified(p)
             self._arm_timer_unlocked()
 
     def flush_now(self) -> None:
@@ -134,12 +143,18 @@ class WorkspaceWatcher:
         *,
         registry: LanguageRegistry | None = None,
         debounce_secs: float = DEFAULT_DEBOUNCE_SECS,
+        on_events_applied: Callable[[], None] | None = None,
     ) -> None:
         self.root = Path(root).resolve()
         self.manager = manager
         self.registry = registry or LanguageRegistry()
+        self._on_events_applied = on_events_applied
         self._debouncer = EventDebouncer(self._deliver, debounce_secs=debounce_secs)
         self._observer: Observer | None = None
+
+    def set_manager(self, manager: IndexManager) -> None:
+        """Point deliveries at a new IndexManager after reindex (no restart)."""
+        self.manager = manager
 
     def start(self) -> None:
         if self.is_running():
@@ -210,3 +225,8 @@ class WorkspaceWatcher:
                 filtered.append(FileEvent(keep, e.kind))
         if filtered:
             self.manager.send_events(filtered)
+            if self._on_events_applied is not None:
+                try:
+                    self._on_events_applied()
+                except Exception:  # noqa: BLE001
+                    logger.exception("on_events_applied failed")

@@ -16,6 +16,8 @@ match the crate.
 
 from __future__ import annotations
 
+import fnmatch
+import logging
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -24,6 +26,8 @@ from pathlib import Path
 from codedoggy.graph.index import ScopeGraphIndex
 from codedoggy.graph.languages import FileExtract, LanguageRegistry
 from codedoggy.graph.types import FileMeta, SymbolAlias, SymbolOccurrence
+
+logger = logging.getLogger(__name__)
 
 # index_manager.rs
 MAX_INDEXABLE_FILE_SIZE: int = 5 * 1024 * 1024
@@ -165,22 +169,23 @@ class IndexBuilder:
             chunk = [(i + j, batch[i + j]) for j in range(min(self.chunk_size, len(batch) - i))]
             chunks.append(chunk)
 
-        def _run_chunk(
-            items: list[tuple[int, Path]],
-        ) -> list[tuple[int, FileSymbols | None]]:
-            out: list[tuple[int, FileSymbols | None]] = []
-            for idx, path in items:
-                out.append((idx, self._process_file_fast(path, root)))
-            return out
+        def _run_one(idx: int, path: Path) -> tuple[int, FileSymbols | None]:
+            try:
+                return idx, self._process_file_fast(path, root)
+            except Exception:  # noqa: BLE001 — per-file isolation
+                logger.exception("extract failed for %s", path)
+                return idx, None
 
         with ThreadPoolExecutor(max_workers=workers) as pool:
-            futs = [pool.submit(_run_chunk, ch) for ch in chunks]
+            futs = []
+            for ch in chunks:
+                for idx, path in ch:
+                    futs.append(pool.submit(_run_one, idx, path))
             for fut in as_completed(futs):
                 try:
-                    for idx, syms in fut.result():
-                        results[idx] = syms
-                except Exception:
-                    # One chunk failure must not kill the whole index
+                    idx, syms = fut.result()
+                    results[idx] = syms
+                except Exception:  # noqa: BLE001
                     continue
         return results
 
@@ -224,26 +229,51 @@ class IndexBuilder:
         )
 
     def _collect_files(self, root: Path) -> list[Path]:
-        git_files = self._collect_files_git(root)
-        if git_files is not None and git_files:
-            return git_files
-        return self._collect_files_walk(root)
+        """Collect indexable source files.
+
+        When ``respect_gitignore`` is True:
+          1. Prefer ``git ls-files --cached --others --exclude-standard``
+             (tracked + untracked, minus ignore rules).
+          2. Else walk the tree applying ``.gitignore`` patterns.
+        When False: plain walk (skip only known junk dirs / hidden).
+        """
+        if self.respect_gitignore:
+            git_files = self._collect_files_git(root)
+            if git_files is not None:
+                return git_files
+            return self._collect_files_walk(root, use_gitignore=True)
+        return self._collect_files_walk(root, use_gitignore=False)
 
     def _collect_files_git(self, root: Path) -> list[Path] | None:
+        """Return supported paths via git, or None if git unavailable / not a repo."""
         try:
             import subprocess
 
             r = subprocess.run(
-                ["git", "-C", str(root), "ls-files"],
+                [
+                    "git",
+                    "-C",
+                    str(root),
+                    "ls-files",
+                    "-z",
+                    "--cached",
+                    "--others",
+                    "--exclude-standard",
+                ],
                 capture_output=True,
-                text=True,
                 timeout=60,
                 check=False,
             )
             if r.returncode != 0:
                 return None
             out: list[Path] = []
-            for line in r.stdout.splitlines():
+            for raw in r.stdout.split(b"\0"):
+                if not raw:
+                    continue
+                try:
+                    line = raw.decode("utf-8")
+                except UnicodeDecodeError:
+                    line = raw.decode("utf-8", errors="replace")
                 line = line.strip()
                 if not line:
                     continue
@@ -255,21 +285,165 @@ class IndexBuilder:
         except Exception:
             return None
 
-    def _collect_files_walk(self, root: Path) -> list[Path]:
+    def _collect_files_walk(
+        self, root: Path, *, use_gitignore: bool = False
+    ) -> list[Path]:
+        """Filesystem walk; optionally honor .gitignore files found along the way."""
         out: list[Path] = []
+        # dir_rel (posix, "" for root) -> stacked ignore matchers from root→dir
+        ignore_stack: dict[str, list[_GitIgnoreFile]] = {"": []}
+        if use_gitignore:
+            root_gi = root / ".gitignore"
+            if root_gi.is_file():
+                ignore_stack[""] = [_GitIgnoreFile.load(root_gi, base_rel="")]
+
         for dirpath, dirnames, filenames in os.walk(root):
+            dir_path = Path(dirpath)
+            try:
+                rel_dir = dir_path.resolve().relative_to(root).as_posix()
+            except ValueError:
+                rel_dir = ""
+            if rel_dir == ".":
+                rel_dir = ""
+
+            if use_gitignore and rel_dir:
+                parent_key = str(Path(rel_dir).parent.as_posix())
+                if parent_key == ".":
+                    parent_key = ""
+                inherited = list(ignore_stack.get(parent_key, ignore_stack[""]))
+                local_gi = dir_path / ".gitignore"
+                if local_gi.is_file():
+                    inherited = inherited + [
+                        _GitIgnoreFile.load(local_gi, base_rel=rel_dir)
+                    ]
+                ignore_stack[rel_dir] = inherited
+
+            matchers = ignore_stack.get(rel_dir, ignore_stack[""]) if use_gitignore else []
+
             keep: list[str] = []
             for d in dirnames:
                 if d in _SKIP_DIR_NAMES:
                     continue
                 if self.skip_hidden and d.startswith("."):
                     continue
+                child_rel = f"{rel_dir}/{d}" if rel_dir else d
+                if use_gitignore and _is_ignored(child_rel, is_dir=True, matchers=matchers):
+                    continue
                 keep.append(d)
             dirnames[:] = keep
+
             for name in filenames:
                 if self.skip_hidden and name.startswith("."):
                     continue
-                path = Path(dirpath) / name
+                child_rel = f"{rel_dir}/{name}" if rel_dir else name
+                if use_gitignore and _is_ignored(
+                    child_rel, is_dir=False, matchers=matchers
+                ):
+                    continue
+                path = dir_path / name
                 if self.registry.is_supported(path):
                     out.append(path)
         return out
+
+
+@dataclass
+class _GitIgnoreRule:
+    """One .gitignore line (simplified: glob, optional dir-only, optional negation)."""
+
+    pattern: str
+    negated: bool = False
+    dir_only: bool = False
+    anchored: bool = False  # leading slash → relative to this ignore file base
+
+
+@dataclass
+class _GitIgnoreFile:
+    base_rel: str  # directory containing this .gitignore, relative to root
+    rules: list[_GitIgnoreRule]
+
+    @classmethod
+    def load(cls, path: Path, *, base_rel: str) -> _GitIgnoreFile:
+        rules: list[_GitIgnoreRule] = []
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return cls(base_rel=base_rel, rules=rules)
+        for line in text.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            negated = False
+            if line.startswith("!"):
+                negated = True
+                line = line[1:]
+            dir_only = line.endswith("/")
+            if dir_only:
+                line = line.rstrip("/")
+            anchored = line.startswith("/")
+            if anchored:
+                line = line.lstrip("/")
+            if not line:
+                continue
+            rules.append(
+                _GitIgnoreRule(
+                    pattern=line,
+                    negated=negated,
+                    dir_only=dir_only,
+                    anchored=anchored,
+                )
+            )
+        return cls(base_rel=base_rel, rules=rules)
+
+    def match(self, rel_path: str, *, is_dir: bool) -> bool | None:
+        """Return True if ignored, False if explicitly un-ignored, None if no match."""
+        # Path relative to this ignore file's directory
+        if self.base_rel:
+            prefix = self.base_rel + "/"
+            if not rel_path.startswith(prefix) and rel_path != self.base_rel:
+                return None
+            local = (
+                rel_path[len(prefix) :]
+                if rel_path.startswith(prefix)
+                else ""
+            )
+        else:
+            local = rel_path
+        if not local and rel_path != self.base_rel:
+            return None
+
+        result: bool | None = None
+        name = local.rsplit("/", 1)[-1] if local else ""
+        for rule in self.rules:
+            if rule.dir_only and not is_dir:
+                continue
+            pat = rule.pattern
+            matched = False
+            if rule.anchored or "/" in pat.rstrip("/"):
+                # Match against full path relative to ignore base
+                matched = fnmatch.fnmatch(local, pat) or fnmatch.fnmatch(
+                    local, pat.rstrip("/")
+                )
+                # Also allow ** style suffix: pat matches any depth if unanchored w/ slash
+                if not matched and not rule.anchored and "/" not in pat:
+                    matched = fnmatch.fnmatch(name, pat)
+            else:
+                # Basename match at any level under this base
+                matched = fnmatch.fnmatch(name, pat) or fnmatch.fnmatch(local, pat)
+                if not matched and "/" in local:
+                    # e.g. pattern "*.pyc" matches nested files
+                    matched = fnmatch.fnmatch(name, pat)
+            if matched:
+                result = not rule.negated
+        return result
+
+
+def _is_ignored(
+    rel_path: str, *, is_dir: bool, matchers: list[_GitIgnoreFile]
+) -> bool:
+    """Last matching rule across stacked matchers wins (gitignore semantics)."""
+    ignored = False
+    for m in matchers:
+        hit = m.match(rel_path, is_dir=is_dir)
+        if hit is not None:
+            ignored = hit
+    return ignored

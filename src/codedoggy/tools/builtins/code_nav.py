@@ -23,11 +23,14 @@ _DESCRIPTION = """\
 Navigate the workspace code graph (GitHub-style go-to-definition / find-references).
 
 Actions:
-  - definition: find where a symbol is defined
-  - references: find call/use sites (optionally include definition)
-  - at_position: resolve identifier at file:line:col then definition
-  - stats: index size (files / defs / refs)
-  - reindex: rebuild the index for the workspace
+  - definition: find where a symbol is defined (read-only)
+  - references: find call/use sites (optionally include definition; read-only)
+  - at_position: resolve identifier at file:line:col then definition (read-only)
+  - stats: index size files/defs/refs (read-only)
+  - reindex: full rebuild; writes/updates workspace cache (.goto_index.json)
+
+Query actions are Search-kind (allowed under read-only explore). reindex mutates
+the on-disk graph cache under the workspace root when caching is enabled.
 
 Prefer symbol name when you know it. Use at_position when you have a cursor
 from a prior read_file line. Paths are relative to session cwd.
@@ -96,6 +99,23 @@ class CodeNavTool(Tool):
             )
 
         if action == "reindex":
+            # reindex mutates the in-memory graph and may write .goto_index.json.
+            # ToolKind is Search (read-only explore), so gate only check_read —
+            # enforce write policy here, fail closed when policy denies writes.
+            policy = (ctx.extra or {}).get("policy")
+            if policy is not None:
+                check_w = getattr(policy, "check_write", None)
+                if callable(check_w):
+                    # Sentinel = actual cache path name (not .codedoggy/ which is deny-listed)
+                    from codedoggy.graph.cache import CACHE_FILE_NAME
+
+                    wd = check_w(CACHE_FILE_NAME)
+                    if wd is not None and not getattr(wd, "allowed", True):
+                        raise ToolError(
+                            getattr(wd, "reason", None)
+                            or f"reindex denied by policy (write to {CACHE_FILE_NAME})",
+                            code=getattr(wd, "code", None) or "policy_denied",
+                        )
             reindex = getattr(graph, "reindex", None)
             if not callable(reindex):
                 raise ToolError("graph.reindex not supported", code="not_available")

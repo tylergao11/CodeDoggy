@@ -9,20 +9,86 @@ if TYPE_CHECKING:
 
 
 def register_builtins(builder: ToolRegistryBuilder) -> None:
+    from codedoggy.tools.builtins.apply_patch import ApplyPatchTool
+    from codedoggy.tools.builtins.ask_user_question import AskUserQuestionTool
     from codedoggy.tools.builtins.code_nav import CodeNavTool
+    from codedoggy.tools.builtins.enter_plan_mode import EnterPlanModeTool
+    from codedoggy.tools.builtins.exit_plan_mode import ExitPlanModeTool
+    from codedoggy.tools.builtins.get_task_output import GetTaskOutputTool
     from codedoggy.tools.builtins.grep import GrepTool
+    from codedoggy.tools.builtins.image_gen import ImageEditTool, ImageGenTool
+    from codedoggy.tools.builtins.video_gen import ImageToVideoTool, ReferenceToVideoTool
+    from codedoggy.tools.builtins.kill_task import KillTaskTool
     from codedoggy.tools.builtins.list_dir import ListDirTool
+    from codedoggy.tools.builtins.lsp import LspTool
     from codedoggy.tools.builtins.memory import MemoryTool
+    from codedoggy.tools.builtins.memory_get import MemoryGetTool
+    from codedoggy.tools.builtins.memory_search import MemorySearchTool
+    from codedoggy.tools.builtins.monitor import MonitorTool
     from codedoggy.tools.builtins.read_file import ReadFileTool
     from codedoggy.tools.builtins.run_terminal_cmd import RunTerminalCmdTool
+    from codedoggy.tools.builtins.scheduler_tools import (
+        SchedulerCreateTool,
+        SchedulerDeleteTool,
+        SchedulerListTool,
+    )
     from codedoggy.tools.builtins.search_replace import SearchReplaceTool
+    from codedoggy.tools.builtins.search_tool import SearchToolTool
     from codedoggy.tools.builtins.session_search import SessionSearchTool
+    from codedoggy.tools.builtins.parallel_tasks import ParallelTasksTool
+    from codedoggy.tools.builtins.spawn_subagent import (
+        GetSubagentOutputTool,
+        TaskTool,
+    )
+    from codedoggy.tools.builtins.todo_write import TodoWriteTool
+    from codedoggy.tools.builtins.update_goal import UpdateGoalTool
+    from codedoggy.tools.builtins.use_tool import UseToolTool
+    from codedoggy.tools.builtins.wait_tasks import WaitTasksTool
+    from codedoggy.tools.builtins.web_fetch import WebFetchTool
+    from codedoggy.tools.builtins.web_search import WebSearchTool
+    from codedoggy.tools.builtins.write import WriteTool
 
+    # Core coding surface (GrokBuild wire ids)
     builder.register(ReadFileTool())
     builder.register(SearchReplaceTool())
+    builder.register(WriteTool())
+    builder.register(ApplyPatchTool())
     builder.register(ListDirTool())
     builder.register(GrepTool())
     builder.register(RunTerminalCmdTool())
+    builder.register(LspTool())
+    builder.register(ImageGenTool())
+    builder.register(ImageEditTool())
+    builder.register(ImageToVideoTool())
+    builder.register(ReferenceToVideoTool())
+    # Background task subsystem
+    builder.register(GetTaskOutputTool())
+    builder.register(WaitTasksTool())
+    builder.register(KillTaskTool())
+    builder.register(MonitorTool())
+    # Orchestration
+    builder.register(TodoWriteTool())
+    builder.register(UpdateGoalTool())
+    builder.register(EnterPlanModeTool())
+    builder.register(ExitPlanModeTool())
+    builder.register(AskUserQuestionTool())
+    builder.register(TaskTool())  # wire id `task` → product spawn_subagent
+    builder.register(ParallelTasksTool())  # MAIN-opt-in multi-spawn (not auto)
+    builder.register(GetSubagentOutputTool())  # legacy; not in product list
+    # Web
+    builder.register(WebFetchTool())
+    builder.register(WebSearchTool())
+    # MCP discovery / dispatch (host injects mcp_tools + mcp_dispatch)
+    builder.register(SearchToolTool())
+    builder.register(UseToolTool())
+    # Scheduler
+    builder.register(SchedulerCreateTool())
+    builder.register(SchedulerDeleteTool())
+    builder.register(SchedulerListTool())
+    # Memory
     builder.register(MemoryTool())
+    builder.register(MemorySearchTool())
+    builder.register(MemoryGetTool())
+    # CodeDoggy enhancements
     builder.register(SessionSearchTool())
     builder.register(CodeNavTool())

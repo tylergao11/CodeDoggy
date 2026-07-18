@@ -38,9 +38,18 @@ def save_index(path: Path | str, index: ScopeGraphIndex) -> None:
     path.write_text(json.dumps(data), encoding="utf-8")
 
 
+class CacheFormatError(ValueError):
+    """Raised when on-disk cache format_version does not match this build."""
+
+
 def load_index(path: Path | str) -> ScopeGraphIndex:
     path = Path(path)
     raw = json.loads(path.read_text(encoding="utf-8"))
+    ver = raw.get("format_version")
+    if ver != CACHE_FORMAT_VERSION:
+        raise CacheFormatError(
+            f"cache format_version mismatch: got {ver!r}, want {CACHE_FORMAT_VERSION}"
+        )
     index = ScopeGraphIndex()
     index.query_version = QueryVersion.from_wire(raw.get("query_version"))
     for name, locs in (raw.get("definitions") or {}).items():
@@ -54,6 +63,13 @@ def load_index(path: Path | str) -> ScopeGraphIndex:
             index.references[name].append((p, line))
             index._files.add(p)
     for alias, original in (raw.get("aliases") or {}).items():
+        # Path-scoped keys ("rel/path::alias") are stored as-is for remove_file cleanup.
+        if "::" in alias and not alias.startswith("::"):
+            # Restore path-scoped + bare without double-scoping
+            path_part, bare = alias.split("::", 1)
+            if path_part and bare:
+                index.add_alias(bare, original, path=path_part)
+                continue
         index.add_alias(alias, original)
     for p, m in (raw.get("file_meta") or {}).items():
         index.file_meta[p] = FileMeta(

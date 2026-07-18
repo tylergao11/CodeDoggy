@@ -169,13 +169,14 @@ class SessionStore:
                     (session_id, cwd, goal, title or (goal or "")[:80], now, now),
                 )
             else:
+                # Do NOT overwrite cwd on existing sessions (cross-project boundary).
+                # Only refresh goal/title when provided; cwd is immutable after insert.
                 self._conn.execute(
                     "UPDATE sessions SET updated_at = ?, "
                     "goal = COALESCE(?, goal), "
-                    "cwd = COALESCE(?, cwd), "
                     "title = COALESCE(?, title) "
                     "WHERE id = ?",
-                    (now, goal, cwd, title, session_id),
+                    (now, goal, title, session_id),
                 )
 
     def append_message(
@@ -188,8 +189,18 @@ class SessionStore:
         tool_call_id: str | None = None,
         tool_calls: Any = None,
     ) -> int:
+        from codedoggy.memory.redact import redact_secrets
+
         self.ensure_session(session_id)
-        tc_json = json.dumps(tool_calls, ensure_ascii=False) if tool_calls else None
+        # Redact before write — no dual-store of unredacted secrets.
+        safe_content = redact_secrets(content)
+        tc_json = None
+        if tool_calls:
+            try:
+                raw_tc = json.dumps(tool_calls, ensure_ascii=False)
+            except (TypeError, ValueError):
+                raw_tc = str(tool_calls)
+            tc_json = redact_secrets(raw_tc)
         now = time.time()
         with self._lock:
             cur = self._conn.execute(
@@ -199,7 +210,7 @@ class SessionStore:
                 (
                     session_id,
                     role,
-                    content or "",
+                    safe_content,
                     tool_name,
                     tool_call_id,
                     tc_json,
@@ -261,6 +272,7 @@ class SessionStore:
         limit: int | None = None,
         offset: int = 0,
     ) -> list[dict[str, Any]]:
+        """Oldest-first slice (offset from start). Prefer get_messages_tail for resume."""
         sql = (
             "SELECT id, session_id, role, content, tool_name, tool_call_id, "
             "tool_calls, timestamp FROM messages WHERE session_id = ? "
@@ -273,6 +285,25 @@ class SessionStore:
         with self._lock:
             rows = self._conn.execute(sql, params).fetchall()
         return [self._row_to_msg(r) for r in rows]
+
+    def get_messages_tail(
+        self,
+        session_id: str,
+        *,
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        """Newest ``limit`` messages, returned oldest→newest (Grok resume)."""
+        limit = max(1, int(limit))
+        sql = (
+            "SELECT id, session_id, role, content, tool_name, tool_call_id, "
+            "tool_calls, timestamp FROM messages WHERE session_id = ? "
+            "ORDER BY id DESC LIMIT ?"
+        )
+        with self._lock:
+            rows = self._conn.execute(sql, (session_id, limit)).fetchall()
+        msgs = [self._row_to_msg(r) for r in rows]
+        msgs.reverse()
+        return msgs
 
     def get_messages_around(
         self,
@@ -337,14 +368,32 @@ class SessionStore:
         *,
         limit: int = 20,
         exclude_session_id: str | None = None,
+        session_id: str | None = None,
+        cwd: str | None = None,
+        roles: list[str] | None = None,
     ) -> list[SearchHit]:
+        """FTS with optional session/cwd/role scope (Grok memory boundary)."""
         q = (query or "").strip()
         if not q:
             return []
         limit = max(1, min(int(limit), 100))
         if self._fts:
-            return self._search_fts(q, limit=limit, exclude_session_id=exclude_session_id)
-        return self._search_like(q, limit=limit, exclude_session_id=exclude_session_id)
+            return self._search_fts(
+                q,
+                limit=limit,
+                exclude_session_id=exclude_session_id,
+                session_id=session_id,
+                cwd=cwd,
+                roles=roles,
+            )
+        return self._search_like(
+            q,
+            limit=limit,
+            exclude_session_id=exclude_session_id,
+            session_id=session_id,
+            cwd=cwd,
+            roles=roles,
+        )
 
     def _search_fts(
         self,
@@ -352,6 +401,9 @@ class SessionStore:
         *,
         limit: int,
         exclude_session_id: str | None,
+        session_id: str | None = None,
+        cwd: str | None = None,
+        roles: list[str] | None = None,
     ) -> list[SearchHit]:
         fts_q = self._sanitize_fts_query(query)
         if not fts_q:
@@ -367,9 +419,19 @@ class SessionStore:
             "WHERE messages_fts MATCH ? "
         )
         params: list[Any] = [fts_q]
+        if session_id:
+            sql += "AND m.session_id = ? "
+            params.append(session_id)
         if exclude_session_id:
             sql += "AND m.session_id != ? "
             params.append(exclude_session_id)
+        if cwd:
+            sql += "AND s.cwd = ? "
+            params.append(str(cwd))
+        if roles:
+            placeholders = ",".join("?" for _ in roles)
+            sql += f"AND m.role IN ({placeholders}) "
+            params.extend(list(roles))
         # bm25 lower-is-better; pull a wider pool then re-rank with recency.
         pool = max(limit * 3, limit + 5)
         sql += "ORDER BY score ASC, m.timestamp DESC LIMIT ?"
@@ -380,16 +442,19 @@ class SessionStore:
             except sqlite3.OperationalError as e:
                 logger.warning("FTS query failed (%s); LIKE fallback", e)
                 return self._search_like(
-                    query, limit=limit, exclude_session_id=exclude_session_id
+                    query,
+                    limit=limit,
+                    exclude_session_id=exclude_session_id,
+                    session_id=session_id,
+                    cwd=cwd,
+                    roles=roles,
                 )
         now = time.time()
         hits: list[SearchHit] = []
         for r in rows:
             bm25 = float(r["score"] or 0.0)
-            # Invert bm25 → higher is better
             relevance = -bm25
             ts = float(r["timestamp"] or 0.0)
-            # Recency boost: up to +2.0 for messages in last hour, decays to 0 over 7d
             age_h = max(0.0, (now - ts) / 3600.0) if ts else 1e9
             if age_h < 1:
                 recency = 2.0
@@ -399,7 +464,6 @@ class SessionStore:
                 recency = 0.5
             else:
                 recency = 0.0
-            # Prefer assistant/user over pure tool noise slightly
             role_boost = 0.3 if r["role"] in {"user", "assistant"} else 0.0
             hits.append(
                 SearchHit(
@@ -423,6 +487,9 @@ class SessionStore:
         *,
         limit: int,
         exclude_session_id: str | None,
+        session_id: str | None = None,
+        cwd: str | None = None,
+        roles: list[str] | None = None,
     ) -> list[SearchHit]:
         tokens = [t for t in re.split(r"\s+", query.strip()) if t][:8]
         if not tokens:
@@ -435,6 +502,16 @@ class SessionStore:
             "JOIN sessions s ON s.id = m.session_id WHERE "
             + " AND ".join(clauses)
         )
+        if session_id:
+            sql += " AND m.session_id = ?"
+            params.append(session_id)
+        if cwd:
+            sql += " AND s.cwd = ?"
+            params.append(str(cwd))
+        if roles:
+            placeholders = ",".join("?" for _ in roles)
+            sql += f" AND m.role IN ({placeholders})"
+            params.extend(list(roles))
         if exclude_session_id:
             sql += " AND m.session_id != ?"
             params.append(exclude_session_id)

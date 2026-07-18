@@ -51,15 +51,20 @@ class ToolCallContext:
         before: str | None,
         after: str | None,
         is_create: bool = False,
+        is_delete: bool = False,
         tool_name: str = "",
         call_id: str = "",
         args: dict[str, Any] | None = None,
     ) -> None:
-        """Record a first-hand file mutation for resident audit (no second read)."""
+        """Append a first-hand file mutation (multi-file per tool call supported).
+
+        Grok hunk spirit: one tool may produce many path-level mutations.
+        ``extra["mutations"]`` is the list; ``extra["mutation"]`` is the last
+        (primary) for single-path callers.
+        """
         from codedoggy.turn.types import FileMutation
 
         mut_args = dict(args or {})
-        # Stamp policy allow decision for audit (writes only reach here if allowed)
         pol = self.extra.get("policy")
         if pol is not None:
             check = getattr(pol, "check_write", None)
@@ -73,7 +78,7 @@ class ToolCallContext:
                     }
                 except Exception:  # noqa: BLE001
                     pass
-        self.extra["mutation"] = FileMutation(
+        mut = FileMutation(
             path=path,
             tool_name=tool_name,
             call_id=call_id,
@@ -81,8 +86,12 @@ class ToolCallContext:
             before=before,
             after=after,
             is_create=is_create,
+            is_delete=is_delete,
         )
-        # Codebase graph: file-event spirit — mark index dirty for next query
+        bag = self.extra.setdefault("mutations", [])
+        if isinstance(bag, list):
+            bag.append(mut)
+        self.extra["mutation"] = mut  # last / primary
         graph = self.extra.get("graph")
         mark = getattr(graph, "mark_dirty", None)
         if callable(mark):

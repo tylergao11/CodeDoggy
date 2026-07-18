@@ -1,7 +1,10 @@
-"""Memory provider protocol (Hermes MemoryProvider spirit, slim).
+"""Memory provider protocol — hermes-agent/agent/memory_provider.py surface.
 
-One external provider max (enforced by MemoryManager). Builtin providers
-wrap curated MEMORY and SessionStore FTS.
+Source lifecycle: initialize / system_prompt_block / prefetch / sync_turn /
+get_tool_schemas / handle_tool_call / shutdown.
+
+CodeDoggy builtins: curated MEMORY.md (system freeze) + SessionStore FTS
+(prefetch only). One external provider max (MemoryManager).
 """
 
 from __future__ import annotations
@@ -21,11 +24,15 @@ class MemoryProvider(Protocol):
         """Text injected into system prompt (may be empty)."""
         ...
 
-    def prefetch(self, query: str, *, session_id: str = "") -> str:
+    def prefetch(
+        self, query: str, *, session_id: str = "", cwd: str = ""
+    ) -> str:
         """On-demand recall for this user turn (may be empty)."""
         ...
 
-    def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
+    def queue_prefetch(
+        self, query: str, *, session_id: str = "", cwd: str = ""
+    ) -> None:
         """Optional: warm next-turn prefetch (default no-op)."""
         ...
 
@@ -35,6 +42,7 @@ class MemoryProvider(Protocol):
         assistant_text: str,
         *,
         session_id: str = "",
+        cwd: str = "",
     ) -> None:
         """Optional: post-turn persistence hook."""
         ...
@@ -45,17 +53,27 @@ class MemoryProvider(Protocol):
 
 
 class BaseMemoryProvider:
-    """Convenience base with no-op defaults."""
+    """Convenience base — hermes-agent MemoryProvider optional hooks as no-ops."""
 
     name: str = "base"
+
+    def is_available(self) -> bool:
+        return True
+
+    def initialize(self, session_id: str = "", **kwargs: Any) -> None:
+        return None
 
     def system_prompt_block(self) -> str:
         return ""
 
-    def prefetch(self, query: str, *, session_id: str = "") -> str:
+    def prefetch(
+        self, query: str, *, session_id: str = "", cwd: str = ""
+    ) -> str:
         return ""
 
-    def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
+    def queue_prefetch(
+        self, query: str, *, session_id: str = "", cwd: str = ""
+    ) -> None:
         return None
 
     def sync_turn(
@@ -64,11 +82,50 @@ class BaseMemoryProvider:
         assistant_text: str,
         *,
         session_id: str = "",
+        cwd: str = "",
+        messages: list[Any] | None = None,
     ) -> None:
         return None
 
     def get_tool_schemas(self) -> list[dict[str, Any]]:
         return []
+
+    def handle_tool_call(
+        self, tool_name: str, args: dict[str, Any], **kwargs: Any
+    ) -> str:
+        raise NotImplementedError(
+            f"Provider {self.name} does not handle tool {tool_name}"
+        )
+
+    def on_turn_start(self, turn_number: int, message: str, **kwargs: Any) -> None:
+        return None
+
+    def on_session_end(self, messages: list[Any] | None = None) -> None:
+        return None
+
+    def on_pre_compress(self, messages: list[Any] | None = None) -> str:
+        """Before context compression — optional extract (Hermes on_pre_compress)."""
+        return ""
+
+    def on_session_switch(
+        self,
+        new_session_id: str,
+        *,
+        parent_session_id: str = "",
+        reset: bool = False,
+        **kwargs: Any,
+    ) -> None:
+        """Hermes: session_id rotated without provider teardown."""
+        self._session_id = new_session_id  # type: ignore[attr-defined]
+        return None
+
+    def on_memory_write(
+        self, action: str, target: str, content: str, metadata: Any = None
+    ) -> None:
+        return None
+
+    def shutdown(self) -> None:
+        return None
 
 
 class CuratedMemoryProvider(BaseMemoryProvider):
@@ -92,26 +149,58 @@ class SessionFtsProvider(BaseMemoryProvider):
     """Builtin: SessionStore FTS hits for prefetch + warm cache for next turn."""
 
     name = "builtin_session_fts"
+    # Default: conversational roles only — never surface raw tool dumps in prefetch.
+    DEFAULT_ROLES = ("user", "assistant")
 
     def __init__(self, store: Any | None = None, *, max_hits: int = 6) -> None:
         self.store = store
         self.max_hits = max_hits
         self._warm: str = ""
         self._warm_query: str = ""
+        self._warm_cwd: str = ""
+        self._session_id: str = ""
 
-    def prefetch(self, query: str, *, session_id: str = "") -> str:
+    def on_session_switch(
+        self,
+        new_session_id: str,
+        *,
+        parent_session_id: str = "",
+        reset: bool = False,
+        **kwargs: Any,
+    ) -> None:
+        self._session_id = new_session_id
+        if reset:
+            self._warm = ""
+            self._warm_query = ""
+            self._warm_cwd = ""
+
+    def prefetch(
+        self,
+        query: str,
+        *,
+        session_id: str = "",
+        cwd: str = "",
+    ) -> str:
         q = (query or "").strip()
         # Prefer warm cache when query shares tokens with last warm key
         if self._warm and q and self._warm_query:
             if _query_overlap(q, self._warm_query) >= 0.3:
-                return self._warm
-        return self._search(q)
+                if not cwd or cwd == self._warm_cwd:
+                    return self._warm
+        return self._search(q, session_id=session_id, cwd=cwd)
 
-    def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
+    def queue_prefetch(
+        self,
+        query: str,
+        *,
+        session_id: str = "",
+        cwd: str = "",
+    ) -> None:
         """Warm FTS result for the next turn (Hermes queue_prefetch spirit)."""
         q = (query or "").strip()
         self._warm_query = q
-        self._warm = self._search(q)
+        self._warm_cwd = cwd or ""
+        self._warm = self._search(q, session_id=session_id, cwd=cwd)
 
     def sync_turn(
         self,
@@ -119,6 +208,7 @@ class SessionFtsProvider(BaseMemoryProvider):
         assistant_text: str,
         *,
         session_id: str = "",
+        cwd: str = "",
     ) -> None:
         # Archive is create-time via runner; warm next prefetch from this turn.
         # Blend user + short assistant keywords for better next-turn recall.
@@ -127,16 +217,27 @@ class SessionFtsProvider(BaseMemoryProvider):
             # First ~120 chars of assistant often name files/decisions
             blend = f"{blend} {(assistant_text or '')[:120]}".strip()
         if blend:
-            self.queue_prefetch(blend, session_id=session_id)
+            self.queue_prefetch(blend, session_id=session_id, cwd=cwd)
 
-    def _search(self, query: str) -> str:
+    def _search(
+        self,
+        query: str,
+        *,
+        session_id: str = "",
+        cwd: str = "",
+    ) -> str:
         if self.store is None or not (query or "").strip():
             return ""
         try:
             hits = self.store.search(
                 query.strip()[:240],
                 limit=self.max_hits,
+                # Include prior turns of the current session (no exclude).
+                # Cross-session hits remain available unless cwd scopes them.
                 exclude_session_id=None,
+                session_id=None,
+                cwd=cwd or None,
+                roles=list(self.DEFAULT_ROLES),
             )
         except Exception:
             return ""

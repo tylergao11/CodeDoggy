@@ -63,24 +63,46 @@ def snap_to_safe_boundary(messages: list[Message], split_idx: int) -> int:
 
 
 def sanitize_tool_pairs(messages: list[Message]) -> list[Message]:
-    """Drop orphan TOOL messages and bare tool-call assistants without results.
+    """Ensure complete tool-call / tool-result pairing for API validity.
 
-    Hermes post-compress hygiene: never leave API-invalid sequences.
+    Rules (stricter than “any one match keeps the assistant”):
+    - Every tool_call id on an assistant must have a matching TOOL result, or
+      we inject a synthetic cancelled/error result.
+    - Orphan TOOL results (no matching call) are dropped.
+    - Assistant with *zero* matching results and no content is dropped;
+      with content, tool_calls are stripped.
     """
     if not messages:
         return []
-    # All tool_call ids that have a result somewhere in the list
-    result_ids: set[str] = set()
+
+    # P0: queue results per id (FIFO) so multi-round reuse of call_N still pairs
+    # correctly — never global first-wins that drops later results.
+    from collections import defaultdict
+
+    results_by_id: dict[str, list[Message]] = defaultdict(list)
     for m in messages:
         if is_tool_result(m) and m.tool_call_id:
-            result_ids.add(m.tool_call_id)
+            results_by_id[str(m.tool_call_id)].append(m)
 
+    consumed: set[int] = set()  # id(message) of tool rows already paired
     out: list[Message] = []
     for m in messages:
         if has_tool_requests(m):
-            ids = {tc.id for tc in (m.tool_calls or []) if tc.id}
-            # Keep assistant tool_calls only if at least one result exists
-            if ids and not ids.intersection(result_ids):
+            calls = list(m.tool_calls or [])
+            ids = [tc.id for tc in calls if tc.id]
+            if not ids:
+                out.append(
+                    Message(
+                        role=m.role,
+                        content=m.content,
+                        tool_calls=None,
+                        tool_call_id=None,
+                        name=m.name,
+                    )
+                )
+                continue
+            present = any(results_by_id.get(str(i)) for i in ids)
+            if not present:
                 if (m.content or "").strip():
                     out.append(
                         Message(
@@ -93,20 +115,34 @@ def sanitize_tool_pairs(messages: list[Message]) -> list[Message]:
                     )
                 continue
             out.append(m)
+            for tc in calls:
+                tid = str(tc.id) if tc.id else ""
+                if not tid:
+                    continue
+                bag = results_by_id.get(tid) or []
+                if bag:
+                    tr = bag.pop(0)
+                    consumed.add(id(tr))
+                    out.append(tr)
+                else:
+                    out.append(
+                        Message(
+                            role=Role.TOOL,
+                            content=(
+                                f"Error (cancelled): tool call {tc.name!r} "
+                                f"({tid}) never executed (abort/cancel mid-batch)"
+                            ),
+                            tool_call_id=tid,
+                            name=tc.name,
+                        )
+                    )
         elif is_tool_result(m):
-            tid = m.tool_call_id or ""
-            if not tid:
+            # Orphan if never consumed by an assistant pairing above
+            if id(m) in consumed:
                 continue
-            # Keep only if a prior kept assistant requested this id
-            claimed = any(
-                tc.id == tid
-                for prev in out
-                if prev.tool_calls
-                for tc in prev.tool_calls
-            )
-            if not claimed:
-                continue
-            out.append(m)
+            # Still queued for a later assistant? leave for that assistant;
+            # if no later claim, drop as orphan at end of scan.
+            continue
         else:
             out.append(m)
     return out

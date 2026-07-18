@@ -1,10 +1,22 @@
-"""read_file — line-numbered file read."""
+"""read_file — Grok ReadFileTool wire + source-ported extract.
+
+Extract core: ``codedoggy.tools.grok_build.read_file_extract``
+  Ported from implementations/grok_build/read_file/mod.rs
+
+Rich formats: ``util/rich_files`` (pdf/pptx/image subset).
+"""
 
 from __future__ import annotations
 
 from typing import Any
 
 from codedoggy.tools.defaults import MAX_LINES_READ_DEFAULT
+from codedoggy.tools.grok_build import read_file_extract as _extract_mod
+from codedoggy.tools.grok_build.read_file_extract import (
+    ExtractedContent,
+    resolve_read_start_line,
+    split_inclusive_newline,
+)
 from codedoggy.tools.kinds import ToolKind, ToolNamespace
 from codedoggy.tools.runtime import (
     ListToolsContext,
@@ -16,108 +28,55 @@ from codedoggy.tools.runtime import (
 )
 from codedoggy.tools.util.binary import is_binary
 from codedoggy.tools.util.paths import resolve_model_path
+from codedoggy.tools.util.rich_files import (
+    is_image,
+    is_pdf,
+    is_pptx,
+    read_image_meta,
+    read_pdf_text,
+    read_pptx_text,
+)
 
-# Approximate token guard (chars/4) when content exceeds this after decode.
+# Re-export for tests that import from builtins.read_file
+__all__ = [
+    "ReadFileTool",
+    "extract_file_content_lines",
+    "resolve_read_start_line",
+    "split_inclusive_newline",
+    "ExtractedContent",
+    "MAX_NUM_TOKENS",
+    "MAX_LINES_READ",
+]
+
+
+def extract_file_content_lines(
+    file_content: str,
+    offset: int | None = None,
+    limit: int | None = None,
+    total_lines: int = 0,
+) -> str:
+    """Return formatted content string (Grok ``ExtractedContent.content``)."""
+    return _extract_mod.extract_file_content_lines(
+        file_content, offset, limit, total_lines
+    ).content
+
+
+# Grok constants
 MAX_NUM_TOKENS = 25_000
+MAX_LINES_READ = MAX_LINES_READ_DEFAULT
 MAX_CONTENT_CHARS_FOR_TOKEN_GUARD = MAX_NUM_TOKENS * 4
 
+# Grok DESCRIPTION_FULL
 _DESCRIPTION = f"""\
 Read a file.
 
 Usage:
 - The target_file parameter can be a relative path in the workspace or an absolute path
-- By default, it reads up to {MAX_LINES_READ_DEFAULT} lines starting from the beginning of the file
+- By default, it reads up to {MAX_LINES_READ} lines starting from the beginning of the file
 - Results are returned with line numbers starting at 1. The format is: LINE_NUMBER→LINE_CONTENT
-- Line-number prefixes appear on the first visible line and every line whose number is divisible by 10 (sparse numbering to save tokens).
-- offset is 1-based; 0 means 1; negative values count from the last content line (e.g. -1 starts at the last line).
-- Only plain text files are supported. Binary files are rejected.
-- For large files, pass offset and limit to page through content, or use grep to find regions of interest first.
+- This tool can read PDF files (.pdf), PowerPoint files (.pptx), Jupyter notebooks (.ipynb files), and image files (e.g. PNG, JPG, etc).
+- When reading an image file the contents are presented visually as this tool uses multimodal LLMs.
 """
-
-
-def resolve_read_start_line(file_content: str, offset: int | None) -> int:
-    """1-indexed start line. None/0 → 1. Negative counts from the last content line.
-
-    Content lines use the same ``split_inclusive`` view as extraction (not a
-    phantom field past EOF). So ``offset=-1`` always starts at the last line
-    the model can see — including files with no trailing newline.
-    """
-    if offset is None or offset == 0:
-        return 1
-    if offset > 0:
-        return int(offset)
-    lines = split_inclusive_newline(file_content)
-    n = len(lines)
-    if n == 0:
-        return 1
-    return max(1, n + int(offset) + 1)
-
-
-def split_inclusive_newline(s: str) -> list[str]:
-    if not s:
-        return []
-    parts: list[str] = []
-    start = 0
-    for i, ch in enumerate(s):
-        if ch == "\n":
-            parts.append(s[start : i + 1])
-            start = i + 1
-    if start < len(s):
-        parts.append(s[start:])
-    return parts
-
-
-def strip_line_ending(s: str) -> str:
-    if s.endswith("\n"):
-        s = s[:-1]
-    if s.endswith("\r"):
-        s = s[:-1]
-    return s
-
-
-def extract_file_content_lines(
-    file_content: str,
-    offset: int | None,
-    limit: int | None,
-) -> str:
-    """Windowed line view; prefix on first visible line and every 10th line number."""
-    skip = max(0, resolve_read_start_line(file_content, offset) - 1)
-    # Always clamp to max window (explicit limit is min(limit, max_lines)).
-    max_lines = MAX_LINES_READ_DEFAULT
-    take = max_lines if limit is None else min(max(0, limit), max_lines)
-
-    if not file_content:
-        return ""
-
-    # split_inclusive already yields one entry per line including a real final
-    # blank line when the file ends with "\n\n". Do NOT invent an extra empty
-    # line solely because the file ends with a single "\n" (almost all source
-    # files) — that phantom disagrees with offset=-1 and confuses models.
-    lines_inc = split_inclusive_newline(file_content)
-
-    output: list[str] = []
-    first_line: int | None = None
-    taken = 0
-
-    for i, line_with_nl in enumerate(lines_inc):
-        if i < skip:
-            continue
-        if taken >= take:
-            break
-        line = strip_line_ending(line_with_nl)
-        line_num = i + 1
-        is_first_visible = first_line is None
-        if is_first_visible:
-            first_line = line_num
-        else:
-            output.append("\n")
-        if is_first_visible or line_num % 10 == 0:
-            output.append(f"{line_num}→{line}")
-        else:
-            output.append(line)
-        taken += 1
-
-    return "".join(output)
 
 
 class ReadFileTool(Tool):
@@ -156,7 +115,22 @@ class ReadFileTool(Tool):
                     "type": "integer",
                     "description": (
                         "The number of lines to read. Only provide if the file is too "
-                        "large to read at once. Capped at the max window size."
+                        "large to read at once."
+                    ),
+                },
+                "pages": {
+                    "type": "string",
+                    "description": (
+                        "Page range for PDF files (e.g. '1-5', '3', '10-'). "
+                        "Required for PDFs with more than 10 pages. Max 20 pages per call. "
+                        "Ignored for non-PDF files."
+                    ),
+                },
+                "format": {
+                    "type": "string",
+                    "description": (
+                        "Output format for PDF files. 'image' (default) renders pages as "
+                        "images. 'text' extracts text content. Ignored for non-PDF files."
                     ),
                 },
             },
@@ -171,10 +145,71 @@ class ReadFileTool(Tool):
         path = resolve_model_path(ctx.cwd, path_arg)
         if not path.exists():
             raise ToolError(f"File not found: {path}", code="not_found")
+        if path.is_dir():
+            raise ToolError(
+                f"Error: {path} is a directory, not a file.",
+                code="is_a_directory",
+            )
         if not path.is_file():
             raise ToolError(f"Not a file: {path}", code="invalid_arguments")
 
-        raw = path.read_bytes()
+        try:
+            raw = path.read_bytes()
+        except PermissionError as e:
+            raise ToolError(f"Permission denied: {path}", code="permission_denied") from e
+        except OSError as e:
+            raise ToolError(f"Failed to read file: {path}, {e}", code="io_error") from e
+
+        fmt = args.get("format")
+        fmt_s = str(fmt).strip().lower() if fmt is not None else None
+
+        # Image first (Grok: bytes_to_metadata → image path)
+        if is_image(path, raw) and fmt_s != "text":
+            try:
+                return read_image_meta(path, raw)
+            except ValueError as e:
+                raise ToolError(str(e), code="image_error") from e
+
+        if is_pdf(path, raw):
+            # Grok default format for PDF is image; without multimodal host we
+            # fall back to text extract and note honesty in error paths.
+            extract_text = fmt_s == "text" or fmt_s in {None, "auto"}
+            if fmt_s == "image":
+                # No page renderer in pure Python tools — honest soft path via text note
+                try:
+                    text = read_pdf_text(
+                        raw,
+                        pages=args.get("pages") if isinstance(args.get("pages"), str) else None,
+                    )
+                except ValueError as e:
+                    raise ToolError(str(e), code="pdf_error") from e
+                return (
+                    "[PDF format=image not available without host page renderer; "
+                    "showing text extract instead]\n\n"
+                    + _window_text(text, args)
+                )
+            if extract_text:
+                try:
+                    text = read_pdf_text(
+                        raw,
+                        pages=args.get("pages") if isinstance(args.get("pages"), str) else None,
+                    )
+                except ValueError as e:
+                    raise ToolError(str(e), code="pdf_error") from e
+                return _window_text(text, args)
+            if fmt_s is not None and fmt_s not in {"image", "text", "auto"}:
+                raise ToolError(
+                    f"Invalid format '{fmt_s}'. Supported values: 'image' (default), 'text'.",
+                    code="invalid_arguments",
+                )
+
+        if is_pptx(path, raw):
+            try:
+                text = read_pptx_text(raw)
+            except ValueError as e:
+                raise ToolError(str(e), code="pptx_error") from e
+            return _window_text(text, args)
+
         ext = path.suffix.lstrip(".").lower()
         if is_binary(ext, raw):
             raise ToolError(f"Cannot read binary file: {path}", code="binary_file")
@@ -182,23 +217,34 @@ class ReadFileTool(Tool):
         file_content = raw.decode("utf-8", errors="replace")
         if not file_content:
             return ""
+        return _window_text(file_content, args)
 
-        offset = _parse_optional_int(args.get("offset"), "offset")
-        limit = _parse_optional_int(args.get("limit"), "limit")
-        if limit is not None and limit < 0:
-            raise ToolError.invalid_arguments("limit must be non-negative")
 
-        # Window first, then guard the projected observation (not whole file).
-        window = extract_file_content_lines(file_content, offset, limit)
-        if len(window) > MAX_CONTENT_CHARS_FOR_TOKEN_GUARD:
-            raise ToolError(
-                "Requested range is too large for one read "
-                f"({len(window)} characters after formatting). "
-                f"Use a smaller limit (max {MAX_LINES_READ_DEFAULT} lines) or "
-                "use grep to locate a narrower region first.",
-                code="file_too_large",
-            )
-        return window
+def _window_text(file_content: str, args: dict[str, Any]) -> str:
+    offset = _parse_optional_int(args.get("offset"), "offset")
+    limit = _parse_optional_int(args.get("limit"), "limit")
+    if limit is not None and limit < 0:
+        raise ToolError.invalid_arguments("limit must be non-negative")
+    # Grok tool path clamps to MAX_LINES_READ
+    effective_limit = MAX_LINES_READ if limit is None else min(limit, MAX_LINES_READ)
+    # Grok tests: matches('\n').count() + 1
+    total_lines = file_content.count("\n") + 1 if file_content else 0
+    extracted = _extract_mod.extract_file_content_lines(
+        file_content,
+        offset,
+        effective_limit,
+        total_lines,
+    )
+    window = extracted.content
+    if len(window) > MAX_CONTENT_CHARS_FOR_TOKEN_GUARD:
+        raise ToolError(
+            "Requested range is too large for one read "
+            f"({len(window)} characters after formatting). "
+            f"Use a smaller limit (max {MAX_LINES_READ} lines) or "
+            "use grep to locate a narrower region first.",
+            code="file_too_large",
+        )
+    return window
 
 
 def _parse_optional_int(value: Any, name: str) -> int | None:

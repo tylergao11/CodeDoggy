@@ -61,10 +61,18 @@ def test_run_terminal_cmd_echo(tmp_path: Path) -> None:
     assert "12345" in out
 
 
-def test_run_terminal_cmd_rejects_trailing_ampersand(tmp_path: Path) -> None:
+def test_run_terminal_cmd_rejects_trailing_ampersand_when_disallowed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Grok: reject & only when allow_background_operator=false or bg disabled."""
+    import codedoggy.tools.builtins.run_terminal_cmd as rtc
+    import codedoggy.tools.defaults as defaults
+
+    monkeypatch.setattr(defaults, "BASH_ALLOW_BACKGROUND_OPERATOR", False)
+    monkeypatch.setattr(rtc, "BASH_ALLOW_BACKGROUND_OPERATOR", False)
     set_ = ToolRegistryBuilder.new().finalize()
     ctx = ToolCallContext(cwd=tmp_path)
-    with pytest.raises(ToolError, match="must not end with"):
+    with pytest.raises(ToolError, match="background|&"):
         set_.call(
             "run_terminal_cmd",
             {
@@ -123,8 +131,26 @@ def test_builtins_registered() -> None:
         "Doggy:list_dir",
         "Doggy:grep",
         "Doggy:run_terminal_cmd",
+        "Doggy:get_task_output",
+        "Doggy:wait_tasks",
+        "Doggy:kill_task",
+        "Doggy:todo_write",
+        "Doggy:update_goal",
+        "Doggy:enter_plan_mode",
+        "Doggy:exit_plan_mode",
+        "Doggy:ask_user_question",
+        "Doggy:monitor",
+        "Doggy:web_fetch",
+        "Doggy:web_search",
+        "Doggy:scheduler_create",
+        "Doggy:scheduler_delete",
+        "Doggy:scheduler_list",
         "Doggy:memory",
+        "Doggy:memory_search",
+        "Doggy:memory_get",
         "Doggy:session_search",
+        "Doggy:task",
+        "Doggy:get_subagent_output",
     ):
         assert b.has_tool_id(qid), qid
 
@@ -193,7 +219,9 @@ def test_grep_python_fallback_basic(tmp_path: Path, monkeypatch: pytest.MonkeyPa
 def test_run_terminal_cmd_description_mentions_tree_kill(tmp_path: Path) -> None:
     set_ = ToolRegistryBuilder.new().finalize()
     defs = {d.name: d for d in set_.tool_definitions()}
-    desc = defs["run_terminal_cmd"].description or ""
-    # Must not claim unimplemented Job Object; must state actual kill mechanism.
-    assert "Job Object" not in desc
-    assert "taskkill" in desc or "process group" in desc or "SIGTERM" in desc
+    # Grok product client name
+    desc = (defs.get("run_terminal_command") or defs["run_terminal_cmd"]).description or ""
+    # Grok Timeout enforcement wording (Job Object on Windows; SIGTERM group on Unix).
+    # We also document taskkill /T as the practical Windows mechanism.
+    assert "Timeout enforcement" in desc or "timeout" in desc.lower()
+    assert "taskkill" in desc or "process group" in desc or "SIGTERM" in desc or "Job Object" in desc

@@ -1,6 +1,10 @@
 """Tool registration and dispatch."""
 
 from codedoggy.tools.config import ToolConfig, ToolServerConfig
+from codedoggy.tools.grok_surface import (
+    codedoggy_product_config,
+    grok_build_product_config,
+)
 from codedoggy.tools.kinds import ToolKind, ToolNamespace
 from codedoggy.tools.registry import (
     FinalizedToolset,
@@ -33,5 +37,7 @@ __all__ = [
     "ToolRegistryBuilder",
     "ToolServerConfig",
     "ToolSpec",
+    "codedoggy_product_config",
+    "grok_build_product_config",
     "register_tool_pack",
 ]

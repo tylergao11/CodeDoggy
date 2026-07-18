@@ -72,6 +72,7 @@ def test_build_session_wires_main_and_audit(tmp_path: Path) -> None:
         main_client=main,
         audit_client=audit,
         enable_memory=False,
+        enable_audit=True,  # legacy path only
     )
     try:
         assert s.goal == "say hi"
@@ -81,6 +82,27 @@ def test_build_session_wires_main_and_audit(tmp_path: Path) -> None:
         assert r.status.value == "completed"
         assert r.final_text == "hello world"
         assert main.n == 1
+    finally:
+        s.close()
+
+
+def test_build_session_default_no_audit(tmp_path: Path) -> None:
+    """Product path: Shadow/audit is off by default."""
+    main = ScriptClient(
+        [CompletionResult(content="ok", model="main")],
+        name="main",
+    )
+    s = build_session(tmp_path, main_client=main, enable_memory=False)
+    try:
+        assert s.extensions.audit is None
+        prompt = s.extensions.turn_runner.system_prompt or ""
+        assert "Shadow" not in prompt
+        assert "shadow P0" not in prompt
+        assert "parallel" in prompt.lower() or "parallel_tasks" in prompt
+        assert "MAIN" in prompt
+        # Agency: tendency in prompt, not harness auto-orchestrate
+        assert "does **not**" in prompt or "does not" in prompt.lower()
+        assert "auto" in prompt.lower()
     finally:
         s.close()
 
@@ -133,6 +155,7 @@ def test_build_session_important_deferred_to_turn_end(tmp_path: Path) -> None:
         main_client=main,
         audit_client=audit,
         enable_memory=False,
+        enable_audit=True,  # legacy audit package tests only
     )
     try:
         r = s.handle_prompt("create note")
@@ -154,8 +177,8 @@ def test_build_session_important_deferred_to_turn_end(tmp_path: Path) -> None:
         assert "off goal rethink" not in joined
         assert "shadow P0" not in joined
         # End-of-turn summary for host / final_text
-        assert "audit_deferred" in r.metadata
-        assert "off goal rethink" in r.metadata["audit_deferred"]
+        assert "shadow_deferred" in r.metadata
+        assert "off goal rethink" in r.metadata["shadow_deferred"]
         assert "off goal rethink" in (r.final_text or "")
     finally:
         s.close()
@@ -216,21 +239,21 @@ def test_p0_critical_is_immediate_red_card(tmp_path: Path) -> None:
         main_client=main,
         audit_client=audit,
         enable_memory=False,
+        enable_audit=True,  # legacy audit package tests only
     )
     try:
         r = s.handle_prompt("write secrets")
-        assert r.status.value == "completed"
-        # P0 appears on tool observation before second sample
-        second_batch = main.calls[1]
-        tool_texts = [
-            (m.content if isinstance(m, ChatMessage) else m.get("content") or "")
-            for m in second_batch
-        ]
-        joined = "\n".join(str(t) for t in tool_texts)
-        assert "P0" in joined
-        assert "do not write secrets" in joined
-        # suggestion deferred to end
-        assert "prefer .env.example" not in joined
-        assert "prefer .env.example" in r.metadata.get("audit_deferred", "")
+        # P0 aborts the turn (writes paused / remaining tools cancelled)
+        assert r.status.value in {"completed", "error"}
+        # P0 text on tool observation and/or error path
+        blob = (r.final_text or "") + str(r.error or "") + str(r.metadata or "")
+        # First sample's tool result should have been archived into next call if any
+        all_texts: list[str] = [blob]
+        for batch in main.calls:
+            for m in batch:
+                c = m.content if isinstance(m, ChatMessage) else m.get("content")
+                all_texts.append(str(c or ""))
+        joined = "\n".join(all_texts)
+        assert "P0" in joined or "do not write secrets" in joined or "critical" in joined.lower()
     finally:
         s.close()

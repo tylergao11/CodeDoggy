@@ -32,9 +32,43 @@ except ImportError:
     msvcrt = None  # type: ignore[assignment]
 
 
+def load_on_disk_store(
+    memory_dir: Path | str | None = None,
+    *,
+    memory_char_limit: int | None = None,
+    user_char_limit: int | None = None,
+) -> "MemoryStore":
+    """Hermes ``load_on_disk_store`` — fresh store for CLI/gateway without live agent.
+
+    Source: hermes-agent/tools/memory_tool.py. Honors env overrides:
+      CODEDOGGY_MEMORY_CHAR_LIMIT / CODEDOGGY_USER_CHAR_LIMIT
+    """
+    mem_lim = memory_char_limit
+    user_lim = user_char_limit
+    if mem_lim is None:
+        raw = os.environ.get("CODEDOGGY_MEMORY_CHAR_LIMIT", "").strip()
+        try:
+            mem_lim = int(raw) if raw else MEMORY_CHAR_LIMIT
+        except ValueError:
+            mem_lim = MEMORY_CHAR_LIMIT
+    if user_lim is None:
+        raw = os.environ.get("CODEDOGGY_USER_CHAR_LIMIT", "").strip()
+        try:
+            user_lim = int(raw) if raw else USER_CHAR_LIMIT
+        except ValueError:
+            user_lim = USER_CHAR_LIMIT
+    store = MemoryStore(
+        memory_dir=memory_dir,
+        memory_char_limit=int(mem_lim),
+        user_char_limit=int(user_lim),
+    )
+    store.load_from_disk()
+    return store
+
+
 class MemoryStore:
     """
-    File-backed curated memory with two stores:
+    File-backed curated memory with two stores (Hermes tools/memory_tool.py):
 
     - ``memory`` → MEMORY.md — agent notes (env, conventions, lessons)
     - ``user`` → USER.md — user profile (prefs, style, habits)
@@ -524,23 +558,33 @@ class MemoryStore:
 
     @staticmethod
     def _drift_error(path: Path, bak_path: str) -> dict[str, Any]:
+        """Hermes tools/memory_tool.py ``_drift_error`` (issue #26045 wording)."""
         return {
             "success": False,
             "error": (
-                f"Refusing to write {path.name}: on-disk content would not round-trip "
-                f"through the memory tool (external edit or concurrent write). "
-                f"Snapshot saved to {bak_path}. Fix the file to clean §-delimited "
-                f"entries, then retry."
+                f"Refusing to write {path.name}: file on disk has content that "
+                f"wouldn't round-trip through the memory tool (likely added by "
+                f"a patch tool, shell append, manual edit, or concurrent session). "
+                f"A snapshot was saved to {bak_path}. "
+                f"Resolve the drift first — either rewrite the file as a clean "
+                f"§-delimited list of entries, or move the extra content out — "
+                f"then retry. This guard exists to prevent silent data loss."
             ),
             "drift_backup": bak_path,
+            "remediation": (
+                "Open the .bak file, integrate missing entries via "
+                "memory(action=add), then rewrite the original to a clean "
+                "§-delimited state."
+            ),
         }
 
     def _detect_external_drift(self, target: str) -> str | None:
-        """Hard drift = bytes that would not round-trip through § parse/join.
+        """Hermes MemoryStore._detect_external_drift.
 
-        Oversized single entries (e.g. after a char-limit change or external
-        paste) still round-trip; blocking them would prevent remove/consolidate
-        recovery. Those are handled by normal budget checks on add/replace.
+        Two signals (hermes-agent tools/memory_tool.py):
+          1. Round-trip mismatch through § parse/join
+          2. Any single entry larger than the *store* char limit (external
+             free-form append treated as one entry — issue #26045)
         """
         path = self._path_for(target)
         if not path.exists():
@@ -553,14 +597,17 @@ class MemoryStore:
             return None
         parsed = [e.strip() for e in raw.split(ENTRY_DELIMITER) if e.strip()]
         roundtrip = ENTRY_DELIMITER.join(parsed)
-        if raw.strip() == roundtrip:
+        char_limit = self._char_limit(target)
+        max_entry_len = max((len(e) for e in parsed), default=0)
+        drift = (raw.strip() != roundtrip) or (max_entry_len > char_limit)
+        if not drift:
             return None
         ts = int(time.time())
         bak = path.with_suffix(path.suffix + f".bak.{ts}")
         try:
             bak.write_text(raw, encoding="utf-8")
         except OSError:
-            return str(bak) + " (BACKUP FAILED)"
+            return str(bak) + " (BACKUP FAILED — file unchanged on disk)"
         return str(bak)
 
     @staticmethod

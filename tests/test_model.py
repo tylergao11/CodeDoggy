@@ -173,8 +173,22 @@ def test_model_auditor_fail_soft() -> None:
     assert "Wrong file" in v.findings[0].message
 
 
-def test_model_auditor_bad_json_pass_silent() -> None:
-    auditor = ModelAuditor(FakeClient("not json at all"))
+def test_model_auditor_bad_json_fail_closed() -> None:
+    auditor = ModelAuditor(FakeClient("not json at all"), fail_closed=True)
+    ctx = AuditContext(
+        goal="x",
+        mutation=MutationEvent(path="a", tool_name="t", call_id="1"),
+        trajectory_summary="",
+        memory=MemorySelectResult(),
+        cwd=".",
+    )
+    v = auditor.review(ctx)
+    assert not v.ok
+    assert "unparseable" in v.findings[0].message.lower() or "needs review" in v.findings[0].message.lower()
+
+
+def test_model_auditor_bad_json_opt_out_pass_silent() -> None:
+    auditor = ModelAuditor(FakeClient("not json at all"), fail_closed=False)
     ctx = AuditContext(
         goal="x",
         mutation=MutationEvent(path="a", tool_name="t", call_id="1"),

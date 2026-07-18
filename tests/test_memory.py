@@ -196,17 +196,23 @@ def test_reject_delimiter_in_content(tmp_path: Path) -> None:
     assert "delimiter" in r["error"].lower()
 
 
-def test_oversized_entry_still_removable(tmp_path: Path) -> None:
-    """External oversized content must not hard-block remove via false drift."""
+def test_oversized_entry_is_hermes_drift(tmp_path: Path) -> None:
+    """Hermes #26045: single entry > store limit = external free-form drift.
+
+    Tool mutations refuse until the file is cleaned; recovery is via .bak,
+    not silent rewrite (matches hermes-agent tools/memory_tool.py).
+    """
     store = MemoryStore(memory_dir=tmp_path, memory_char_limit=30)
     store.load_from_disk()
-    # Plant a large single entry on disk (as if hand-edited)
     (tmp_path / "MEMORY.md").write_text("x" * 100, encoding="utf-8")
     store.load_from_disk()
     assert len(store.memory_entries) == 1
     r = store.remove("memory", "xxxx")
-    assert r["success"] is True
-    assert store.memory_entries == []
+    assert r["success"] is False
+    assert r.get("drift_backup")
+    assert "round-trip" in (r.get("error") or "").lower() or "drift" in (
+        r.get("error") or ""
+    ).lower() or "wouldn't" in (r.get("error") or "")
 
 
 def test_no_match_does_not_trip_breaker(tmp_path: Path) -> None:

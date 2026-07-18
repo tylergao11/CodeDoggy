@@ -25,6 +25,8 @@ class ModelConfig:
     temperature: float | None = 0.2
     max_tokens: int | None = None
     timeout_s: float = 120.0
+    # Grok SamplingConfig.context_window — total model context tokens.
+    context_window: int | None = None
     extra_headers: dict[str, str] = field(default_factory=dict)
     # Opaque bag for provider-specific options (num_ctx, etc.).
     extra: dict[str, Any] = field(default_factory=dict)

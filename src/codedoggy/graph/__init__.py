@@ -23,6 +23,8 @@ from codedoggy.graph.builder import (
 )
 from codedoggy.graph.cache import (
     CACHE_FILE_NAME,
+    CACHE_FORMAT_VERSION,
+    CacheFormatError,
     get_cache_path,
     load_index,
     save_index,
@@ -50,6 +52,8 @@ from codedoggy.graph.watcher import EventDebouncer, WorkspaceWatcher
 
 __all__ = [
     "CACHE_FILE_NAME",
+    "CACHE_FORMAT_VERSION",
+    "CacheFormatError",
     "MAX_INDEXABLE_FILE_SIZE",
     "CodebaseGraph",
     "EventDebouncer",

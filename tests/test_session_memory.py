@@ -8,6 +8,7 @@ from pathlib import Path
 from codedoggy.audit.types import MemorySelectRequest, MutationEvent
 from codedoggy.bootstrap import build_session
 from codedoggy.memory import HermesMemorySelector, MemoryStore, SessionStore
+from codedoggy.memory.redact import redact_secrets
 from codedoggy.model import CompletionResult
 from codedoggy.tools import ToolCallContext, ToolRegistryBuilder
 
@@ -28,6 +29,162 @@ def test_session_store_search_and_scroll(tmp_path: Path) -> None:
 
     around = store.get_messages_around("s1", hits[0].message_id, window=2)
     assert around["window"]
+    store.close()
+
+
+def test_redact_secrets_pure() -> None:
+    raw = (
+        "export OPENAI_API_KEY=sk-proj-abcdefghijklmnopqrstuvwxyz123456 "
+        "Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.payload.sig "
+        "password=hunter2xx "
+        "token ghp_ABCDEFGHIJKLMNOPQRSTUV "
+        "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA\n-----END RSA PRIVATE KEY-----"
+    )
+    out = redact_secrets(raw)
+    assert "sk-proj-" not in out
+    assert "eyJhbGci" not in out
+    assert "hunter2xx" not in out
+    assert "ghp_" not in out
+    assert "BEGIN RSA" not in out
+    assert "[REDACTED" in out
+    assert redact_secrets(None) == ""
+    assert redact_secrets("") == ""
+
+
+def test_append_message_redacts_before_write(tmp_path: Path) -> None:
+    """No dual-store: secrets never land unredacted in SQLite / FTS."""
+    store = SessionStore(tmp_path / "r.db")
+    store.ensure_session("s1")
+    secret = "deploy with OPENAI_API_KEY=sk-proj-abcdefghijklmnopqrstuvwxyz999999"
+    store.append_message("s1", "user", secret)
+    store.append_message(
+        "s1",
+        "assistant",
+        "ok",
+        tool_calls=[{"id": "1", "name": "x", "arguments": {"token": "sk-abcdefghijklmnopqrstuvwxyz1234"}}],
+    )
+    msgs = store.get_messages("s1")
+    blob = " ".join((m.get("content") or "") + " " + str(m.get("tool_calls") or "") for m in msgs)
+    assert "sk-proj-" not in blob
+    assert "sk-abcdefghijklmnopqrstuvwxyz1234" not in blob
+    assert "REDACTED" in blob or "[REDACTED" in blob
+    # FTS must not surface the raw key either
+    hits = store.search("OPENAI deploy", limit=5, roles=["user", "assistant"])
+    for h in hits:
+        assert "sk-proj-" not in (h.content or "")
+        assert "sk-proj-" not in (h.snippet or "")
+    store.close()
+
+
+def test_hermes_select_scopes_fts_with_cwd_and_roles(tmp_path: Path) -> None:
+    """Selector passes cwd/roles into SessionStore.search; tool dumps excluded by default."""
+    ss = SessionStore(tmp_path / "scope.db")
+    ss.ensure_session("a", cwd="/proj/alpha", goal="auth", title="alpha")
+    ss.append_message("a", "user", "JWT login timeout in alpha workspace")
+    ss.append_message("a", "assistant", "fixed expiry for alpha")
+    ss.append_message(
+        "a",
+        "tool",
+        "raw tool dump JWT secrets dump should not hit default roles filter",
+        tool_name="run_terminal_cmd",
+    )
+    ss.ensure_session("b", cwd="/proj/beta", goal="other", title="beta")
+    ss.append_message("b", "user", "JWT login timeout in beta workspace")
+    ss.append_message("b", "assistant", "beta JWT notes")
+
+    sel = HermesMemorySelector(session_store=ss, include_current_session=True)
+    # cwd scopes to alpha only
+    res = sel.select(
+        MemorySelectRequest(
+            goal="auth",
+            mutation=MutationEvent(
+                path="auth.py", tool_name="search_replace", call_id="1", after="x"
+            ),
+            trajectory_summary="(none)",
+            session_id="current",
+            query_hint="JWT login",
+            max_session_hits=10,
+            extra={"cwd": "/proj/alpha", "roles": ["user", "assistant"]},
+        )
+    )
+    assert res.session_hits
+    joined = "\n".join(res.session_hits)
+    assert "alpha" in joined.lower() or "JWT" in joined
+    assert "beta" not in joined.lower()
+    # tool role excluded by default roles
+    assert "raw tool dump" not in joined
+    assert "[tool]" not in joined
+
+    # include_current_session=False excludes request.session_id
+    ss.append_message("sid-now", "user", "JWT login current session only unique")
+    excl = HermesMemorySelector(
+        session_store=ss, include_current_session=False
+    ).select(
+        MemorySelectRequest(
+            goal="auth",
+            mutation=MutationEvent(
+                path="auth.py", tool_name="t", call_id="1", after="x"
+            ),
+            trajectory_summary="(none)",
+            session_id="sid-now",
+            query_hint="JWT login unique",
+            max_session_hits=10,
+            extra={"roles": ["user", "assistant"]},
+        )
+    )
+    assert all("current session only unique" not in h for h in excl.session_hits)
+
+    # Explicit roles can include tool if requested
+    with_tool = sel.select(
+        MemorySelectRequest(
+            goal="auth",
+            mutation=MutationEvent(
+                path="auth.py", tool_name="t", call_id="1", after="x"
+            ),
+            trajectory_summary="(none)",
+            session_id="current",
+            query_hint="raw tool dump JWT",
+            max_session_hits=10,
+            extra={"cwd": "/proj/alpha", "roles": ["tool"]},
+        )
+    )
+    assert any("tool dump" in h.lower() or "[tool]" in h for h in with_tool.session_hits)
+    ss.close()
+
+
+def test_hydrate_uses_get_messages_tail(tmp_path: Path) -> None:
+    """Kernel hydrate prefers get_messages_tail (newest limit), not oldest head."""
+    from codedoggy.session.kernel import RuntimeKernel
+    from codedoggy.turn import SampleResult
+    from codedoggy.turn.runner import AgentTurnRunner
+
+    class DummySampler:
+        def sample(self, messages, tool_defs):
+            return SampleResult(content="ok")
+
+    store = SessionStore(tmp_path / "h.db")
+    sid = "hydrate-sid"
+    store.ensure_session(sid, cwd=str(tmp_path))
+    for i in range(15):
+        store.append_message(sid, "user", f"msg-{i:02d}")
+
+    tools = ToolRegistryBuilder.new().finalize()
+    runner = AgentTurnRunner(sampler=DummySampler(), tools=tools)
+    kernel = RuntimeKernel(
+        session_id=sid,
+        cwd=tmp_path,
+        turn_runner=runner,
+        session_store=store,
+    )
+    n = kernel.hydrate_from_store(limit=5)
+    assert n == 5
+    live = runner.live_messages
+    assert len(live) == 5
+    # Tail: newest 5 oldest→newest → msg-10 .. msg-14
+    contents = [m.content for m in live]
+    assert contents[0] == "msg-10"
+    assert contents[-1] == "msg-14"
+    assert "msg-00" not in contents
     store.close()
 
 
@@ -145,7 +302,8 @@ def test_hermes_selector_live_and_same_session(tmp_path: Path) -> None:
 def test_session_search_tool(tmp_path: Path) -> None:
     db = tmp_path / "state.db"
     store = SessionStore(db)
-    store.ensure_session("s1", title="deploy")
+    # cwd must match tool context (session_search scopes discovery to workspace)
+    store.ensure_session("s1", cwd=str(tmp_path.resolve()), title="deploy")
     store.append_message("s1", "user", "kubernetes rollout failed")
     store.append_message("s1", "assistant", "check image pull secrets")
 
@@ -209,7 +367,9 @@ def test_memory_manager_prefetch_and_one_external(tmp_path: Path) -> None:
     class Ext(BaseMemoryProvider):
         name = "ext_a"
 
-        def prefetch(self, query: str, *, session_id: str = "") -> str:
+        def prefetch(
+            self, query: str, *, session_id: str = "", cwd: str = ""
+        ) -> str:
             return "external-hit"
 
     class Ext2(BaseMemoryProvider):

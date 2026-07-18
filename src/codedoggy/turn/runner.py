@@ -63,6 +63,14 @@ class AgentTurnRunner:
             return {"ok": False, "reason": "rewind unsupported"}
         before = len(self.live_messages)
         self.live_messages = rew(self.live_messages, as_reference=as_reference)
+        # Hermes: transcript truncated under same session_id → rewound
+        # Caller may pass session via live; best-effort if bound on self later.
+        mm = getattr(self, "_memory_manager", None)
+        sid = getattr(self, "_session_id", None)
+        if mm is not None and sid:
+            from codedoggy.memory.hermes_seam import on_transcript_rewound
+
+            on_transcript_rewound(mm, session_id=str(sid))
         return {
             "ok": True,
             "checkpoint": str(path),
@@ -86,36 +94,50 @@ class AgentTurnRunner:
             check = getattr(session, "is_cancel_requested", None)
             return bool(check()) if callable(check) else False
 
-        system_prompt = self.system_prompt
-        ext = getattr(session, "extensions", None)
-        mem = getattr(ext, "memory", None) if ext is not None else None
-        memory_manager = getattr(ext, "memory_manager", None) if ext is not None else None
-        session_store = getattr(ext, "session_store", None) if ext is not None else None
+        # Prefer RuntimeKernel as single source for handles + system prompt base
+        kernel = getattr(session, "_kernel", None)
+        if kernel is None:
+            ext0 = getattr(session, "extensions", None)
+            kernel = getattr(ext0, "kernel", None) if ext0 is not None else None
 
-        # Memory pillar: prefer MemoryManager system blocks, else curated store
-        if memory_manager is not None:
-            try:
-                blocks = memory_manager.build_system_prompt()
-                if blocks:
-                    system_prompt = (
-                        f"{system_prompt}\n\n{blocks}" if system_prompt else blocks
-                    )
-            except Exception:  # noqa: BLE001
-                logger.warning("memory_manager.build_system_prompt failed", exc_info=True)
-        elif mem is not None:
-            blocks_fn = getattr(mem, "system_prompt_blocks", None)
-            if callable(blocks_fn):
-                blocks = blocks_fn()
-                if blocks:
-                    system_prompt = (
-                        f"{system_prompt}\n\n{blocks}" if system_prompt else blocks
-                    )
+        system_prompt = (
+            getattr(kernel, "base_system_prompt", None) or self.system_prompt
+        )
+        ext = getattr(session, "extensions", None)
+        mem = (
+            getattr(kernel, "memory", None)
+            if kernel is not None
+            else (getattr(ext, "memory", None) if ext is not None else None)
+        )
+        memory_manager = (
+            getattr(kernel, "memory_manager", None)
+            if kernel is not None
+            else (getattr(ext, "memory_manager", None) if ext is not None else None)
+        )
+        session_store = (
+            getattr(kernel, "session_store", None)
+            if kernel is not None
+            else (getattr(ext, "session_store", None) if ext is not None else None)
+        )
+
+        # Hermes seam: system memory block (curated freeze + provider static)
+        from codedoggy.memory.hermes_seam import (
+            build_system_memory_block,
+            on_turn_begin,
+            on_turn_end,
+            prefetch_fenced,
+        )
+
+        blocks = build_system_memory_block(memory_manager, mem)
+        if blocks:
+            system_prompt = (
+                f"{system_prompt}\n\n{blocks}" if system_prompt else blocks
+            )
 
         # Lazy imports avoid audit ↔ turn package cycles at import time.
         from codedoggy.audit.hooks import resolve_audit_hooks
         from codedoggy.audit.memory_select import CuratedMemorySelector
         from codedoggy.memory.hermes_select import HermesMemorySelector
-        from codedoggy.memory.prefetch import inject_prefetch_block, prefetch_for_turn
 
         audit = getattr(ext, "audit", None) if ext is not None else None
         selector = None
@@ -137,30 +159,16 @@ class AgentTurnRunner:
                 session_store=session_store,
             )
 
-        # Prefetch: MemoryManager.prefetch_all when present, else FTS selector path
-        if memory_manager is not None:
-            try:
-                pre = memory_manager.prefetch_all(
-                    request.text or "", session_id=session_id or ""
-                )
-                if pre:
-                    system_prompt = inject_prefetch_block(
-                        system_prompt,
-                        "## Prefetched memory (MemoryManager)\n"
-                        "Reference only — latest user message wins:\n" + pre,
-                    )
-            except Exception:  # noqa: BLE001
-                logger.warning("memory_manager.prefetch_all failed", exc_info=True)
-        else:
-            system_prompt = inject_prefetch_block(
-                system_prompt,
-                prefetch_for_turn(
-                    selector=selector,
-                    session=session,
-                    session_id=session_id,
-                    user_text=request.text,
-                ),
-            )
+        cwd_s = str(cwd) if cwd is not None else ""
+        # Hermes: fenced prefetch for sample-time user inject only
+        prefetch_user_block = prefetch_fenced(
+            memory_manager,
+            user_text=request.text or "",
+            session_id=session_id or "",
+            cwd=cwd_s,
+            selector=selector,
+            session=session,
+        )
 
         hooks = resolve_audit_hooks(session, explicit_hooks=self.hooks)
 
@@ -180,10 +188,27 @@ class AgentTurnRunner:
                 memory_manager=memory_manager,
             )
 
+        # Grok residual: bind ModelConfig.context_window onto budget once per run.
+        # ChatSampler wraps client; walk getattr carefully (client/config chain).
+        _bind_compactor_model_window(compactor, self.sampler)
+        # Hermes: let compactor know session_id for post-fold rewound notify
+        if compactor is not None and session_id:
+            try:
+                compactor._session_id = session_id  # type: ignore[attr-defined]
+            except Exception:  # noqa: BLE001
+                pass
+
         # Always clear per-turn suppress (bootstrap path shares one compactor).
         on_start = getattr(compactor, "on_turn_start", None)
         if callable(on_start):
             on_start()
+        turn_n = int(getattr(session, "_turn_count", 0) or 0) + 1
+        on_turn_begin(
+            memory_manager,
+            mem,
+            turn_number=turn_n,
+            user_text=request.text or "",
+        )
 
         prior = self.live_messages if self.resume_live and self.live_messages else None
 
@@ -221,6 +246,35 @@ class AgentTurnRunner:
             except Exception:  # noqa: BLE001
                 pass
 
+        # Mid-turn tool path: provider tools + session_search read stores from
+        # ctx.extra. Kernel.tool_extra is the single source; refresh every run
+        # so late-bound handles (policy, graph, mm) are visible.
+        tool_extra: dict[str, Any] = {}
+        if kernel is not None:
+            refresh = getattr(kernel, "refresh_tool_extra", None)
+            if callable(refresh):
+                refresh()
+            tool_extra = dict(getattr(kernel, "tool_extra", None) or {})
+        # Defensive fill when session was not fully kernel-wired (or keys missing)
+        if "memory_manager" not in tool_extra and memory_manager is not None:
+            tool_extra["memory_manager"] = memory_manager
+        if "memory_store" not in tool_extra and mem is not None:
+            tool_extra["memory_store"] = mem
+        if "session_store" not in tool_extra and session_store is not None:
+            tool_extra["session_store"] = session_store
+        if ext is not None:
+            if "policy" not in tool_extra:
+                pol = getattr(ext, "policy", None)
+                if pol is not None:
+                    tool_extra["policy"] = pol
+            if "graph" not in tool_extra:
+                gr = getattr(ext, "graph", None)
+                if gr is not None:
+                    tool_extra["graph"] = gr
+        if prefetch_user_block:
+            tool_extra = dict(tool_extra)
+            tool_extra["prefetch_user_block"] = prefetch_user_block
+
         loop = run_agent_loop(
             user_text=request.text,
             sampler=self.sampler,
@@ -236,11 +290,15 @@ class AgentTurnRunner:
             context_compactor=compactor,
             prior_messages=prior,
             on_archive_message=_archive,
+            tool_extra=tool_extra,
         )
 
-        # Carry live window into the next prompt (may already be pruned/folded).
+        # Normalize tool pairs before carrying live history
+        from codedoggy.context.select import sanitize_tool_pairs
+
+        live = sanitize_tool_pairs(list(loop.messages))
         if self.resume_live:
-            self.live_messages = list(loop.messages)
+            self.live_messages = live
 
         # Grok: clear UNTIL_SUCCESS suppress when a model sample completed.
         if not loop.error and compactor is not None:
@@ -248,17 +306,15 @@ class AgentTurnRunner:
             if callable(on_ok):
                 on_ok()
 
-        # Hermes MemoryManager post-turn: single spine via sync_all only.
-        # Providers warm inside sync_turn (avoids queue clobbering richer blend).
-        if memory_manager is not None:
-            try:
-                memory_manager.sync_all(
-                    request.text or "",
-                    loop.final_text or "",
-                    session_id=session_id or "",
-                )
-            except Exception:  # noqa: BLE001
-                logger.warning("memory_manager post-turn failed", exc_info=True)
+        # Hermes post-turn: sync_all + queue_prefetch_all (seam)
+        on_turn_end(
+            memory_manager,
+            user_text=request.text or "",
+            assistant_text=loop.final_text or "",
+            session_id=session_id or "",
+            cwd=cwd_s,
+            messages=list(loop.messages) if loop.messages else None,
+        )
 
         meta_extra = {
             "live_messages": len(loop.messages),
@@ -317,6 +373,77 @@ class AgentTurnRunner:
             tools_called=loop.tools_called,
             metadata={"rounds": loop.rounds, **loop.metadata, **meta_extra},
         )
+
+
+def _bind_compactor_model_window(compactor: Any, sampler: Any) -> None:
+    """If sampler exposes a ModelConfig, bind its window into the compactor.
+
+    Resolution order (Grok / ChatSampler):
+      sampler.client.config → sampler.config → sampler.client (if config-like)
+    """
+    if compactor is None or sampler is None:
+        return
+    bind = getattr(compactor, "bind_model_window", None)
+    if not callable(bind):
+        return
+
+    config = _resolve_model_config(sampler)
+    if config is None:
+        return
+
+    cw = getattr(config, "context_window", None)
+    mt = getattr(config, "max_tokens", None)
+    if cw is None:
+        extra = getattr(config, "extra", None)
+        if isinstance(extra, dict):
+            raw = extra.get("context_window")
+            if raw is None:
+                raw = extra.get("num_ctx")
+            cw = raw
+    if cw is None and mt is None:
+        return
+    try:
+        bind(
+            context_window=int(cw) if cw else None,
+            max_completion_tokens=int(mt) if mt else None,
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug("bind_model_window from sampler failed", exc_info=True)
+
+
+def _resolve_model_config(sampler: Any) -> Any | None:
+    """Walk ChatSampler → client → config without assuming types."""
+    # 1) sampler.client.config (ChatSampler + OpenAICompatClient)
+    client = getattr(sampler, "client", None)
+    if client is not None:
+        cfg = getattr(client, "config", None)
+        if callable(cfg):
+            try:
+                cfg = cfg()
+            except TypeError:
+                cfg = None
+        if cfg is not None and (
+            hasattr(cfg, "context_window") or hasattr(cfg, "max_tokens")
+        ):
+            return cfg
+        # client itself might carry the knobs
+        if hasattr(client, "context_window") or hasattr(client, "max_tokens"):
+            return client
+    # 2) sampler.config
+    cfg = getattr(sampler, "config", None)
+    if callable(cfg):
+        try:
+            cfg = cfg()
+        except TypeError:
+            cfg = None
+    if cfg is not None and (
+        hasattr(cfg, "context_window") or hasattr(cfg, "max_tokens")
+    ):
+        return cfg
+    # 3) sampler itself looks like ModelConfig
+    if hasattr(sampler, "context_window") or hasattr(sampler, "max_tokens"):
+        return sampler
+    return None
 
 
 

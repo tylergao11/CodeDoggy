@@ -150,19 +150,17 @@ class ContextCompactor:
     last_checkpoint_path: str | None = None
     # Hermes iterative summary: feed prior summary into next fold.
     previous_summary: str | None = None
-    # After fold, wait for a real usage sample before trusting estimate alone
-    # (Hermes awaiting_real_usage_after_compression anti-thrash spirit).
+    # After fold, prefer one real usage sample (bounded — never permanent).
     awaiting_real_usage: bool = False
-    # One vote per fold cycle: pending estimate flag, confirmed by real usage
     _pending_ineffective: bool = False
     _ineffective_compression_count: int = 0
-    _thrash_turns_left: int = 0  # after thrash, skip hard fold N ensures then retry
+    _thrash_turns_left: int = 0
+    AWAITING_USAGE_MAX_ENSURES: int = 3
     prefire: PrefireController = field(default_factory=PrefireController)
-    # Result of last joined prefire flush (entries_written) if any
     _prefire_flush_entries: int = 0
 
     def update_from_response(self, usage: dict[str, Any] | None) -> None:
-        """Hermes ContextEngine.update_from_response — track real API usage."""
+        """Track real API usage; clears awaiting_real_usage (Grok)."""
         if not usage or not isinstance(usage, dict):
             return
         for key in ("prompt_tokens", "input_tokens", "prompt_token_count"):
@@ -170,18 +168,17 @@ class ContextCompactor:
             if val is not None:
                 try:
                     self.budget.last_prompt_tokens = int(val)
+                    self.budget.awaiting_usage_ensures = 0
                     if self.awaiting_real_usage:
                         self.awaiting_real_usage = False
                         over = int(val) > self.budget.trigger_tokens
                         if self._pending_ineffective:
-                            # Confirm or clear the single pending vote from last fold
                             if over:
                                 self._ineffective_compression_count += 1
                             else:
                                 self._ineffective_compression_count = 0
                             self._pending_ineffective = False
                         elif not over:
-                            # Real under-budget usage always heals thrash counter
                             self._ineffective_compression_count = 0
                             self._thrash_turns_left = 0
                 except (TypeError, ValueError):
@@ -196,8 +193,23 @@ class ContextCompactor:
                     pass
                 break
 
+    def bind_sample_tools(self, tool_specs: list[Any] | None) -> None:
+        """Grok tools_reserve: count tool schemas against the window each sample."""
+        self.budget.bind_tools(tool_specs)
+
+    def bind_model_window(
+        self,
+        *,
+        context_window: int | None = None,
+        max_completion_tokens: int | None = None,
+    ) -> None:
+        self.budget.bind_model(
+            context_window=context_window,
+            max_completion_tokens=max_completion_tokens,
+        )
+
     def on_session_end(self) -> None:
-        """Hermes on_session_end — clear per-session compaction state."""
+        """Clear per-session compaction state."""
         self.previous_summary = None
         self.compaction_count = 0
         self.last_flush_cycle = -1
@@ -209,6 +221,8 @@ class ContextCompactor:
         self._prefire_flush_entries = 0
         self.budget.last_prompt_tokens = None
         self.budget.last_completion_tokens = None
+        self.budget.awaiting_usage_ensures = 0
+        self.budget.tools_reserve = 0
         self.suppressor.clear()
         self.prefire.clear()
 
@@ -322,20 +336,20 @@ class ContextCompactor:
             self._prefire_flush_entries = pre_entries
             self.last_flush_cycle = self.compaction_count
 
-        # After fold: wait for one real usage sample before another hard fold
+        # Bounded wait for real usage — never permanent when API omits usage
         if self.awaiting_real_usage and self.budget.last_prompt_tokens is None:
-            # Still allow cheap prune below — only skip the hard fold path later
-            pass
-        # Cool-down after thrash: skip hard fold for a few ensures, never block prune
+            self.budget.awaiting_usage_ensures += 1
+            if self.budget.awaiting_usage_ensures >= self.AWAITING_USAGE_MAX_ENSURES:
+                self.awaiting_real_usage = False
+                self.budget.awaiting_usage_ensures = 0
         thrash_skip_fold = False
         if self._ineffective_compression_count >= 2:
             if self._thrash_turns_left <= 0:
-                self._thrash_turns_left = 3  # skip hard fold for 3 ensure cycles
+                self._thrash_turns_left = 3
             thrash_skip_fold = self._thrash_turns_left > 0
             if thrash_skip_fold:
                 self._thrash_turns_left -= 1
             if self._thrash_turns_left <= 0:
-                # Give fold another chance after cool-down
                 self._ineffective_compression_count = 1
                 thrash_skip_fold = False
 
@@ -435,33 +449,60 @@ class ContextCompactor:
         try:
             folded, n_folded, used_llm, segment_path = self._fold_middle(working)
             folded, pruned2 = prune_oversized_tool_results(folded, self.budget)
-            # Fold may drop middle TOOL messages that carried P0 — re-inject.
             folded = reinject_missing_p0(folded, open_p0)
             folded = sanitize_tool_pairs(folded)
             after = estimate_chars(folded)
-            # One vote per fold: pending until real usage confirms
             saved = before - after
-            if n_folded > 0 and after <= self.budget.trigger_chars and saved > 0:
-                self._pending_ineffective = False
-                self._ineffective_compression_count = 0
-            elif n_folded > 0 and (
-                after > self.budget.trigger_chars
-                or saved < max(256, before // 20)
+            # Grok commit gate: never replace history with a *worse* window.
+            # No savings → reject. Still over trigger with weak savings → commit
+            # but mark ineffective (anti-thrash); strong savings → heal.
+            min_save = max(256, before // 20)
+            if n_folded > 0 and saved <= 0:
+                self._pending_ineffective = True
+                self._ineffective_compression_count += 1
+                working = reinject_missing_p0(working, open_p0)
+                working = sanitize_tool_pairs(working)
+                after_w = estimate_chars(working)
+                return CompactionResult(
+                    messages=working,
+                    did_compact=pruned > 0 or retained > 0 or flush_entries > 0,
+                    pruned_tools=pruned,
+                    retained_cleared=retained,
+                    chars_before=before,
+                    chars_after=after_w,
+                    mode="fold_rejected+no_savings",
+                    flush_entries=flush_entries,
+                    segment_path=str(segment_path) if segment_path else None,
+                )
+            if n_folded > 0 and (
+                after > self.budget.trigger_chars or saved < min_save
             ):
                 self._pending_ineffective = True
             else:
                 self._pending_ineffective = False
+                if n_folded > 0:
+                    self._ineffective_compression_count = 0
             self.compaction_count += 1
             self.awaiting_real_usage = True
-            self.budget.last_prompt_tokens = None  # force real sample next
+            self.budget.awaiting_usage_ensures = 0
+            self.budget.last_prompt_tokens = None
             self.suppressor.on_compact_success()
-            # Honest mode labels: don't claim "fold" when middle was not folded.
+            # Hermes: transcript truncated in-place → providers rewound
+            if n_folded > 0 and self.memory_manager is not None:
+                sid = getattr(self, "_session_id", None) or ""
+                if not sid and self.session_store is not None:
+                    sid = str(getattr(self.session_store, "last_session_id", "") or "")
+                if sid:
+                    try:
+                        from codedoggy.memory.hermes_seam import on_transcript_rewound
+
+                        on_transcript_rewound(self.memory_manager, session_id=sid)
+                    except Exception:  # noqa: BLE001
+                        logger.debug("post-fold rewound notify failed", exc_info=True)
             if n_folded > 0:
                 core = "llm_summary" if used_llm else "fold"
                 if self.mode is not CompactionMode.SUMMARY:
                     core = f"{core}+{self.mode.value}"
-                if saved <= 0:
-                    core = f"{core}+no_savings"
             elif pruned or retained or pruned2:
                 core = "hard_trim+prune" if mode == "prune" else "hard_trim"
             elif flush_entries:
@@ -522,6 +563,11 @@ class ContextCompactor:
         if not middle:
             return sanitize_tool_pairs(system + head + tail), 0, False, None
 
+        # Hermes seam: on_pre_compress before fold discards middle
+        from codedoggy.memory.hermes_seam import on_pre_compress
+
+        pre_compress_extra = on_pre_compress(self.memory_manager, list(messages))
+
         segment_path: Path | None = None
         if self.checkpoint_on_fold or self.mode is CompactionMode.SEGMENTS:
             try:
@@ -534,7 +580,9 @@ class ContextCompactor:
             except Exception as e:  # noqa: BLE001
                 logger.warning("segment/checkpoint write failed: %s", e)
 
-        summary_text, used_llm = self._summarize_middle(middle)
+        summary_text, used_llm = self._summarize_middle(
+            middle, provider_extract=pre_compress_extra
+        )
         # Hermes iterative summary: remember for next fold
         if summary_text:
             self.previous_summary = summary_text
@@ -559,10 +607,21 @@ class ContextCompactor:
             segment_path,
         )
 
-    def _summarize_middle(self, middle: list[Message]) -> tuple[str, bool]:
+    def _summarize_middle(
+        self,
+        middle: list[Message],
+        *,
+        provider_extract: str = "",
+    ) -> tuple[str, bool]:
         # Strip prior compaction directives from sketch input (Hermes hygiene)
         sketch = _deterministic_sketch(middle)
         sketch = _strip_prior_summary_directives(sketch)
+        if provider_extract and str(provider_extract).strip():
+            sketch = (
+                sketch
+                + "\n\n### Memory provider pre-compress extract\n"
+                + str(provider_extract).strip()
+            )
         if self.summary_client is None:
             if self.previous_summary:
                 return (
@@ -573,21 +632,24 @@ class ContextCompactor:
         try:
             from codedoggy.model.types import ChatMessage
 
+            # Grok: summarizer sees the real middle (full sketch), not a tiny head.
             user_parts = []
             if self.previous_summary:
                 user_parts.append(
                     "Previous compaction summary (update iteratively, do not drop "
                     "still-relevant facts):\n"
-                    + self.previous_summary[:4_000]
+                    + self.previous_summary[:8_000]
                 )
-            user_parts.append("New middle transcript to fold:\n" + sketch[:10_000])
+            # Cap only at a large bound for transport; do not hide middle content.
+            middle_body = sketch if len(sketch) <= 80_000 else sketch[:80_000] + "\n…[cap]"
+            user_parts.append("New middle transcript to fold:\n" + middle_body)
             result = self.summary_client.complete(
                 [
                     ChatMessage(role="system", content=_SUMMARIZER_SYSTEM),
                     ChatMessage(role="user", content="\n\n".join(user_parts)),
                 ],
                 temperature=0.1,
-                max_tokens=700,
+                max_tokens=900,
             )
             text = (result.content or "").strip()
             text = re.sub(r"<think>[\s\S]*?</think>", "", text, flags=re.I).strip()
@@ -635,14 +697,11 @@ def _refresh_memory_after_flush(
     memory_store: Any | None,
     memory_manager: Any | None = None,
 ) -> list[Message]:
-    """After mid-turn flush: one-spine refresh via MemoryManager when bound."""
+    """After mid-turn flush: one-spine refresh via Hermes seam when bound."""
     if memory_manager is not None:
-        notify = getattr(memory_manager, "notify_memory_write", None)
-        if callable(notify):
-            try:
-                notify("memory")
-            except Exception as e:  # noqa: BLE001
-                logger.warning("memory_manager.notify_memory_write failed: %s", e)
+        from codedoggy.memory.hermes_seam import notify_curated_write
+
+        notify_curated_write(memory_manager, "memory")
         store = getattr(memory_manager, "curated_store", None) or memory_store
     else:
         store = memory_store

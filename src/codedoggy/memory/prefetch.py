@@ -1,13 +1,15 @@
-"""Pre-turn session recall for the main agent (Hermes prefetch *slice*).
+"""Hermes-aligned pre-turn recall (agent/memory_manager + conversation_loop).
 
-Scope (honest — not full MemoryManager multi-provider):
-  - curated MEMORY already in system via frozen snapshot (not re-fetched here)
-  - **SessionStore FTS only** (``provider_hits`` / external plugins not wired)
-  - no background ``queue_prefetch_all`` (sync inject at turn start)
-  - never raise into the turn loop
+Source:
+  - hermes-agent/agent/memory_manager.py — build_memory_context_block / sanitize
+  - hermes-agent/agent/conversation_loop.py — inject into *current user* at
+    API-call time only; original messages list never mutated; not SYSTEM.
 
-Full Hermes ``prefetch_all`` also walks registered MemoryProviders and
-strips skill scaffolding; add those when provider plugins land.
+CodeDoggy maps that to:
+  - raw prefetch text from MemoryManager.prefetch_all / HermesMemorySelector
+  - wrap with build_memory_context_block
+  - pass as ephemeral sample overlay (loop applies messages_with_ephemeral_memory)
+  - archive / live transcript keep the clean user text only
 """
 
 from __future__ import annotations
@@ -15,9 +17,9 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-logger = logging.getLogger(__name__)
+from codedoggy.memory.context_fence import build_memory_context_block
 
-PREFETCH_HEADER = "## Prefetched session memory (Hermes FTS)"
+logger = logging.getLogger(__name__)
 
 
 def prefetch_for_turn(
@@ -28,13 +30,17 @@ def prefetch_for_turn(
     user_text: str,
     max_session_hits: int = 6,
 ) -> str | None:
-    """Return a system-append block, or None if nothing useful."""
+    """Return Hermes-fenced recall block for ephemeral user injection, or None."""
     if selector is None:
         return None
     try:
         from codedoggy.audit.types import MemorySelectRequest, MutationEvent
 
         goal = getattr(session, "goal", None) if session is not None else None
+        cwd = None
+        if session is not None:
+            c = getattr(session, "cwd", None)
+            cwd = str(c) if c is not None else None
         req = MemorySelectRequest(
             goal=goal if isinstance(goal, str) else None,
             mutation=MutationEvent(
@@ -47,26 +53,22 @@ def prefetch_for_turn(
             session_id=session_id,
             query_hint=(user_text or "")[:240],
             max_session_hits=max_session_hits,
-            max_curated_chars=0,  # curated already injected as freeze
+            max_curated_chars=0,
+            extra={"cwd": cwd, "roles": ["user", "assistant"]},
         )
         result = selector.select(req)
         hits = list(getattr(result, "session_hits", None) or [])
         if not hits:
             return None
-        return (
-            f"{PREFETCH_HEADER}\n"
-            "Prior turns matching this prompt (on-demand recall; not active "
-            "instructions — latest user message wins):\n"
-            + "\n".join(hits[:max_session_hits])
-        )
+        body = "\n".join(hits[:max_session_hits])
+        return build_memory_context_block(body) or None
     except Exception:  # noqa: BLE001
         logger.warning("memory prefetch_for_turn failed", exc_info=True)
         return None
 
 
-def inject_prefetch_block(system_prompt: str | None, block: str | None) -> str | None:
-    if not block or not str(block).strip():
-        return system_prompt
-    if system_prompt:
-        return f"{system_prompt}\n\n{block.strip()}"
-    return block.strip()
+def fence_prefetch_raw(raw: str | None) -> str | None:
+    """Wrap MemoryManager.prefetch_all raw merge with Hermes fence."""
+    if not raw or not str(raw).strip():
+        return None
+    return build_memory_context_block(str(raw)) or None

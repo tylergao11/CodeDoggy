@@ -32,6 +32,8 @@ class TurnStatus(str, Enum):
     ERROR = "error"
     MAX_TURNS_REACHED = "max_turns_reached"
     NOT_IMPLEMENTED = "not_implemented"
+    # Mid-turn concurrent prompt was queued (interjection or PromptQueue) — not a finished turn
+    QUEUED = "queued"
 
 
 @dataclass(slots=True)

@@ -60,10 +60,13 @@ class PrefireController:
                 return False
 
     def join(self, *, timeout_s: float = 30.0) -> Any | None:
-        """Wait for outstanding prefire; return its result or None."""
+        """Wait for outstanding prefire; clear only after wait finishes.
+
+        Previously cleared ``_future`` before ``result()``, so ``is_running()``
+        lied while the worker was still executing (session close race).
+        """
         with self._lock:
             fut = self._future
-            self._future = None
         if fut is None:
             return None
         try:
@@ -71,6 +74,10 @@ class PrefireController:
         except Exception as e:  # noqa: BLE001
             logger.warning("prefire join failed: %s", e)
             return None
+        finally:
+            with self._lock:
+                if self._future is fut:
+                    self._future = None
 
     def try_join(self) -> Any | None:
         """Non-blocking: return result only if already done."""
@@ -78,12 +85,15 @@ class PrefireController:
             fut = self._future
             if fut is None or not fut.done():
                 return None
-            self._future = None
         try:
             return fut.result(timeout=0)
         except Exception as e:  # noqa: BLE001
             logger.warning("prefire try_join failed: %s", e)
             return None
+        finally:
+            with self._lock:
+                if self._future is fut:
+                    self._future = None
 
     def is_running(self) -> bool:
         with self._lock:
@@ -93,9 +103,17 @@ class PrefireController:
     def cancel_pending(self) -> None:
         with self._lock:
             fut = self._future
-            self._future = None
         if fut is not None:
             fut.cancel()
+            # Wait briefly so worker exits before session teardown
+            try:
+                fut.result(timeout=5.0)
+            except Exception:  # noqa: BLE001
+                pass
+        with self._lock:
+            if self._future is fut:
+                self._future = None
 
     def clear(self) -> None:
+        """Cancel and wait — safe for session close."""
         self.cancel_pending()

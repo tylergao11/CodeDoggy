@@ -55,11 +55,7 @@ class SampleResult:
 
 @dataclass(slots=True)
 class FileMutation:
-    """Workspace mutation discovered from a tool call (for quality hooks).
-
-    Tools should set first-hand ``before``/``after`` on the call context when
-    possible; the executor falls back to path-only events.
-    """
+    """Workspace mutation — Grok hunk unit for Shadow (multi per tool call)."""
 
     path: str
     tool_name: str
@@ -68,6 +64,7 @@ class FileMutation:
     before: str | None = None
     after: str | None = None
     is_create: bool = False
+    is_delete: bool = False
 
 
 @dataclass(slots=True)
@@ -80,6 +77,7 @@ class ToolResultRecord:
     error_code: str | None = None
     kind: ToolKind | None = None
     mutation: FileMutation | None = None
+    mutations: list[FileMutation] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -88,14 +86,19 @@ class HookDecision:
 
     # Extra text appended to the tool observation the model sees.
     append_observation: str | None = None
-    # Stop the loop early (e.g. hard quality gate).
+    # Stop the loop early (e.g. hard quality gate / shadow P0).
     abort: bool = False
     abort_reason: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
 class LoopResult:
-    """Result of one agentic run (one user prompt)."""
+    """Result of one agentic run (one user prompt).
+
+    Exit flags mirror Grok TurnOutcome: completed / max_turns / cancelled
+    (user or permission) / aborted (hook hard) / error.
+    """
 
     final_text: str | None
     messages: list[Message]
@@ -106,4 +109,6 @@ class LoopResult:
     cancelled: bool = False
     aborted: bool = False
     error: str | None = None
+    # Grok-aligned exit label: completed|max_turns|cancelled|permission_reject|…
+    exit_reason: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)

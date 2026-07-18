@@ -79,8 +79,15 @@ class IndexManager:
             return self._index
 
     def get_snapshot(self) -> ScopeGraphIndex:
-        """Return current index (caller must not mutate without lock)."""
-        return self.index
+        """Return a shallow immutable-enough copy for lock-free reads.
+
+        Watcher continues mutating ``_index``; navigators must use this copy
+        or hold the manager lock.
+        """
+        import copy
+
+        with self._lock:
+            return copy.copy(self._index)
 
     def rebuild(self) -> ScopeGraphIndex:
         with self._lock:
@@ -127,33 +134,42 @@ class IndexManager:
         self._index.remove_file(rel)
 
     def _reindex_file(self, path: Path) -> None:
-        """reindex_file: remove then extract single file (index_manager.rs)."""
+        """reindex_file: extract first, then swap — never leave a hole on extract fail."""
         abs_path = path if path.is_absolute() else (self.root / path)
         abs_path = abs_path.resolve()
         rel = self._rel(abs_path)
-        self._index.remove_file(rel)
 
         if not abs_path.is_file():
+            # File gone — drop index entries only
+            self._index.remove_file(rel)
             return
         if not self.registry.is_supported(abs_path):
+            self._index.remove_file(rel)
             return
         try:
             st = abs_path.stat()
         except OSError:
             return
         if st.st_size == 0 or st.st_size > MAX_INDEXABLE_FILE_SIZE:
+            self._index.remove_file(rel)
             return
         try:
             with abs_path.open("rb") as f:
                 head = f.read(8000)
                 if b"\x00" in head:
-                    return
+                    return  # keep prior index; binary/corrupt skip without wipe
                 raw = head + f.read()
             source = raw.decode("utf-8", errors="replace")
+            extracted = self.registry.extract(abs_path, source)
         except OSError:
             return
+        except Exception:  # noqa: BLE001
+            # Extract failed — leave previous symbols for this path intact
+            logger.debug("reindex extract failed path=%s", rel, exc_info=True)
+            return
 
-        extracted = self.registry.extract(abs_path, source)
+        # Successful extract → atomic-ish swap
+        self._index.remove_file(rel)
         self._index.add_definitions(rel, extracted.definitions)
         self._index.add_references(rel, extracted.references)
         self._index.add_aliases(rel, extracted.aliases)

@@ -172,7 +172,7 @@ def test_fail_important_deferred_not_mid_tool(tmp_path: Path) -> None:
     assert "P0" not in (tool_msg.content or "")
     assert "off-goal" not in (tool_msg.content or "")
     assert result.completed
-    assert "off-goal" in result.metadata.get("audit_deferred", "")
+    assert "off-goal" in result.metadata.get("shadow_deferred", "")
     assert "off-goal" in (result.final_text or "")
     # Non-P0 closed loop: deferred note lands in transcript for SessionStore/FTS.
     assert any(

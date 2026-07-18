@@ -98,6 +98,8 @@ def model_config_from_env(
         temperature=_env_float("CODEDOGGY_TEMPERATURE", 0.2),
         max_tokens=_env_int("CODEDOGGY_MAX_TOKENS", None),
         timeout_s=_env_float("CODEDOGGY_TIMEOUT_S", 120.0) or 120.0,
+        context_window=_env_int("CODEDOGGY_CONTEXT_WINDOW", None)
+        or _env_int("CODEDOGGY_CONTEXT_MAX_TOKENS", 32768),
     )
 
 

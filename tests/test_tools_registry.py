@@ -39,8 +39,28 @@ def test_new_registers_file_tools() -> None:
     assert b.has_tool_id("Doggy:grep")
     assert b.has_tool_id("Doggy:run_terminal_cmd")
     assert b.has_tool_id("Doggy:memory")
+    assert b.has_tool_id("Doggy:task")
+    assert b.has_tool_id("Doggy:get_subagent_output")
     kinds = b.known_tool_kinds()
     assert kinds["Doggy:read_file"] is ToolKind.Read
+    assert kinds["Doggy:task"].value == "task"
+
+
+def test_grok_product_client_names() -> None:
+    """Default finalize uses Grok product renames (xai-grok-agent config.rs)."""
+    set_ = ToolRegistryBuilder.new().finalize()
+    names = set(set_.client_names())
+    assert "run_terminal_command" in names
+    assert "get_command_or_subagent_output" in names
+    assert "kill_command_or_subagent" in names
+    assert "wait_commands_or_subagents" in names
+    assert "spawn_subagent" in names
+    # Wire ids still resolve on call path but are not the product listing name
+    defs = {d.name: d for d in set_.tool_definitions()}
+    assert "run_terminal_command" in defs
+    props = defs["run_terminal_command"].parameters.get("properties") or {}
+    assert "background" in props
+    assert "is_background" not in props
 
 
 def test_finalize_tool_definitions_and_call(tmp_path: Path) -> None:

@@ -1,4 +1,10 @@
-"""grep — content search via ripgrep when available, else pure Python."""
+"""grep — Grok GrepTool wire + source-ported finalize formatters.
+
+Format/finalize: ``codedoggy.tools.grok_build.grep_format``
+  Ported from implementations/grok_build/grep/mod.rs
+
+rg invocation mirrors prepare_grep: ``--heading --with-filename --line-number``.
+"""
 
 from __future__ import annotations
 
@@ -7,20 +13,24 @@ import re
 import shutil
 import subprocess
 import sys
-from enum import Enum
 from pathlib import Path
 from typing import Any
 
 from codedoggy.tools.defaults import (
-    DEFAULT_TOOL_OUTPUT_BYTES,
-    GREP_CONTENT_LINE_DEFAULT,
-    GREP_CONTENT_LINE_LIMIT,
-    GREP_DEFAULT_MAX_CHARS_PER_LINE,
-    GREP_FILE_COUNT_DEFAULT,
-    GREP_FILE_COUNT_LIMIT,
-    GREP_MAX_STDOUT_BYTES,
     GREP_TIMEOUT_DEFAULT_SECS,
     GREP_TIMEOUT_WSL_SECS,
+)
+from codedoggy.tools.grok_build.grep_format import (
+    DEFAULT_MAX_CHARS_PER_LINE,
+    DEFAULT_TOOL_OUTPUT_BYTES,
+    MAX_STDOUT_BYTES,
+    OutputMode,
+    finalize_grep_body,
+    no_matches_card,
+    resolve_effective_head_limit,
+    rg_exit2_message,
+    rg_unknown_exit_message,
+    wrap_workspace_result,
 )
 from codedoggy.tools.kinds import ToolKind, ToolNamespace
 from codedoggy.tools.runtime import (
@@ -33,30 +43,26 @@ from codedoggy.tools.runtime import (
 )
 from codedoggy.tools.util.paths import resolve_model_path
 
+# Re-export for tests
+__all__ = [
+    "GrepTool",
+    "OutputMode",
+    "resolve_effective_head_limit",
+    "format_content_output",
+]
+
+from codedoggy.tools.grok_build.grep_format import format_content_output  # noqa: E402
+
+# Grok description_template (exact product wording; Doggy note about fallback appended)
 _DESCRIPTION = """\
-Search file contents with regular expressions.
+Search file contents with regular expressions (ripgrep).
 
-Usage:
-- Prefer this tool over shell pipelines for content search.
-- Supports full regex syntax (e.g., "log.*Error", "function\\s+\\w+").
+- Full regex syntax, so escape literal special characters: `functionCall\\(`, or `interface\\{\\}` to find interface{} in Go.
 - Pass the pattern as a raw regex string — no surrounding quotes.
-- Filter files with glob (e.g., "*.js", "*.{ts,tsx}").
-- When the `rg` binary is available it is used; otherwise a pure-Python fallback
-  runs (slower). Without `rg`, context flags (-A/-B/-C), `type`, and multiline
-  are rejected rather than silently ignored — install ripgrep or omit those args.
-- Python fallback only supports simple `*.ext` globs (not brace globs like `*.{ts,tsx}`).
-- This tool returns content matches only (path:line:text). Results are wrapped
-  in a <workspace_result> block with a Found N matching lines summary.
-- head_limit defaults to 200 matching content lines (hard cap 2000).
-- Multiline mode can match across lines when enabled (requires `rg`, or is rejected
-  on the Python fallback).
+- Respects .gitignore unless you pass a broad glob like '--glob *'.
+- Only filter by 'type' or 'glob' when you are sure of the file type; import paths may not match source file types (.js vs .ts).
+- Output is ripgrep-style: ':' marks match lines, '-' marks context lines, grouped by file. Large results are capped and report "at least" counts.
 """
-
-
-class OutputMode(str, Enum):
-    Content = "content"
-    FilesWithMatches = "files_with_matches"
-    Count = "count"
 
 
 def _is_wsl() -> bool:
@@ -72,60 +78,6 @@ def _is_wsl() -> bool:
 
 def grep_timeout_secs() -> int:
     return GREP_TIMEOUT_WSL_SECS if _is_wsl() else GREP_TIMEOUT_DEFAULT_SECS
-
-
-def resolve_effective_head_limit(head_limit: int | None, mode: OutputMode) -> int:
-    if mode is OutputMode.Content:
-        default, cap = GREP_CONTENT_LINE_DEFAULT, GREP_CONTENT_LINE_LIMIT
-    else:
-        default, cap = GREP_FILE_COUNT_DEFAULT, GREP_FILE_COUNT_LIMIT
-    raw = default if head_limit is None else head_limit
-    # Clamp to at least 1 so head_limit=0 does not look like "No matches found".
-    return min(max(1, int(raw)), cap)
-
-
-def truncate_line(line: str, max_chars: int = GREP_DEFAULT_MAX_CHARS_PER_LINE) -> str:
-    if len(line) <= max_chars:
-        return line
-    return line[: max_chars - 1] + "…"
-
-
-def format_content_output(
-    output_lines: list[str],
-    *,
-    is_truncated: bool,
-    max_chars_per_line: int = GREP_DEFAULT_MAX_CHARS_PER_LINE,
-    max_output_bytes: int = DEFAULT_TOOL_OUTPUT_BYTES,
-) -> str:
-    """Model-facing card body (before workspace_result wrapper)."""
-    at_least = "at least " if is_truncated else ""
-    n = len(output_lines)
-    lines = [f"Found {at_least}{n} matching lines"]
-    trimmed = [truncate_line(ln, max_chars_per_line) for ln in output_lines]
-    cut = _first_idx_exceed_cum_limit(trimmed, max_output_bytes)
-    lines.extend(trimmed[:cut])
-    remaining = len(trimmed) - cut
-    if remaining > 0:
-        lines.append(f"... [{at_least}{remaining} lines truncated] ...")
-    return "\n".join(lines)
-
-
-def wrap_workspace_result(workspace_path: str, body: str) -> str:
-    return (
-        f'<workspace_result workspace_path="{workspace_path}">\n'
-        f"{body}\n"
-        f"</workspace_result>"
-    )
-
-
-def _first_idx_exceed_cum_limit(lines: list[str], max_bytes: int) -> int:
-    total = 0
-    for i, line in enumerate(lines):
-        add = len(line.encode("utf-8", errors="replace")) + (1 if i else 0)
-        if total + add > max_bytes:
-            return i
-        total += add
-    return len(lines)
 
 
 class GrepTool(Tool):
@@ -205,6 +157,15 @@ class GrepTool(Tool):
                         "span lines (rg -U --multiline-dotall). Default: false."
                     ),
                 },
+                "output_mode": {
+                    "type": "string",
+                    "enum": ["content", "files_with_matches", "count"],
+                    "description": (
+                        "content (default): path:line:text; "
+                        "files_with_matches: paths only; "
+                        "count: path:count per file."
+                    ),
+                },
             },
             "required": ["pattern"],
         }
@@ -224,7 +185,7 @@ class GrepTool(Tool):
         if not root.exists():
             raise ToolError(f"Path not found: {root}", code="not_found")
 
-        mode = OutputMode.Content
+        mode = _parse_output_mode(args.get("output_mode"))
         head_limit = _optional_int(args.get("head_limit"), "head_limit")
         effective = resolve_effective_head_limit(head_limit, mode)
 
@@ -247,10 +208,11 @@ class GrepTool(Tool):
 
         rg = shutil.which("rg") or shutil.which("rg.exe")
         if rg:
-            raw_lines, hit_limit = _run_rg(
+            raw_lines, hit_limit, err = _run_rg(
                 rg,
                 pattern=pattern,
                 root=root,
+                cwd_display=workspace_label,
                 case_i=case_i,
                 multiline=multiline,
                 before=before,
@@ -259,7 +221,10 @@ class GrepTool(Tool):
                 glob=glob,
                 ftype=ftype,
                 head_limit=effective,
+                mode=mode,
             )
+            if err is not None:
+                raise ToolError(err, code="rg_error")
         else:
             _reject_python_fallback_unsupported(
                 multiline=multiline,
@@ -273,22 +238,35 @@ class GrepTool(Tool):
                 pattern=pattern,
                 root=root,
                 case_i=case_i,
-                multiline=False,
                 head_limit=effective,
                 glob=glob,
+                mode=mode,
             )
 
         if not raw_lines:
-            body = "No matches found"
-            return wrap_workspace_result(workspace_label, body)
+            return no_matches_card(workspace_label)
 
-        body = format_content_output(
+        body = finalize_grep_body(
             raw_lines,
+            mode=mode,
             is_truncated=hit_limit,
-            max_chars_per_line=GREP_DEFAULT_MAX_CHARS_PER_LINE,
+            effective_head_limit=effective,
+            max_chars_per_line=DEFAULT_MAX_CHARS_PER_LINE,
             max_output_bytes=DEFAULT_TOOL_OUTPUT_BYTES,
         )
         return wrap_workspace_result(workspace_label, body)
+
+
+def _parse_output_mode(raw: Any) -> OutputMode:
+    if raw is None or raw == "":
+        return OutputMode.Content
+    s = str(raw).strip().lower()
+    for m in OutputMode:
+        if m.value == s:
+            return m
+    raise ToolError.invalid_arguments(
+        f"output_mode must be content|files_with_matches|count, got {raw!r}"
+    )
 
 
 def _optional_int(value: Any, name: str) -> int | None:
@@ -301,12 +279,10 @@ def _optional_int(value: Any, name: str) -> int | None:
 
 
 def _is_simple_ext_glob(glob: str) -> bool:
-    """True for patterns like ``*.py`` / ``*.tsx`` that the Python walker can honor."""
     g = glob.strip()
     if not g.startswith("*.") or len(g) < 3:
         return False
     ext = g[2:]
-    # No nested globs, braces, path seps, or multi-segment patterns.
     if any(ch in ext for ch in "*?[]{}\\/"):
         return False
     return True
@@ -321,7 +297,6 @@ def _reject_python_fallback_unsupported(
     ftype: str | None,
     glob: str | None,
 ) -> None:
-    """Fail closed: do not silently drop flags the Python path cannot honor."""
     unsupported: list[str] = []
     if multiline:
         unsupported.append("multiline")
@@ -351,6 +326,7 @@ def _run_rg(
     *,
     pattern: str,
     root: Path,
+    cwd_display: str,
     case_i: bool,
     multiline: bool,
     before: Any,
@@ -359,24 +335,43 @@ def _run_rg(
     glob: str | None,
     ftype: str | None,
     head_limit: int,
-) -> tuple[list[str], bool]:
-    cmd = [rg, "--line-number", "--color", "never", "--no-heading"]
+    mode: OutputMode = OutputMode.Content,
+) -> tuple[list[str], bool, str | None]:
+    """Returns (lines, hit_head_limit, error_message_or_None)."""
+    # Grok prepare_grep base flags
+    if mode is OutputMode.FilesWithMatches:
+        cmd = [rg, "-l", "--color=never"]
+    elif mode is OutputMode.Count:
+        cmd = [rg, "-c", "--color=never"]
+    else:
+        cmd = [
+            rg,
+            "--heading",
+            "--with-filename",
+            "--line-number",
+            "--color=never",
+            "--max-columns",
+            "1000",
+            "--max-columns-preview",
+        ]
     if case_i:
-        cmd.append("-i")
+        cmd.append("--ignore-case")
     if multiline:
         cmd.extend(["-U", "--multiline-dotall"])
-    if context_n is not None:
-        cmd.extend(["-C", str(int(context_n))])
-    else:
-        if before is not None:
-            cmd.extend(["-B", str(int(before))])
-        if after is not None:
-            cmd.extend(["-A", str(int(after))])
+    if mode is OutputMode.Content:
+        if context_n is not None and int(context_n) > 0:
+            cmd.extend(["-C", str(int(context_n))])
+        else:
+            if before is not None and int(before) > 0:
+                cmd.extend(["-B", str(int(before))])
+            if after is not None and int(after) > 0:
+                cmd.extend(["-A", str(int(after))])
     if glob:
         cmd.extend(["--glob", glob])
     if ftype:
         cmd.extend(["--type", ftype])
-    cmd.extend(["--regexp", pattern, "--", str(root)])
+    cmd.extend(["-e", pattern, str(root)])
+    cmd.extend(["--max-filesize", "5M"])
 
     try:
         proc = subprocess.run(
@@ -391,31 +386,31 @@ def _run_rg(
             code="timeout",
         ) from e
     except OSError as e:
-        raise ToolError(f"failed to run rg: {e}", code="io_error") from e
+        raise ToolError(f"Error calling tool: {e}", code="io_error") from e
 
-    raw = proc.stdout[:GREP_MAX_STDOUT_BYTES]
+    raw = proc.stdout[:MAX_STDOUT_BYTES]
     text = raw.decode("utf-8", errors="replace")
     stderr = (proc.stderr or b"").decode("utf-8", errors="replace")
     code = proc.returncode if proc.returncode is not None else -1
 
-    # rg: 0 = matches, 1 = no matches, 2 = error (bad regex, type, I/O, …).
-    # Do not report exit-2 as "No matches found".
-    if code == 1 and not text.strip():
-        return [], False
-    if code == 2 and "No files were searched" in stderr:
-        return [], False
+    # finalize_grep exit handling
+    if (code == 1 and not text.strip()) or (
+        code == 2 and "No files were searched" in stderr
+    ):
+        return [], False, None
     if code == 2:
-        msg = stderr.strip() or "rg failed with exit 2"
-        raise ToolError(f"grep error: {msg}", code="rg_error")
+        return [], False, rg_exit2_message(stderr.strip() or "(no stderr)", cwd_display)
     if code not in (0, 1):
-        msg = stderr.strip() or f"rg failed with exit {code}"
-        raise ToolError(f"grep error: {msg}", code="rg_error")
+        return [], False, rg_unknown_exit_message(code, cwd_display)
 
-    lines = [ln for ln in text.splitlines() if ln != ""]
+    # str::lines() style: drop trailing empties from splitlines
+    lines = text.splitlines()
+    # Read head_limit+1 to detect truncation (Grok)
+    probe = head_limit + 1 if head_limit >= 0 else head_limit
     hit = len(lines) > head_limit
-    if hit:
+    if hit and head_limit >= 0:
         lines = lines[:head_limit]
-    return lines, hit
+    return lines, hit, None
 
 
 def _run_python_grep(
@@ -423,21 +418,20 @@ def _run_python_grep(
     pattern: str,
     root: Path,
     case_i: bool,
-    multiline: bool,
     head_limit: int,
     glob: str | None,
+    mode: OutputMode = OutputMode.Content,
 ) -> tuple[list[str], bool]:
+    """Heading-style pure-Python fallback (content mode)."""
     flags = re.MULTILINE
     if case_i:
         flags |= re.IGNORECASE
-    if multiline:
-        flags |= re.DOTALL
     try:
         cre = re.compile(pattern, flags)
     except re.error as e:
         raise ToolError.invalid_arguments(f"invalid regex: {e}") from e
 
-    matches: list[str] = []
+    out: list[str] = []
     paths: list[Path] = []
     if root.is_file():
         paths = [root]
@@ -464,9 +458,32 @@ def _run_python_grep(
             rel = path.relative_to(root if root.is_dir() else path.parent)
         except ValueError:
             rel = path
+        rel_s = str(rel).replace("\\", "/")
+
+        if mode is OutputMode.FilesWithMatches:
+            if any(cre.search(line) for line in text.splitlines()):
+                out.append(rel_s)
+                if head_limit >= 0 and len(out) >= head_limit:
+                    return out, True
+            continue
+        if mode is OutputMode.Count:
+            n = sum(1 for line in text.splitlines() if cre.search(line))
+            if n:
+                out.append(f"{rel_s}:{n}")
+                if head_limit >= 0 and len(out) >= head_limit:
+                    return out, True
+            continue
+
+        # Content: heading format
+        file_lines: list[str] = []
         for i, line in enumerate(text.splitlines(), start=1):
             if cre.search(line):
-                matches.append(f"{rel}:{i}:{line}")
-                if len(matches) >= head_limit:
-                    return matches, True
-    return matches, False
+                file_lines.append(f"{i}:{line}")
+        if file_lines:
+            # path header + matches (Grok heading style)
+            chunk = [rel_s, *file_lines, ""]
+            for ln in chunk:
+                out.append(ln)
+                if head_limit >= 0 and len(out) >= head_limit:
+                    return out, True
+    return out, False

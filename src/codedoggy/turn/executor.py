@@ -48,36 +48,45 @@ def execute_tool_call(
     session_id: str | None = None,
     extra: dict[str, Any] | None = None,
 ) -> ToolResultRecord:
-    """Run one tool call; ToolError becomes an observation, not a crash."""
+    """Run one tool call; ToolError becomes an observation, not a crash.
+
+    Mutations are collected even when the tool returns non-zero / ToolError
+    after partial writes (shell multi-file) — Shadow must see them.
+    """
     kind = tools.kind_of(call.name)
     ctx = ToolCallContext(cwd=cwd, session_id=session_id, extra=dict(extra or {}))
     try:
         content = tools.call(call.name, call.arguments, ctx)
-        mutation = _resolve_mutation(ctx, call, kind)
+        mutations = _resolve_mutations(ctx, call, kind)
         return ToolResultRecord(
             call=call,
             content=content if content is not None else "",
             ok=True,
             kind=kind,
-            mutation=mutation,
+            mutation=mutations[0] if mutations else None,
+            mutations=mutations,
         )
     except ToolError as e:
+        mutations = _resolve_mutations(ctx, call, kind)
         return ToolResultRecord(
             call=call,
             content=format_tool_error_observation(e),
             ok=False,
             error_code=e.code,
             kind=kind,
-            mutation=None,
+            mutation=mutations[0] if mutations else None,
+            mutations=mutations,
         )
     except Exception as e:  # noqa: BLE001 — observation surface for the model
+        mutations = _resolve_mutations(ctx, call, kind)
         return ToolResultRecord(
             call=call,
             content=f"Error (internal): {type(e).__name__}: {e}",
             ok=False,
             error_code="internal",
             kind=kind,
-            mutation=None,
+            mutation=mutations[0] if mutations else None,
+            mutations=mutations,
         )
 
 
@@ -89,10 +98,8 @@ def execute_tool_batch(
     session_id: str | None = None,
     extra: dict[str, Any] | None = None,
 ) -> list[ToolResultRecord]:
-    """Execute tool calls in request order (sequential).
-
-    Parallel batching is a future executor concern; keep order stable for
-    writeback and same-file conflicts until locks exist.
+    """Legacy sequential helper. Prefer ``execute_tool_calls_two_phase`` /
+    path-lock batch for Grok-aligned dispatch.
     """
     return [
         execute_tool_call(
@@ -102,33 +109,60 @@ def execute_tool_batch(
     ]
 
 
-def _resolve_mutation(
+def _resolve_mutations(
     ctx: ToolCallContext,
     call: ToolCall,
     kind: ToolKind | None,
-) -> FileMutation | None:
-    """Prefer first-hand mutation from the tool; else path-only for mutating kinds."""
-    raw = ctx.extra.get("mutation")
-    if isinstance(raw, FileMutation):
-        return FileMutation(
-            path=raw.path,
-            tool_name=raw.tool_name or call.name,
-            call_id=raw.call_id or call.id,
-            args=dict(raw.args or call.arguments or {}),
-            before=raw.before,
-            after=raw.after,
-            is_create=raw.is_create,
-        )
-    if is_mutating_kind(kind):
-        path = extract_mutation_path(call.arguments if isinstance(call.arguments, dict) else {})
-        if path is not None:
-            return FileMutation(
-                path=path,
-                tool_name=call.name,
-                call_id=call.id,
-                args=dict(call.arguments) if isinstance(call.arguments, dict) else {},
+) -> list[FileMutation]:
+    """Collect all first-hand mutations (multi-file); fallback path-only."""
+    out: list[FileMutation] = []
+    bag = ctx.extra.get("mutations")
+    if isinstance(bag, list):
+        for raw in bag:
+            if isinstance(raw, FileMutation):
+                out.append(
+                    FileMutation(
+                        path=raw.path,
+                        tool_name=raw.tool_name or call.name,
+                        call_id=raw.call_id or call.id,
+                        args=dict(raw.args or call.arguments or {}),
+                        before=raw.before,
+                        after=raw.after,
+                        is_create=raw.is_create,
+                        is_delete=raw.is_delete,
+                    )
+                )
+    if not out:
+        raw = ctx.extra.get("mutation")
+        if isinstance(raw, FileMutation):
+            out.append(
+                FileMutation(
+                    path=raw.path,
+                    tool_name=raw.tool_name or call.name,
+                    call_id=raw.call_id or call.id,
+                    args=dict(raw.args or call.arguments or {}),
+                    before=raw.before,
+                    after=raw.after,
+                    is_create=raw.is_create,
+                    is_delete=raw.is_delete,
+                )
             )
-    return None
+    if not out and is_mutating_kind(kind):
+        path = extract_mutation_path(
+            call.arguments if isinstance(call.arguments, dict) else {}
+        )
+        if path is not None:
+            out.append(
+                FileMutation(
+                    path=path,
+                    tool_name=call.name,
+                    call_id=call.id,
+                    args=dict(call.arguments)
+                    if isinstance(call.arguments, dict)
+                    else {},
+                )
+            )
+    return out
 
 
 def parse_tool_arguments(raw: Any) -> dict[str, Any]:

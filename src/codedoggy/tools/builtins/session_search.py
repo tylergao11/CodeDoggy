@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import Any
 
 from codedoggy.memory.session_store import SessionStore
@@ -115,12 +116,20 @@ class SessionSearchTool(Tool):
                 }
             return json.dumps(payload, ensure_ascii=False, default=str)
 
+        # Scope FTS to current workspace cwd (Hermes / cross-project boundary)
+        cwd_scope = str(Path(ctx.cwd).resolve()) if ctx.cwd is not None else None
+
         # discovery
         if isinstance(query, str) and query.strip():
             exclude = None
             if ctx.session_id:
                 exclude = ctx.session_id
-            hits = store.search(query.strip(), limit=limit, exclude_session_id=exclude)
+            hits = store.search(
+                query.strip(),
+                limit=limit,
+                exclude_session_id=exclude,
+                cwd=cwd_scope,
+            )
             results = []
             for h in hits:
                 around = store.get_messages_around(
@@ -140,15 +149,31 @@ class SessionSearchTool(Tool):
                     }
                 )
             return json.dumps(
-                {"shape": "discovery", "query": query.strip(), "results": results},
+                {
+                    "shape": "discovery",
+                    "query": query.strip(),
+                    "cwd": cwd_scope,
+                    "results": results,
+                },
                 ensure_ascii=False,
                 default=str,
             )
 
-        # browse
-        recent = store.list_recent_sessions(limit=limit)
+        # browse — same cwd scope when store supports it
+        list_kw: dict[str, Any] = {"limit": limit}
+        try:
+            recent = store.list_recent_sessions(limit=limit, cwd=cwd_scope)
+        except TypeError:
+            recent = store.list_recent_sessions(limit=limit)
+            if cwd_scope and isinstance(recent, list):
+                recent = [
+                    s
+                    for s in recent
+                    if str(s.get("cwd") or "") == cwd_scope
+                    or not s.get("cwd")
+                ]
         return json.dumps(
-            {"shape": "browse", "sessions": recent},
+            {"shape": "browse", "cwd": cwd_scope, "sessions": recent},
             ensure_ascii=False,
             default=str,
         )

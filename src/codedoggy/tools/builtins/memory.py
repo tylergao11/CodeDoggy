@@ -52,7 +52,8 @@ class MemoryTool(Tool):
         return ToolNamespace.Doggy
 
     def kind(self) -> ToolKind:
-        return ToolKind.Other
+        # Mutates curated MEMORY/USER — not read-only (capability filter)
+        return ToolKind.Edit
 
     def description(self, ctx: ListToolsContext | None = None) -> ToolDescription:
         return ToolDescription(name="memory", description=_DESCRIPTION.strip())

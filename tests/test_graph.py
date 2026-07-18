@@ -318,3 +318,124 @@ def test_python_tree_sitter_extract() -> None:
     assert "Z" in names
     assert "helper" in names
     assert any(r.name == "helper" for r in ex.references)
+
+
+def test_removed_then_created_debounce_indexes_file(tmp_path: Path) -> None:
+    """Atomic rewrite: Removed → Created coalesces to Modified; index keeps symbols."""
+    from codedoggy.graph import EventDebouncer, FileEvent, IndexBuilder, IndexManager, Navigator
+
+    root = _sample_repo(tmp_path)
+    index = IndexBuilder().build(root)
+    mgr = IndexManager(root, index=index)
+    received: list[list[FileEvent]] = []
+
+    def on_flush(batch: list[FileEvent]) -> None:
+        received.append(batch)
+        mgr.send_events(batch)
+
+    deb = EventDebouncer(on_flush, debounce_secs=0.1)
+    target = root / "pkg" / "mod.py"
+    # Simulate editor atomic save: delete then recreate
+    deb.push(FileEvent.removed(target))
+    # File still on disk for reindex after coalesced Modified/Created
+    deb.push(FileEvent.created(target))
+    deb.flush_now()
+
+    assert len(received) == 1
+    assert len(received[0]) == 1
+    assert received[0][0].kind.value in ("Created", "Modified")
+    nav = Navigator(mgr.index, root=root)
+    assert nav.goto_definition_by_name("AuthService").locations
+    assert nav.goto_definition_by_name("token_for").locations
+
+
+def test_reindex_updates_watcher_manager_pointer(tmp_path: Path) -> None:
+    from codedoggy.graph.handle import CodebaseGraph
+
+    root = _sample_repo(tmp_path)
+    g = CodebaseGraph(root, use_cache=False)
+    g.reindex()
+    g.start_watch(debounce_secs=0.2)
+    try:
+        assert g.watcher is not None
+        old_mgr = g.manager
+        assert g.watcher.manager is old_mgr
+        g.reindex()
+        new_mgr = g.manager
+        assert new_mgr is not None
+        assert new_mgr is not old_mgr
+        assert g.watcher.manager is new_mgr
+    finally:
+        g.stop_watch()
+
+
+def test_cache_format_version_mismatch_rebuilds(tmp_path: Path) -> None:
+    import json
+
+    from codedoggy.graph import CACHE_FORMAT_VERSION, CacheFormatError, get_cache_path, load_index
+    from codedoggy.graph.handle import CodebaseGraph
+
+    root = _sample_repo(tmp_path)
+    g = CodebaseGraph(root, use_cache=True)
+    g.reindex()
+    cache = get_cache_path(root)
+    assert cache.is_file()
+
+    raw = json.loads(cache.read_text(encoding="utf-8"))
+    raw["format_version"] = CACHE_FORMAT_VERSION - 1
+    # Poison definitions so a successful load of stale format would be visible
+    raw["definitions"] = {"OnlyInStaleCache": [["pkg/mod.py", 1]]}
+    cache.write_text(json.dumps(raw), encoding="utf-8")
+
+    try:
+        load_index(cache)
+        raise AssertionError("expected CacheFormatError")
+    except CacheFormatError:
+        pass
+
+    g2 = CodebaseGraph(root, use_cache=True)
+    idx = g2.ensure_indexed()
+    assert "OnlyInStaleCache" not in idx.definitions
+    assert "AuthService" in idx.definitions
+    # Fresh cache written with current format
+    reloaded = load_index(cache)
+    assert reloaded.stats().definitions == idx.stats().definitions
+
+
+def test_send_event_marks_dirty_for_persist(tmp_path: Path) -> None:
+    from codedoggy.graph import FileEvent
+    from codedoggy.graph.handle import CodebaseGraph
+
+    root = _sample_repo(tmp_path)
+    g = CodebaseGraph(root, use_cache=True)
+    g.reindex()
+    assert g._dirty is False  # noqa: SLF001
+    mod = root / "pkg" / "mod.py"
+    mod.write_text("def after_edit():\n    return 1\n", encoding="utf-8")
+    g.send_event(FileEvent.modified(mod))
+    assert g._dirty is True  # noqa: SLF001
+    g.persist_if_dirty()
+    assert g._dirty is False  # noqa: SLF001
+
+
+def test_respect_gitignore_walk_skips_ignored(tmp_path: Path) -> None:
+    """When git is unavailable, walk path still applies .gitignore."""
+    from codedoggy.graph.builder import IndexBuilder
+
+    (tmp_path / "keep.py").write_text("def keep_me():\n    pass\n", encoding="utf-8")
+    (tmp_path / "skip_me.py").write_text("def skip_me():\n    pass\n", encoding="utf-8")
+    (tmp_path / ".gitignore").write_text("skip_me.py\n", encoding="utf-8")
+
+    b = IndexBuilder(respect_gitignore=True)
+    # Force walk path (skip git) by monkeypatching
+    b._collect_files_git = lambda root: None  # type: ignore[method-assign]
+    files = b._collect_files(tmp_path)
+    names = {p.name for p in files}
+    assert "keep.py" in names
+    assert "skip_me.py" not in names
+
+    b2 = IndexBuilder(respect_gitignore=False)
+    b2._collect_files_git = lambda root: None  # type: ignore[method-assign]
+    files2 = b2._collect_files(tmp_path)
+    names2 = {p.name for p in files2}
+    assert "skip_me.py" in names2

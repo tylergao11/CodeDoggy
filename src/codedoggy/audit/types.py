@@ -28,6 +28,7 @@ class MutationEvent:
     before: str | None = None
     after: str | None = None
     is_create: bool = False
+    is_delete: bool = False
     agent_id: str = "main"
     session_id: str | None = None
     goal_snapshot: str | None = None
@@ -37,21 +38,56 @@ class MutationEvent:
     id: str = field(default_factory=lambda: uuid4().hex[:16])
     timestamp: float = field(default_factory=time)
 
-    def unified_diff_hint(self, *, max_chars: int = 4_000) -> str:
-        """Compact before/after view for model auditors (not full unified diff)."""
+    def unified_diff_hint(self, *, max_chars: int = 8_000) -> str:
+        """Real unified diff (difflib) for Shadow — middle edits stay visible.
+
+        Truncates with balanced head/tail of the unified diff if over budget.
+        """
+        import difflib
+
         if self.is_create:
-            body = self.after or ""
-            head = f"+++ create {self.path}\n"
-        else:
-            head = f"--- {self.path}\n+++ {self.path}\n"
-            body = (
-                f"<<<BEFORE>>>\n{self.before or ''}\n"
-                f"<<<AFTER>>>\n{self.after or ''}\n"
+            after = self.after or ""
+            lines = list(
+                difflib.unified_diff(
+                    [],
+                    after.splitlines(keepends=True),
+                    fromfile="/dev/null",
+                    tofile=self.path,
+                    lineterm="",
+                )
             )
-        text = head + body
-        if len(text) > max_chars:
-            return text[: max_chars - 20] + "\n… (truncated)"
-        return text
+            text = "\n".join(lines) if lines else f"+++ create {self.path}\n{after}"
+        elif self.is_delete:
+            before = self.before or ""
+            lines = list(
+                difflib.unified_diff(
+                    before.splitlines(keepends=True),
+                    [],
+                    fromfile=self.path,
+                    tofile="/dev/null",
+                    lineterm="",
+                )
+            )
+            text = "\n".join(lines) if lines else f"--- delete {self.path}\n{before}"
+        else:
+            before = self.before or ""
+            after = self.after or ""
+            lines = list(
+                difflib.unified_diff(
+                    before.splitlines(keepends=True),
+                    after.splitlines(keepends=True),
+                    fromfile=f"a/{self.path}",
+                    tofile=f"b/{self.path}",
+                    lineterm="",
+                    n=3,
+                )
+            )
+            text = "\n".join(lines) if lines else f"(no textual diff) {self.path}"
+        if len(text) <= max_chars:
+            return text
+        # Keep head + tail of the unified diff so middle hunks can still appear
+        keep = max_chars // 2 - 20
+        return text[:keep] + "\n…[diff truncated]…\n" + text[-keep:]
 
 
 @dataclass(slots=True)

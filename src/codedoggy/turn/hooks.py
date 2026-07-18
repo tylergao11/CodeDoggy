@@ -25,12 +25,22 @@ class LoopHooks(Protocol):
     """Optional callbacks around sample / tool execution.
 
     Default implementations may omit methods; the loop uses getattr.
+
+    Grok alignment: ``pre_tool_use`` is phase-1 (before run). Soft deny
+    (abort without metadata hard) → HookDenied non-terminal; hard →
+    PermissionReject stops the batch.
     """
 
     def after_sample(
         self, sample: SampleResult, ctx: HookContext
     ) -> HookDecision | None:
         """After a successful sample, before tools run."""
+        ...
+
+    def pre_tool_use(
+        self, call: Any, ctx: HookContext
+    ) -> HookDecision | None:
+        """Grok PreToolUse — before execute. Soft deny feeds model; hard stops batch."""
         ...
 
     def after_tool(
@@ -59,6 +69,9 @@ class NoopHooks:
     def after_sample(
         self, sample: SampleResult, ctx: HookContext
     ) -> HookDecision | None:
+        return None
+
+    def pre_tool_use(self, call: Any, ctx: HookContext) -> HookDecision | None:
         return None
 
     def after_tool(

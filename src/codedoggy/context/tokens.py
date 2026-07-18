@@ -104,3 +104,24 @@ def count_messages_tokens(messages: list[Any]) -> int:
         if name:
             total += count_text_tokens(name)
     return max(1, total)
+
+
+def count_tools_tokens(tool_specs: list[Any] | None) -> int:
+    """Token cost of tool schemas sent with the sample (Grok tools_reserve)."""
+    if not tool_specs:
+        return 0
+    total = 0
+    for spec in tool_specs:
+        name = getattr(spec, "name", None) or ""
+        desc = getattr(spec, "description", None) or ""
+        params = getattr(spec, "parameters", None) or {}
+        total += 8  # framing
+        total += count_text_tokens(str(name))
+        total += count_text_tokens(str(desc))
+        try:
+            import json
+
+            total += count_text_tokens(json.dumps(params, ensure_ascii=False))
+        except Exception:  # noqa: BLE001
+            total += count_text_tokens(str(params))
+    return total

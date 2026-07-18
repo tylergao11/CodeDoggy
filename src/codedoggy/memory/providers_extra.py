@@ -43,7 +43,9 @@ class FileNotesProvider(BaseMemoryProvider):
             text = text[:797] + "…"
         return f"### File notes ({self.path.name})\n{text}"
 
-    def prefetch(self, query: str, *, session_id: str = "") -> str:
+    def prefetch(
+        self, query: str, *, session_id: str = "", cwd: str = ""
+    ) -> str:
         if not self.path.is_file() or not (query or "").strip():
             return ""
         try:
@@ -70,6 +72,7 @@ class FileNotesProvider(BaseMemoryProvider):
         assistant_text: str,
         *,
         session_id: str = "",
+        cwd: str = "",
     ) -> None:
         # Optional auto-append of durable-looking decisions (very conservative)
         blob = f"{user_text or ''}\n{assistant_text or ''}"

@@ -11,8 +11,10 @@ in each common tool and why.
 3. **Errors are part of the API** — actionable, stable codes when useful.
 4. **Defaults are finite** — omitted args never mean “unbounded dump.”
 5. **Descriptions state hard constraints** (timeouts, missing unix utils, FG-only).
-6. **Claim matches implement** — do not advertise Job Objects, PDF readers, or
-   background tasks that are not wired.
+6. **Claim matches implement** — do not advertise capabilities we do not have.
+   Windows shell kill uses real Job Objects when assign succeeds (with taskkill
+   fallback). Do not claim full Grok terminal actor or Linux cgroup. PDF/image
+   multimodal and MCP transport stay host-scoped until wired for real.
 
 ## Per-tool details
 
@@ -78,7 +80,7 @@ in each common tool and why.
 | Shell detect | pwsh → powershell → git bash → cmd | Matches host, not assumed bash |
 | UTF-8 env | `PYTHONUTF8`, `PYTHONIOENCODING` | Child tools don’t mojibake |
 | Default timeout | 120s, max 300s; `0`→default | Finite by default |
-| Timeout kill | Windows: `taskkill /T`; POSIX: process group SIGTERM→SIGKILL | Descendants die with the shell |
+| Timeout kill | Windows: Job Object terminate (fallback `taskkill /T`); POSIX: process group SIGTERM→SIGKILL | Descendants die with the shell |
 | Output card | first line `exit: N` or `exit: killed (timeout)` | Always parseable |
 | Output cap | 20_000 chars | Shell is noisy; hard stop |
 | `description` required | yes | Forces intentional shell use |
@@ -86,12 +88,28 @@ in each common tool and why.
 | Description | no unix utils on PowerShell/cmd | Steers model to `grep`/`read_file` |
 | Chain note | `;` when `&&` unsupported | Fewer shell syntax failures |
 
+### Background / tasks
+
+| Detail | Behavior | Why |
+|--------|----------|-----|
+| `is_background` | returns XML task-id envelope | Grok BackgroundTaskStarted |
+| `get_task_output` | snapshot or wait (cap 10m) | Unified bash + subagent lookup |
+| `kill_task` | process tree + subagent cancel | Same surface as Grok |
+| Output file | session `.codedoggy/tasks/<sid>/` | Full log via read_file |
+
+### Web
+
+| Detail | Behavior | Why |
+|--------|----------|-----|
+| SSRF | block private/metadata IPs; loopback OK | Grok ssrf.rs |
+| web_search | DDG Instant Answer or `CODEDOGGY_WEB_SEARCH_URL` | No hard vendor lock |
+
 ## What not to put in tools
 
 - Parallel batching of multiple tool calls → turn executor
 - Permission / sandbox → policy extension
 - System-wide “how to code” rules → prompts / project rules
-- Background task_id / kill_task → future tools pack
+- Imagine media / production MCP client → optional packs when API keys exist
 
 ## Defaults module
 

@@ -373,18 +373,22 @@ def test_multi_tool_batch_writeback(tmp_path: Path) -> None:
     assert "B" in (tool_msgs[1].content or "")
 
 
-def test_abort_mid_batch_skips_rest_but_keeps_transcript(tmp_path: Path) -> None:
-    """Abort after first tool: second call must not run; first stays in transcript."""
-    tools = ToolRegistryBuilder.new().finalize()
-    executed: list[str] = []
+def test_abort_after_tool_stops_loop_but_batch_already_dispatched(tmp_path: Path) -> None:
+    """Grok path-lock batch: phase-2 runs approved tools first; hooks see results after.
 
-    class AbortAfterFirst(NoopHooks):
+    after_tool abort ends the *loop* (no next sample) and can pause further
+    turns, but does not un-run tools already dispatched in the same batch.
+    """
+    tools = ToolRegistryBuilder.new().finalize()
+    seen: list[str] = []
+
+    class AbortAfterFirstWriteback(NoopHooks):
         def after_tool(
             self, record: ToolResultRecord, ctx: HookContext
         ) -> HookDecision | None:
-            executed.append(record.call.name)
-            if len(executed) == 1:
-                return HookDecision(abort=True, abort_reason="stop after first")
+            seen.append(record.call.id)
+            if record.call.id == "1":
+                return HookDecision(abort=True, abort_reason="stop after first writeback")
             return None
 
     sampler = ScriptedSampler(
@@ -412,6 +416,7 @@ def test_abort_mid_batch_skips_rest_but_keeps_transcript(tmp_path: Path) -> None
                     ),
                 ],
             ),
+            SampleResult(content="should not sample"),
         ]
     )
     result = run_agent_loop(
@@ -419,17 +424,20 @@ def test_abort_mid_batch_skips_rest_but_keeps_transcript(tmp_path: Path) -> None
         sampler=sampler,
         tools=tools,
         cwd=tmp_path,
-        hooks=AbortAfterFirst(),
+        hooks=AbortAfterFirstWriteback(),
     )
     assert result.aborted
-    assert result.tools_called == ["search_replace"]
+    assert result.tools_called == ["search_replace", "search_replace"]
     assert (tmp_path / "first.txt").is_file()
-    assert not (tmp_path / "second.txt").exists()
+    assert (tmp_path / "second.txt").is_file()  # phase-2 already ran both
     tool_msgs = [m for m in result.messages if m.role is Role.TOOL]
-    assert len(tool_msgs) == 1
-    # Assistant listed two tool_calls; only one result — remaining not executed.
+    assert len(tool_msgs) == 2
+    assert tool_msgs[0].tool_call_id == "1"
+    assert tool_msgs[1].tool_call_id == "2"
     asst = next(m for m in result.messages if m.role is Role.ASSISTANT)
     assert asst.tool_calls is not None and len(asst.tool_calls) == 2
+    # No further sample after abort
+    assert sampler.calls == 1
 
 
 def test_unknown_tool_observation(tmp_path: Path) -> None:

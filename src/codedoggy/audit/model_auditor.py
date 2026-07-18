@@ -57,11 +57,14 @@ class ModelAuditor:
         temperature: float = 0.1,
         max_tokens: int = 800,
         max_diff_chars: int = 6_000,
+        fail_closed: bool = True,
     ) -> None:
         self.client = client
         self.temperature = temperature
         self.max_tokens = max_tokens
         self.max_diff_chars = max_diff_chars
+        # When True, model/parse failure is a soft fail finding (not silent pass)
+        self.fail_closed = fail_closed
 
     def review(self, ctx: AuditContext) -> AuditVerdict:
         user = self._build_user_prompt(ctx)
@@ -76,14 +79,33 @@ class ModelAuditor:
             )
         except Exception as e:  # noqa: BLE001 — never crash the coding loop
             logger.warning("model auditor call failed: %s", e)
+            if self.fail_closed:
+                return AuditVerdict.fail(
+                    [
+                        AuditFinding(
+                            message=f"Shadow unavailable (call failed): {e}",
+                            severity=FindingSeverity.IMPORTANT,
+                            path=ctx.mutation.path if ctx.mutation else None,
+                        )
+                    ]
+                )
             return AuditVerdict.pass_silent()
 
         text = (result.content or "").strip()
-        # Strip thinking tags some local models emit (e.g. qwen3).
         text = re.sub(r"<think>[\s\S]*?</think>", "", text, flags=re.I).strip()
         verdict = _parse_verdict(text)
         if verdict is None:
             logger.warning("model auditor unparseable response: %s", text[:200])
+            if self.fail_closed:
+                return AuditVerdict.fail(
+                    [
+                        AuditFinding(
+                            message="Shadow returned unparseable output; treat write as needs review",
+                            severity=FindingSeverity.IMPORTANT,
+                            path=ctx.mutation.path if ctx.mutation else None,
+                        )
+                    ]
+                )
             return AuditVerdict.pass_silent()
         return verdict
 
@@ -96,7 +118,7 @@ class ModelAuditor:
             f"## Agent\n{ctx.agent_id}  session={ctx.session_id or '-'}",
             f"## Mutation trajectory (summary)\n{ctx.trajectory_summary}",
             f"## This mutation\npath={mut.path}\ntool={mut.tool_name}\n"
-            f"create={mut.is_create}\n\n{diff}",
+            f"create={mut.is_create} delete={getattr(mut, 'is_delete', False)}\n\n{diff}",
         ]
         if mem.strip():
             parts.append(f"## Selected memory\n{mem}")

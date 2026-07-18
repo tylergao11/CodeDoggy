@@ -18,17 +18,18 @@ class TurnRunner(Protocol):
 
 @dataclass(slots=True)
 class SessionExtensions:
-    """Swappable backends. All fields optional."""
+    """Swappable backends. Prefer bind once at build_session (RuntimeKernel)."""
 
     turn_runner: TurnRunner | None = None
     tools: Any | None = None
-    context: Any | None = None  # ContextCompactor (Grok live window)
+    context: Any | None = None  # ContextCompactor
     memory: Any | None = None  # MemoryStore (curated)
-    memory_manager: Any | None = None  # MemoryManager (orchestration)
-    session_store: Any | None = None  # SessionStore (FTS archive)
-    audit: Any | None = None  # AuditServices
+    memory_manager: Any | None = None  # MemoryManager
+    session_store: Any | None = None  # SessionStore
+    audit: Any | None = None  # AuditServices / Shadow
     graph: Any | None = None
     policy: Any | None = None  # WorkspacePolicy
+    kernel: Any | None = None  # RuntimeKernel (state spine)
 
     def _copy(self, **kwargs: Any) -> SessionExtensions:
         base = {
@@ -41,6 +42,7 @@ class SessionExtensions:
             "audit": self.audit,
             "graph": self.graph,
             "policy": self.policy,
+            "kernel": self.kernel,
         }
         base.update(kwargs)
         return SessionExtensions(**base)
@@ -59,3 +61,6 @@ class SessionExtensions:
 
     def with_session_store(self, session_store: Any) -> SessionExtensions:
         return self._copy(session_store=session_store)
+
+    def with_kernel(self, kernel: Any) -> SessionExtensions:
+        return self._copy(kernel=kernel)

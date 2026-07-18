@@ -15,13 +15,29 @@ class MutationTrajectory:
     selection across stores happens in MemorySelector.
     """
 
+    # Cap retained full before/after bodies (Grok: trajectory must not grow unbounded).
+    MAX_EVENTS: int = 200
+    MAX_BODY_CHARS: int = 32_000
+
     def __init__(self) -> None:
         self._events: list[MutationEvent] = []
         self._lock = Lock()
 
     def append(self, event: MutationEvent) -> None:
+        # Bound body size so long sessions do not OOM
+        if event.before is not None and len(event.before) > self.MAX_BODY_CHARS:
+            event.before = event.before[: self.MAX_BODY_CHARS] + "\n…[traj trunc]"
+        if event.after is not None and len(event.after) > self.MAX_BODY_CHARS:
+            event.after = event.after[: self.MAX_BODY_CHARS] + "\n…[traj trunc]"
         with self._lock:
             self._events.append(event)
+            if len(self._events) > self.MAX_EVENTS:
+                # Drop oldest bodies first — keep path-only stubs
+                overflow = len(self._events) - self.MAX_EVENTS
+                for e in self._events[:overflow]:
+                    e.before = None
+                    e.after = None
+                self._events = self._events[overflow:]
 
     def clear(self) -> None:
         with self._lock:

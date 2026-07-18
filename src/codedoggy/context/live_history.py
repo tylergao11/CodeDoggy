@@ -24,16 +24,21 @@ def seed_messages(
     user_text: str,
     prior_messages: list[Message] | None = None,
 ) -> list[Message]:
-    """Build the opening transcript for one prompt.
+    """Build the opening transcript for one prompt (Grok continuous session).
 
     Order:
-      [SYSTEM(current)] + prior non-system + USER(new prompt)
+      [SYSTEM(current)] + prior non-system (tool-pair sanitized) + USER(new prompt)
     """
+    from codedoggy.context.select import sanitize_tool_pairs
+
     out: list[Message] = []
     if system_prompt:
         out.append(Message(role=Role.SYSTEM, content=system_prompt))
     if prior_messages:
-        out.extend(strip_system_messages(prior_messages))
+        prior = strip_system_messages(prior_messages)
+        # Grok: never carry orphan tool_result / broken pairs into next sample
+        prior = sanitize_tool_pairs(prior)
+        out.extend(prior)
     out.append(Message(role=Role.USER, content=user_text))
     return out
 

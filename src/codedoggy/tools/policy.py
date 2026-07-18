@@ -71,6 +71,17 @@ class WorkspacePolicy:
             base.enabled = False
         return base
 
+    def check_read(self, path: str) -> PolicyDecision:
+        """Grok-style read boundary: no path escape outside cwd."""
+        if not self.enabled:
+            return PolicyDecision(True)
+        rel = self._rel_or_none(path)
+        if rel is None:
+            return PolicyDecision(
+                False, f"path escapes workspace: {path}", "path_escape"
+            )
+        return PolicyDecision(True)
+
     def check_write(self, path: str) -> PolicyDecision:
         if not self.enabled:
             return PolicyDecision(True)
@@ -104,10 +115,72 @@ class WorkspacePolicy:
             return PolicyDecision(True)
         if not self.allow_shell:
             return PolicyDecision(False, "shell disabled by policy", "shell_disabled")
-        # Soft deny dangerous recursive deletes at policy layer
         low = (command or "").lower()
-        if "rm -rf /" in low or "remove-item -recurse -force c:\\" in low:
-            return PolicyDecision(False, "destructive shell blocked", "shell_dangerous")
+        dangerous = (
+            "rm -rf /",
+            "remove-item -recurse -force c:\\",
+            "format c:",
+            "git clean -fdx",
+            "git clean -ffdx",
+            "git reset --hard",
+        )
+        for d in dangerous:
+            if d in low:
+                return PolicyDecision(
+                    False, f"destructive shell blocked: {d}", "shell_dangerous"
+                )
+        # When writes disabled: block interpreters / redirect shells that can
+        # write arbitrarily (regex is a signal, not the full sandbox — still gate).
+        if not self.allow_writes:
+            write_capable = (
+                "python",
+                "python3",
+                "py ",
+                "node ",
+                "nodejs",
+                "ruby ",
+                "perl ",
+                "php ",
+                "bash -c",
+                "sh -c",
+                "pwsh",
+                "powershell",
+                "cmd /c",
+                "cmd.exe",
+                ">",
+                ">>",
+                "tee ",
+                "dd ",
+                "cp ",
+                "mv ",
+                "copy ",
+                "move ",
+                "set-content",
+                "out-file",
+                "add-content",
+                "new-item",
+                "remove-item",
+            )
+            for w in write_capable:
+                if w in low:
+                    return PolicyDecision(
+                        False,
+                        f"shell may write while allow_writes=False ({w.strip()})",
+                        "shell_write_capable",
+                    )
+        try:
+            from codedoggy.tools.util.write_detect import detect_shell_write_paths
+
+            for wp in detect_shell_write_paths(command or ""):
+                wd = self.check_write(wp)
+                if not wd.allowed:
+                    return PolicyDecision(
+                        False,
+                        wd.reason or f"shell would write denied path: {wp}",
+                        wd.code or "deny_path",
+                    )
+        except Exception:  # noqa: BLE001
+            pass
         return PolicyDecision(True)
 
     def snapshot(self) -> dict[str, Any]:
@@ -133,11 +206,13 @@ class WorkspacePolicy:
 
 
 def _norm_rel(path: str) -> str:
-    """Normalize relative path without eating leading dots (``.git`` must stay)."""
+    """Normalize relative path; casefold for Windows-safe deny matching."""
     s = path.replace("\\", "/")
     while s.startswith("./"):
         s = s[2:]
-    return s.lstrip("/")  # only leading slashes, NOT dots
+    s = s.lstrip("/")  # only leading slashes, NOT dots
+    # Case-insensitive compare for deny rules (Windows / mixed tooling)
+    return s.casefold()
 
 
 def _path_matches_prefix(path: str, prefix: str) -> bool:
@@ -150,15 +225,16 @@ def _path_matches_prefix(path: str, prefix: str) -> bool:
 
 
 def _path_matches_rule(path: str, rule: str) -> bool:
-    """Prefix match or simple ``*.ext`` / basename deny rules."""
+    """Prefix match or simple ``*.ext`` / basename deny rules (case-insensitive)."""
     if not rule:
         return False
-    # basename exact (id_rsa)
-    if "/" not in rule.rstrip("/") and not rule.startswith("*") and not rule.endswith("/"):
-        base = path.rsplit("/", 1)[-1]
-        if base == rule or path == rule:
+    # path and rule already casefold via _norm_rel for callers of check_write
+    rule_n = rule.replace("\\", "/").casefold()
+    path_n = path.replace("\\", "/").casefold()
+    if "/" not in rule_n.rstrip("/") and not rule_n.startswith("*") and not rule_n.endswith("/"):
+        base = path_n.rsplit("/", 1)[-1]
+        if base == rule_n or path_n == rule_n:
             return True
-    # extension glob *.pem
-    if rule.startswith("*."):
-        return path.lower().endswith(rule[1:].lower())
-    return _path_matches_prefix(path, rule)
+    if rule_n.startswith("*."):
+        return path_n.endswith(rule_n[1:])
+    return _path_matches_prefix(path_n, rule_n.rstrip("/"))
