@@ -66,15 +66,9 @@ def _notes_session(
         or [CompletionResult(content="ok", model="main")],
         name="main",
     )
-    audit = _ScriptClient(
-        [CompletionResult(content='{"ok": true}', model="audit")],
-        name="audit",
-    )
     s = build_session(
         tmp_path,
         main_client=main,
-        audit_client=audit,
-        enable_audit=False,
         enable_graph=False,
         enable_policy=True,
         memory_dir=home / "memories",
@@ -187,10 +181,6 @@ def test_p1_session_search_via_tool_extra_cwd_scope(
         main_client=_ScriptClient(
             [CompletionResult(content="ok", model="main")], name="main"
         ),
-        audit_client=_ScriptClient(
-            [CompletionResult(content="ok", model="audit")], name="audit"
-        ),
-        enable_audit=False,
         enable_graph=False,
         enable_policy=False,
         memory_dir=home / "memories",
@@ -266,10 +256,6 @@ def test_p1_handle_prompt_session_search_mid_turn(
     s = build_session(
         tmp_path,
         main_client=main,
-        audit_client=_ScriptClient(
-            [CompletionResult(content="ok", model="audit")], name="audit"
-        ),
-        enable_audit=False,
         enable_graph=False,
         enable_policy=False,
         memory_dir=home / "memories",

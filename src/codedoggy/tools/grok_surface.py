@@ -139,6 +139,7 @@ _GROK_PRODUCT_IDS: list[str] = [
     "Doggy:monitor",
     "Doggy:search_tool",
     "Doggy:use_tool",
+    "Doggy:skill",
     "Doggy:update_goal",
     # workspace extras
     "Doggy:enter_plan_mode",

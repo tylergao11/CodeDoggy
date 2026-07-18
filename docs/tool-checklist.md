@@ -23,7 +23,7 @@ Reminder list for model-facing tool contracts. Not orchestration (turn/session).
 - [x] search_replace: CRLF match (LF old_string) + preserve CRLF on write; bytes write
 - [x] run_terminal_cmd: whole-command argv, shell detect, UTF-8 env; FG timeout 0→default 120s
 - [x] run_terminal_cmd: `description` required; `is_background` when enabled; trailing `&` rejected in FG
-- [x] run_terminal_cmd: timeout kills process tree (Job Object / taskkill fallback / process group)
+- [x] run_terminal_cmd: timeout kills process tree (TerminateJobObject + child kill / killpg; no taskkill)
 - [x] Background task manager + get_task_output + kill_task
 - [x] Orchestration tools: todo_write, update_goal, enter/exit_plan_mode, ask_user_question
 - [x] list_dir description honest: depth 3, char budget, no gitignore claim

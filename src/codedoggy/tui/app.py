@@ -7,6 +7,7 @@ import shutil
 import threading
 import time
 from collections.abc import Callable
+from itertools import groupby
 from typing import Any
 
 from prompt_toolkit.application import Application
@@ -49,53 +50,57 @@ STATUS_TEXT = {
 }
 
 
-APPLE_DARK = Style.from_dict(
+DOGGY_NEON = Style.from_dict(
     {
-        "root": "bg:#0b0b0d #f5f5f7",
-        "header": "bg:#0b0b0d #f5f5f7",
-        "brand": "#f5f5f7 bold",
-        "meta": "#8e8e93",
-        "separator": "#2c2c2e",
-        "tree": "#3a3a3c",
-        "task.title": "#f5f5f7 bold",
-        "task.status": "#8e8e93",
-        "status.running": "#64d2ff",
-        "status.completed": "#30d158",
-        "status.waiting": "#636366",
-        "status.failed": "#ff9f0a bold",
-        "doggy.coat": "#ff9f0a bold",
-        "doggy.detail": "#f5f5f7 bold",
-        "doggy.speed": "#64d2ff bold",
-        "doggy.wordmark": "#d1d1d6 bold",
-        "agent": "bg:#2c2c2e #e5e5ea",
-        "agent.selected": "bg:#f2f2f7 #1c1c1e bold",
-        "reporter": "#f2f2f7 bold",
-        "report": "#d1d1d6",
-        "empty": "#8e8e93",
-        "input": "bg:#1c1c1e #f5f5f7",
-        "input.placeholder": "bg:#1c1c1e #636366",
-        "prompt": "bg:#1c1c1e #f5f5f7 bold",
-        "prompt.border": "bg:#0b0b0d #48484a",
-        "prompt.border.focus": "bg:#0b0b0d #8e8e93",
-        "prompt.border.info": "bg:#0b0b0d #64d2ff",
-        "prompt.border.success": "bg:#0b0b0d #30d158",
-        "prompt.border.warning": "bg:#0b0b0d #ff9f0a",
-        "prompt.caption": "bg:#0b0b0d #8e8e93",
-        "turn.status": "bg:#0b0b0d #d1d1d6",
-        "turn.elapsed": "bg:#0b0b0d #636366",
-        "turn.stop": "bg:#0b0b0d #8e8e93",
-        "feedback.info": "bg:#0b0b0d #64d2ff",
-        "feedback.success": "bg:#0b0b0d #30d158",
-        "feedback.warning": "bg:#0b0b0d #ff9f0a",
-        "shortcut.key": "bg:#0b0b0d #d1d1d6 bold",
-        "shortcut.label": "bg:#0b0b0d #636366",
-        "shortcut.separator": "bg:#0b0b0d #3a3a3c",
-        "shortcut.pending": "bg:#0b0b0d #d1d1d6",
-        "agent-window": "bg:#1c1c1e #f5f5f7",
-        "agent-window.header": "bg:#1c1c1e #f5f5f7 bold",
-        "agent-window.close": "bg:#3a3a3c #f2f2f7 bold",
-        "agent-output": "bg:#1c1c1e #f5f5f7",
-        "agent-window.hint": "bg:#1c1c1e #8e8e93",
+        "root": "bg:#020507 #e8f1ef",
+        "header": "bg:#020507 #e8f1ef",
+        "brand": "#f4f6f5 bold",
+        "meta": "#66858a",
+        "separator": "#454c4e",
+        "task.spine": "#263c40",
+        "task.spine.active": "#16dfe5 bold",
+        "task.marker": "#aeb9b9 bold",
+        "task.title": "#f4f6f5 bold",
+        "task.divider": "#263c40",
+        "task.status": "#6d8c90",
+        "task.status.running": "#16dfe5 bold",
+        "task.status.reporting": "#f12698 bold",
+        "task.status.completed": "#ffc21a bold",
+        "task.status.failed": "#ff4aa8 bold",
+        "doggy.wordmark": "#f12698 bold",
+        "agent.border": "#697477",
+        "agent.border.selected": "#f12698 bold",
+        "agent.label": "#c7d1d0 bold",
+        "agent.label.selected": "#ff4aa8 bold",
+        "reporter.running": "#16dfe5 bold",
+        "reporter.completed": "#f2d397 bold",
+        "reporter.waiting": "#879496 bold",
+        "reporter.failed": "#ff4aa8 bold",
+        "report": "#d7e5e3",
+        "input": "bg:#071116 #e8f1ef",
+        "input.placeholder": "bg:#071116 #48666b",
+        "prompt": "bg:#071116 #f2d397 bold",
+        "prompt.border": "bg:#020507 #16464c",
+        "prompt.border.focus": "bg:#020507 #f12698",
+        "prompt.border.info": "bg:#020507 #16dfe5",
+        "prompt.border.success": "bg:#020507 #ffc21a",
+        "prompt.border.warning": "bg:#020507 #ff4aa8",
+        "prompt.caption": "bg:#020507 #66858a",
+        "turn.status": "bg:#020507 #b8d0cf",
+        "turn.elapsed": "bg:#020507 #587075",
+        "turn.stop": "bg:#020507 #f12698 bold",
+        "feedback.info": "bg:#020507 #16dfe5",
+        "feedback.success": "bg:#020507 #ffc21a",
+        "feedback.warning": "bg:#020507 #ff4aa8",
+        "shortcut.key": "bg:#020507 #f2d397 bold",
+        "shortcut.label": "bg:#020507 #587075",
+        "shortcut.separator": "bg:#020507 #16464c",
+        "shortcut.pending": "bg:#020507 #ff4aa8",
+        "agent-window": "bg:#050b0e #e8f1ef",
+        "agent-window.header": "bg:#050b0e #16dfe5 bold",
+        "agent-window.close": "bg:#2b1023 #ff4aa8 bold",
+        "agent-output": "bg:#050b0e #d7e5e3",
+        "agent-window.hint": "bg:#050b0e #66858a",
     }
 )
 
@@ -272,7 +277,7 @@ class CodeDoggyTUI:
         self.app: Application[None] = Application(
             layout=Layout(root, focused_element=self._input),
             key_bindings=self._keys,
-            style=APPLE_DARK,
+            style=DOGGY_NEON,
             full_screen=True,
             mouse_support=True,
             color_depth=ColorDepth.TRUE_COLOR,
@@ -566,14 +571,29 @@ class CodeDoggyTUI:
         self.app.invalidate()
 
     def _render_turn_status(self) -> StyleAndTextTuples:
+        width = max(1, _terminal_width())
         if not self._is_running():
             if self._feedback_active():
                 icon = {"info": "●", "success": "✓", "warning": "!"}[
                     self._feedback_kind
                 ]
+                prefix = f"  {icon} "
+                if get_cwidth(prefix) >= width:
+                    return [
+                        (
+                            f"class:feedback.{self._feedback_kind}",
+                            _truncate_display(prefix, width),
+                        )
+                    ]
                 return [
-                    (f"class:feedback.{self._feedback_kind}", f"  {icon} "),
-                    ("class:turn.status", self._feedback_text),
+                    (f"class:feedback.{self._feedback_kind}", prefix),
+                    (
+                        "class:turn.status",
+                        _truncate_display(
+                            self._feedback_text,
+                            width - get_cwidth(prefix),
+                        ),
+                    ),
                 ]
             return [("class:turn.status", "")]
         elapsed = max(0.0, time.monotonic() - (self._task_started_at or time.monotonic()))
@@ -584,28 +604,53 @@ class CodeDoggyTUI:
         )
         label = _task_activity_text(active) if active is not None else "等待响应…"
         budget = _budget_text(self.session)
-        right_prefix = f"{budget}  " if budget else ""
-        stop = "[停止]"
-        right = f"{right_prefix}{stop}  "
-        width = max(36, _terminal_width())
-        label_budget = max(8, width - get_cwidth(right) - 18)
+        stop = "[停]" if width < 36 else "[停止]"
+        trailing = "  " if width >= 12 else ""
+        prefix = f"  {spinner} "
+        minimum_gap = 1
+        fixed = (
+            get_cwidth(prefix)
+            + minimum_gap
+            + get_cwidth(stop)
+            + get_cwidth(trailing)
+        )
+        if width <= fixed:
+            compact = _truncate_display(f"{spinner} {stop}", width)
+            return [("class:turn.stop", compact, self._stop_mouse)]
+
+        elapsed_piece = ""
+        budget_piece = ""
+        label_budget = width - fixed
+        elapsed_candidate = f" {_format_elapsed(elapsed)}"
+        if width >= 28 and label_budget - get_cwidth(elapsed_candidate) >= 4:
+            elapsed_piece = elapsed_candidate
+            label_budget -= get_cwidth(elapsed_piece)
+        budget_candidate = f"{budget}  " if budget else ""
+        if (
+            width >= 56
+            and budget_candidate
+            and label_budget - get_cwidth(budget_candidate) >= 4
+        ):
+            budget_piece = budget_candidate
+            label_budget -= get_cwidth(budget_piece)
+
         label = _truncate_display(label, label_budget)
-        left = f"  {spinner} {label}"
-        elapsed_text = _format_elapsed(elapsed)
+        left = prefix + label
         gap = max(
             1,
             width
             - get_cwidth(left)
-            - get_cwidth(elapsed_text)
-            - get_cwidth(right)
-            - 1,
+            - get_cwidth(elapsed_piece)
+            - get_cwidth(budget_piece)
+            - get_cwidth(stop)
+            - get_cwidth(trailing),
         )
         return [
             ("class:turn.status", left),
-            ("class:turn.elapsed", f" {elapsed_text}"),
-            ("class:turn.elapsed", " " * gap + right_prefix),
+            ("class:turn.elapsed", elapsed_piece),
+            ("class:turn.elapsed", " " * gap + budget_piece),
             ("class:turn.stop", stop, self._stop_mouse),
-            ("class:turn.elapsed", "  "),
+            ("class:turn.elapsed", trailing),
         ]
 
     def _render_prompt_prefix(self) -> StyleAndTextTuples:
@@ -742,16 +787,14 @@ class CodeDoggyTUI:
             self._cancel_current()
 
     def _render_header(self) -> StyleAndTextTuples:
-        width = max(36, _terminal_width())
-        cwd = str(getattr(self.session, "cwd", ""))
-        left = f"  CodeDoggy  main · {cwd}"
+        width = max(1, _terminal_width())
+        left = "  CODEDOGGY"
         right = _budget_text(self.session)
-        gap = max(1, width - get_cwidth(left) - get_cwidth(right) - 1)
-        return [
-            ("class:brand", "  CodeDoggy"),
-            ("class:meta", f"  main · {cwd}"),
-            ("class:meta", " " * gap + right + " "),
-        ]
+        left = _truncate_display(left, width)
+        if not right or get_cwidth(left) + get_cwidth(right) + 2 > width:
+            return [("class:brand", left)]
+        gap = width - get_cwidth(left) - get_cwidth(right) - 1
+        return [("class:brand", left), ("class:meta", " " * gap + right + " ")]
 
     def _render_tasks(self) -> StyleAndTextTuples:
         tasks = self.ledger.snapshots()
@@ -759,55 +802,88 @@ class CodeDoggyTUI:
         refs: list[tuple[str, str]] = []
         selected_line = 0
         line = 0
-        width = max(36, _terminal_width() - 2)
+        width = max(1, _terminal_width() - 2)
 
         if not tasks:
             return _render_doggy_empty(width)
 
         for task_index, task in enumerate(tasks):
-            status = _task_stage_text(task)
-            task_icon, task_icon_style = _status_icon(task.status, ambient=True)
-            title_budget = max(8, width - get_cwidth(status) - 8)
+            active = task.phase in {"dispatching", "parallel", "reporting"}
+            spine_style = "class:task.spine.active" if active else "class:task.spine"
+            prefix = "  │  " if active else "     "
+            status = (
+                _compact_task_stage_text(task)
+                if width < 34
+                else _task_stage_text(task)
+            )
+            marker = "▼" if active else "▸"
+            minimum_gap = 1 if width < 34 else 2
+            fixed_width = get_cwidth(prefix) + 1 + 2 + minimum_gap + 2
+            title_budget = max(1, width - get_cwidth(status) - fixed_width)
             title = _truncate_display(task.title, title_budget)
-            left = f"  {task_icon} {title}"
-            gap = max(2, width - get_cwidth(left) - get_cwidth(status))
+            left = f"{prefix}{marker}  {title}"
+            gap = max(minimum_gap, width - get_cwidth(left) - get_cwidth(status) - 2)
             fragments.extend(
                 [
-                    ("", "  "),
-                    (task_icon_style, task_icon),
-                    ("class:task.title", f" {title}"),
-                    ("class:task.status", " " * gap + status + "  \n"),
+                    (spine_style, prefix),
+                    ("class:task.marker", marker),
+                    ("class:task.title", f"  {title}"),
+                    (_task_status_style(task), " " * gap + status + "  \n"),
                 ]
             )
             line += 1
-            fragments.append(("class:tree", "  │  "))
-            for agent in task.agents:
-                index = len(refs)
-                refs.append((task.id, agent.id))
-                style = "class:agent.selected" if index == self._selected_agent else "class:agent"
-                if index == self._selected_agent:
-                    selected_line = line
-                agent_icon, _ = _status_icon(agent.status, ambient=False)
-                fragments.append(
-                    (style, f" {agent_icon} {agent.label}  › ", self._agent_mouse(index))
-                )
-                fragments.append(("", "  "))
-            fragments.append(("", "\n"))
+            fragments.extend([(spine_style, prefix), ("", "\n")])
             line += 1
-            if task.report:
+
+            boxes, line, selected_line = self._render_agent_boxes(
+                task,
+                width,
+                refs,
+                line,
+                selected_line,
+                prefix,
+                spine_style,
+            )
+            fragments.extend(boxes)
+
+            divider_width = max(1, width - get_cwidth(prefix) - 4)
+            fragments.extend(
+                [
+                    (spine_style, prefix),
+                    ("class:task.divider", "  " + "┈" * divider_width + "\n"),
+                ]
+            )
+            line += 1
+            for reporter, report, agent_status in _task_briefs(task):
+                available = max(2, width - get_cwidth(prefix))
+                label_width = min(14, max(1, available // 3))
+                label = _truncate_display(reporter, label_width)
+                padded_label = label + " " * max(0, label_width - get_cwidth(label))
+                report_width = max(1, available - label_width)
                 fragments.extend(
                     [
-                        ("class:tree", "  └─ "),
-                        ("class:reporter", f"{task.reporter:<8}"),
-                        ("class:report", task.report.strip() + "\n"),
+                        (spine_style, prefix),
+                        (_reporter_style(agent_status), padded_label),
+                        (
+                            "class:report",
+                            _truncate_display(report, report_width) + "\n",
+                        ),
                     ]
                 )
-                line += max(1, task.report.count("\n") + 1)
+                line += 1
             if task_index != len(tasks) - 1:
                 fragments.append(
-                    ("class:separator", "  " + "─" * max(1, width - 2) + "\n")
+                    ("class:separator", "  " + "─" * max(1, width - 4) + "\n")
                 )
                 line += 1
+
+        mascot = _render_doggy_corner(width) if width >= 72 else []
+        mascot_lines = sum(fragment[1].count("\n") for fragment in mascot)
+        task_height = max(8, _terminal_height() - 8)
+        if mascot and line + mascot_lines <= task_height:
+            padding = task_height - line - mascot_lines
+            fragments.append(("", "\n" * padding))
+            fragments.extend(mascot)
 
         self._agent_refs = refs
         if refs:
@@ -816,6 +892,81 @@ class CodeDoggyTUI:
             self._selected_agent = 0
         self._selected_line = selected_line
         return fragments
+
+    def _render_agent_boxes(
+        self,
+        task: TaskView,
+        width: int,
+        refs: list[tuple[str, str]],
+        line: int,
+        selected_line: int,
+        prefix: str,
+        spine_style: str,
+    ) -> tuple[StyleAndTextTuples, int, int]:
+        content_width = max(1, width - get_cwidth(prefix) - 2)
+        chips: list[tuple[int, str, int]] = []
+        for agent in task.agents:
+            index = len(refs)
+            refs.append((task.id, agent.id))
+            label = _truncate_display(agent.label, max(1, min(14, content_width - 7)))
+            inner = f" {label}  › "
+            chips.append((index, inner, get_cwidth(inner) + 2))
+
+        groups: list[list[tuple[int, str, int]]] = []
+        current: list[tuple[int, str, int]] = []
+        used = 0
+        for chip in chips:
+            extra = chip[2] + (2 if current else 0)
+            if current and used + extra > content_width:
+                groups.append(current)
+                current = []
+                used = 0
+                extra = chip[2]
+            current.append(chip)
+            used += extra
+        if current:
+            groups.append(current)
+
+        fragments: StyleAndTextTuples = []
+        for group in groups:
+            for row in range(3):
+                fragments.extend([(spine_style, prefix), ("", "  ")])
+                for chip_index, (index, inner, box_width) in enumerate(group):
+                    selected = index == self._selected_agent
+                    border = (
+                        "class:agent.border.selected"
+                        if selected
+                        else "class:agent.border"
+                    )
+                    label_style = (
+                        "class:agent.label.selected"
+                        if selected
+                        else "class:agent.label"
+                    )
+                    handler = self._agent_mouse(index)
+                    if chip_index:
+                        fragments.append(("", "  "))
+                    if row == 0:
+                        fragments.append(
+                            (border, "╭" + "─" * (box_width - 2) + "╮", handler)
+                        )
+                    elif row == 1:
+                        fragments.extend(
+                            [
+                                (border, "│", handler),
+                                (label_style, inner, handler),
+                                (border, "│", handler),
+                            ]
+                        )
+                        if selected:
+                            selected_line = line
+                    else:
+                        fragments.append(
+                            (border, "╰" + "─" * (box_width - 2) + "╯", handler)
+                        )
+                fragments.append(("", "\n"))
+                line += 1
+        return fragments, line, selected_line
 
     def _render_modal_title(self) -> StyleAndTextTuples:
         if not self._modal_ref:
@@ -942,6 +1093,13 @@ def _terminal_width() -> int:
         return shutil.get_terminal_size(fallback=(100, 30)).columns
 
 
+def _terminal_height() -> int:
+    try:
+        return get_app().output.get_size().rows
+    except Exception:  # noqa: BLE001
+        return shutil.get_terminal_size(fallback=(100, 30)).lines
+
+
 def _budget_text(session: Any) -> str:
     context = getattr(session.extensions, "context", None)
     budget = getattr(context, "budget", None)
@@ -1001,55 +1159,238 @@ def _task_stage_text(task: TaskView) -> str:
     return STATUS_TEXT.get(task.status, task.status)
 
 
+def _compact_task_stage_text(task: TaskView) -> str:
+    if task.phase == "dispatching":
+        return "拆解中"
+    if task.phase == "parallel":
+        active = sum(
+            agent.status in {"pending", "running"} for agent in task.agents
+        )
+        return f"{max(1, active)} 并行"
+    if task.phase == "reporting":
+        return "汇总中"
+    if task.phase == "done":
+        return f"完成·{len(task.agents)}"
+    return STATUS_TEXT.get(task.status, task.status)
+
+
+def _task_status_style(task: TaskView) -> str:
+    if task.status in {"failed", "max_turns"}:
+        return "class:task.status.failed"
+    if task.phase == "done":
+        return "class:task.status.completed"
+    if task.phase == "reporting":
+        return "class:task.status.reporting"
+    if task.phase in {"dispatching", "parallel"}:
+        return "class:task.status.running"
+    return "class:task.status"
+
+
+def _task_briefs(task: TaskView) -> list[tuple[str, str, str]]:
+    """Return one boss-readable first paragraph per reporting Agent."""
+    briefs: list[tuple[str, str, str]] = []
+    report_matched = False
+    for agent in task.agents:
+        raw = agent.output
+        if task.report and agent.label == task.reporter:
+            raw = task.report
+            report_matched = True
+        if raw.strip():
+            briefs.append(
+                (agent.label, task_report_from_agent(raw), agent.status)
+            )
+    if task.report and not report_matched:
+        briefs.append((task.reporter, task_report_from_agent(task.report), task.status))
+    if not briefs:
+        main = task.agents[0] if task.agents else None
+        briefs.append(
+            (
+                main.label if main is not None else "MAIN",
+                _task_activity_text(task),
+                main.status if main is not None else task.status,
+            )
+        )
+    return briefs
+
+
+def _reporter_style(status: str) -> str:
+    if status in {"running", "pending"}:
+        return "class:reporter.running"
+    if status == "completed":
+        return "class:reporter.completed"
+    if status in {"failed", "max_turns"}:
+        return "class:reporter.failed"
+    return "class:reporter.waiting"
+
+
+_DOGGY_CITY_ART = (
+    "........................FFF......FF.............................",
+    "........................FMFF....FFF.....SSS.....................",
+    "........................FMMF....FMFF...FSSS.....................",
+    "............MM..........FMMFFFFFFMMF..SSSS......................",
+    "............MM..........FMMFFFFFFFF...SSS.......................",
+    ".......M....MM..........FFFFFFFFFFF...SSSSS.....................",
+    ".......M.....M...........FFFFFWFFFFW...SSSS.....................",
+    ".......M....MMM...........FF.WWFFFWW..SSS.......................",
+    "..M...MMM..MMMM..........FFFFFFFFFFF..SFS.......................",
+    "..M...MMM..MMM...........FFFFFFDDDFF.SSS........................",
+    "M.M...MMM..M.M...........GFFFFDDDDGWWM..........................",
+    "MMM...MMMMMM.M.MM.....CC.GGGFDDDDDCCCC..........................",
+    "MMM.M.MMM.MM.F.M.CCCCCCCFFGGGFFFGGFFCCCCCC......................",
+    "MMM.M..MM.M..CCCCC..CCC.FFFGGGFGGGFFF....CCC....................",
+    "MMM.M.....CCCCCCCCCCCCCCFFFFFGGGGDD..DD.CC.CCCC.................",
+    "MMM.M.CCCCCCCC.C.CCCCC.CCCFFFCCGD.DDD.D.CCCC..CCCC..............",
+    "M...CCCBCCCCCCCCCCCCCCCCCCCC..CCCCCCCCCCCCCCCCCCCCCCCC..........",
+    "M..CCCCCBCCCCBCCCCCCCCCCCBCCCC....CC..........CCC...CCCC........",
+    "MM.CCCCCCCC.CCCC...CCCCDCCDDCCCCCC.CCC..........CC....CCC.......",
+    "MM.CCCCCCCC..CCB....CCCCCCCBBCCCWCCCCCC...........CC.CCWCC......",
+    "MMMCCDCC.CC..CC.....CCCDCCCCCBCCWWW.CCCC.......CC..CCCCWWCC.....",
+    "...CCGCCC.CC.CC.....CCDDDCCCCCCCCCWCCC.CCCCCCCCCCCCCCCCCCCC.....",
+    "MMMCCGCCC..CCCCCC...CCDGDCCDDD..CCCCC...CC.....GGG....C..CCC....",
+    ".MM.CDCCCC..CCCCCCCCCCDG.CCBB....CCCCCCCCCCCCCCCCCCCCCCCCCC.....",
+    "MMM.CDCCCC......CCCCCCDDDCCB....CCD......CC..........CC...C.....",
+    "....CCC.CCCCCCCCCC..CCCDCCCCC..CCD......CCCCCCCCCCCCCC...CC.....",
+    "MMMM.DD..MM...CCCCCCCCCCCDC.CC.CCC.....CCCCCCCCCCCCCCCCCCCC.....",
+    "..MMMMMM..MMMMMM......CCC.CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC.....",
+    "......MMMMMM...M..MMM..D........................................",
+    "..........MMMMMM....MMMM........................................",
+    ".............MMMMMMM....MMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMM...",
+    ".................MMMMMM.........................................",
+)
+
+_DOGGY_CORNER_ART = (
+    "........................",
+    "........................",
+    "...DGG......GGG.........",
+    "...GDG.....GDDG.........",
+    "..GGDDG...GDDDG.........",
+    "..GDDDGGGGGGDDG.........",
+    "...GDGGGGGGGDDG.........",
+    "...GGGGGGGGGGGG.........",
+    "...DD.DGDD..DG..........",
+    "...D..DDD..GGG..........",
+    "...GGGD.GGGGGG..........",
+    "...GGGDDGGGGGG..........",
+    "...DDDGGDGDGDDG.........",
+    ".....GGGGGGDDGGG..WDD...",
+    "...GGDDWWDDDGGGGG.DWDW..",
+    "...GGWDGGFGGGGGGGG.WFW..",
+    "...GGWGGGWWGGGGGGG.W....",
+    "....GGWGWWGGGGDGGGG.....",
+    "....GGDGWFGGGDDGGGGG....",
+    "....GGGGGGGGGDDGGGGG....",
+    "..DGGGG..DGGGDGGGDD.....",
+    "..........WWDG..........",
+    "........................",
+    "........................",
+)
+
+_DOGGY_ART_PALETTE = {
+    ".": "#020507",
+    "C": "#16dfe5",
+    "M": "#f12698",
+    "G": "#ffc21a",
+    "F": "#f2d397",
+    "D": "#343a3e",
+    "S": "#92999e",
+    "W": "#f4f6f5",
+    "B": "#07596a",
+}
+
+_DOGGY_ART_PRIORITY = {
+    ".": 0,
+    "B": 1,
+    "D": 2,
+    "S": 3,
+    "F": 4,
+    "C": 5,
+    "M": 6,
+    "G": 7,
+    "W": 8,
+}
+
+
 def _render_doggy_empty(
     width: int,
     *,
     now: float | None = None,
 ) -> StyleAndTextTuples:
-    """Render the launch mascot as fixed-width terminal art without jitter."""
-    tick = int((time.monotonic() if now is None else now) * 4) % 4
-    wind = ("≋≋≋━━━", "━≋≋≋━━", "━━≋≋≋━", "≋━━≋≋≋")[tick]
-    wheel = ("◉", "●", "◎", "●")[tick]
-    canvas_width = 23
-    lines: list[list[tuple[str, str]]] = [
-        [("class:doggy.coat", "       ╱╲       ╱╲")],
-        [("class:doggy.coat", "      ╱  ╲_____╱  ╲")],
-        [("class:doggy.detail", "     │  ╭━━╮ ╭━━╮  │")],
-        [("class:doggy.detail", "     │  ┃● ┃━┃ ●┃  │")],
-        [("class:doggy.detail", "     │  ╰━━╯ ╰━━╯  │")],
-        [("class:doggy.coat", "     ╰╮     ᴥ     ╭╯")],
-        [("class:doggy.coat", "      ╰──╮ ╰━╯ ╭──╯")],
-        [
-            ("class:doggy.speed", wind),
-            ("class:doggy.coat", "╯ │     │ ╰━━"),
-        ],
-        [("class:doggy.coat", "          ╲_____╱")],
-        [("class:doggy.speed", "    ═══════════════════")],
-        [("class:doggy.speed", f"       {wheel}           {wheel}")],
-    ]
+    """Render the idle Frenchie cockpit as opaque true-colour terminal pixels."""
+    rows = _DOGGY_CITY_ART
+    target_width = max(1, min(len(rows[0]), width - 4))
+    if target_width < len(rows[0]):
+        rows = tuple(_fit_art_row(row, target_width) for row in rows)
 
-    outer = max(0, (width - canvas_width) // 2)
-    fragments: StyleAndTextTuples = [("", "\n")]
-    for parts in lines:
+    art_width = len(rows[0])
+    outer = max(0, (width - art_width) // 2)
+    title = "— DOGGY —"
+    title_outer = max(0, (width - get_cwidth(title)) // 2)
+    tick = int((time.monotonic() if now is None else now) * 4) % 2
+    palette = dict(_DOGGY_ART_PALETTE)
+    if tick:
+        palette["G"] = "#ffe36a"
+
+    fragments: StyleAndTextTuples = [
+        ("", "\n"),
+        ("", " " * title_outer),
+        ("class:doggy.wordmark", title + "\n"),
+        ("", "\n"),
+    ]
+    for top, bottom in zip(rows[::2], rows[1::2], strict=True):
         fragments.append(("", " " * outer))
-        fragments.extend(parts)
+        pairs = zip(top, bottom, strict=True)
+        for pair, cells in groupby(pairs):
+            count = sum(1 for _ in cells)
+            style, glyph = _half_block(pair[0], pair[1], palette)
+            fragments.append((style, glyph * count))
         fragments.append(("", "\n"))
-    fragments.extend(
-        [
-            ("", "\n"),
-            ("", " " * max(0, (width - 17) // 2)),
-            ("class:doggy.coat", "D"),
-            ("", "   "),
-            ("class:doggy.wordmark", "o"),
-            ("", "   "),
-            ("class:doggy.wordmark", "g"),
-            ("", "   "),
-            ("class:doggy.wordmark", "g"),
-            ("", "   "),
-            ("class:doggy.speed", "y\n"),
-        ]
-    )
     return fragments
+
+
+def _render_doggy_corner(width: int) -> StyleAndTextTuples:
+    """Render the small decorative Doggy at the lower-right of a task canvas."""
+    rows = _DOGGY_CORNER_ART
+    art_width = len(rows[0])
+    outer = max(0, width - art_width - 4)
+    palette = dict(_DOGGY_ART_PALETTE)
+    if int(time.monotonic() * 3) % 2:
+        palette["G"] = "#ffe36a"
+    fragments: StyleAndTextTuples = []
+    for top, bottom in zip(rows[::2], rows[1::2], strict=True):
+        fragments.append(("", " " * outer))
+        for pair, cells in groupby(zip(top, bottom, strict=True)):
+            count = sum(1 for _ in cells)
+            style, glyph = _half_block(pair[0], pair[1], palette)
+            fragments.append((style, glyph * count))
+        fragments.append(("", "\n"))
+    return fragments
+
+
+def _fit_art_row(row: str, width: int) -> str:
+    """Keep bright silhouette pixels while fitting art to the terminal width."""
+    fitted: list[str] = []
+    for index in range(width):
+        start = index * len(row) // width
+        end = max(start + 1, (index + 1) * len(row) // width)
+        fitted.append(max(row[start:end], key=_DOGGY_ART_PRIORITY.__getitem__))
+    return "".join(fitted)
+
+
+def _half_block(
+    top: str,
+    bottom: str,
+    palette: dict[str, str],
+) -> tuple[str, str]:
+    background = palette["."]
+    if top == bottom == ".":
+        return f"bg:{background}", " "
+    if top == bottom:
+        return f"fg:{palette[top]} bg:{background}", "█"
+    if top == ".":
+        return f"fg:{palette[bottom]} bg:{background}", "▄"
+    if bottom == ".":
+        return f"fg:{palette[top]} bg:{background}", "▀"
+    return f"fg:{palette[top]} bg:{palette[bottom]}", "▀"
 
 
 def _task_activity_text(task: TaskView) -> str:
@@ -1063,24 +1404,6 @@ def _task_activity_text(task: TaskView) -> str:
     if task.phase == "reporting":
         return "MAIN 正在汇总结果…"
     return "MAIN 正在推进…"
-
-
-def _status_icon(status: str, *, ambient: bool) -> tuple[str, str]:
-    if status in {"running", "pending"}:
-        if ambient:
-            frames = ("○", "◎", "◉", "◎")
-            frame = frames[int(time.monotonic() * 3.75) % len(frames)]
-        else:
-            frames = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
-            frame = frames[int(time.monotonic() * 7.5) % len(frames)]
-        return frame, "class:status.running"
-    if status == "completed":
-        return "✓", "class:status.completed"
-    if status in {"failed", "max_turns"}:
-        return "!", "class:status.failed"
-    if status == "cancelled":
-        return "×", "class:status.waiting"
-    return "○", "class:status.waiting"
 
 
 def _truncate_display(text: str, width: int) -> str:

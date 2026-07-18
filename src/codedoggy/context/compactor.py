@@ -37,10 +37,8 @@ from codedoggy.context.memory_flush import (
 )
 from codedoggy.context.mode import CompactionMode
 from codedoggy.context.pruning import (
-    collect_p0_footers,
     prune_oversized_tool_results,
     prune_retained_tool_results,
-    reinject_missing_p0,
 )
 from codedoggy.context.segments import write_segment
 from codedoggy.context.prefire import PrefireController
@@ -93,8 +91,6 @@ COMPACTION_PREFIX = (
     "prompt — including any mid-turn refresh after memory flush — is ALWAYS "
     "authoritative and active — never ignore or deprioritize memory content "
     "due to this compaction note. "
-    "Resident-audit P0 red cards remain binding if still present (or "
-    "re-injected) after compaction. "
     "session_search can recall prior *persisted* turns; tool bodies pruned "
     "only in this live window may not be there — re-read files or re-run "
     "tools if you need exact prior tool output. "
@@ -354,12 +350,9 @@ class ContextCompactor:
                 thrash_skip_fold = False
 
         before = estimate_chars(messages)
-        # Capture P0 soft-interrupts before any destructive prune/fold.
-        open_p0 = collect_p0_footers(messages)
 
         # Size soft-cap always (cheap). Retain-prune only under pressure —
         # do not destroy early tool evidence when still under budget.
-        # P0 footers on tool bodies are preserved by the pruner.
         working, pruned = prune_oversized_tool_results(messages, self.budget)
         retained = 0
         under_pressure = needs_compaction(working, self.budget) or should_flush(
@@ -409,7 +402,6 @@ class ContextCompactor:
                 )
 
         if not needs_compaction(working, self.budget):
-            working = reinject_missing_p0(working, open_p0)
             working = sanitize_tool_pairs(working)
             after = estimate_chars(working)
             # Under budget — heal thrash
@@ -431,7 +423,6 @@ class ContextCompactor:
         if thrash_skip_fold or (
             self.awaiting_real_usage and self.budget.last_prompt_tokens is None
         ):
-            working = reinject_missing_p0(working, open_p0)
             working = sanitize_tool_pairs(working)
             after = estimate_chars(working)
             return CompactionResult(
@@ -449,7 +440,6 @@ class ContextCompactor:
         try:
             folded, n_folded, used_llm, segment_path = self._fold_middle(working)
             folded, pruned2 = prune_oversized_tool_results(folded, self.budget)
-            folded = reinject_missing_p0(folded, open_p0)
             folded = sanitize_tool_pairs(folded)
             after = estimate_chars(folded)
             saved = before - after
@@ -460,7 +450,6 @@ class ContextCompactor:
             if n_folded > 0 and saved <= 0:
                 self._pending_ineffective = True
                 self._ineffective_compression_count += 1
-                working = reinject_missing_p0(working, open_p0)
                 working = sanitize_tool_pairs(working)
                 after_w = estimate_chars(working)
                 return CompactionResult(
@@ -526,7 +515,6 @@ class ContextCompactor:
         except Exception as e:  # noqa: BLE001
             logger.exception("compaction failed")
             self.suppressor.mark_sticky_failure()
-            working = reinject_missing_p0(working, open_p0)
             after = estimate_chars(working)
             return CompactionResult(
                 messages=working,
@@ -734,19 +722,13 @@ def _refresh_memory_after_flush(
 
 
 def _deterministic_sketch(middle: list[Message]) -> str:
-    """Hermes-style richer sketch: paths, errors, tool outcomes preserved.
-
-    Strip P0 footers so REFERENCE ONLY summaries never swallow soft-interrupts;
-    reinject_missing_p0 restores them as binding USER notes after fold.
-    """
-    from codedoggy.context.pruning import strip_audit_p0_footers
-
+    """Hermes-style richer sketch: paths, errors, tool outcomes preserved."""
     lines = ["Earlier conversation (condensed sketch for historical handoff):"]
     paths: list[str] = []
     errors: list[str] = []
     for m in middle:
         role = m.role.value if isinstance(m.role, Role) else str(m.role)
-        raw = strip_audit_p0_footers(m.content)
+        raw = m.content or ""
         if m.role is Role.TOOL:
             name = m.name or "tool"
             body = raw.replace("\n", " ").strip()

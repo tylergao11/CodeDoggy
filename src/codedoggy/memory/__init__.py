@@ -5,6 +5,7 @@ manager calls from runner/kernel/compactor.
 """
 
 from codedoggy.memory.context_fence import (
+    StreamingContextScrubber,
     build_memory_context_block,
     messages_with_ephemeral_memory,
     sanitize_context,
@@ -19,6 +20,7 @@ from codedoggy.memory.hermes_seam import (
     build_system_memory_block,
     commit_session_boundary,
     notify_curated_write,
+    on_delegation,
     on_pre_compress,
     on_session_close,
     on_transcript_rewound,
@@ -56,6 +58,7 @@ __all__ = [
     "MemoryStore",
     "SessionFtsProvider",
     "SessionStore",
+    "StreamingContextScrubber",
     "USER_CHAR_LIMIT",
     "bind_session",
     "build_memory_context_block",
@@ -72,6 +75,7 @@ __all__ = [
     "load_on_disk_store",
     "messages_with_ephemeral_memory",
     "notify_curated_write",
+    "on_delegation",
     "on_pre_compress",
     "on_session_close",
     "on_transcript_rewound",

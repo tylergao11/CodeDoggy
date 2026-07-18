@@ -1,14 +1,11 @@
-"""search_tool — Grok SearchTool wire surface only.
+"""search_tool — Grok SearchTool (source-level).
 
-Source: implementations/search_tool/mod.rs + types/tool_index.rs
-
-Grok injects Arc<dyn ToolSearchIndex> (BM25 lives in xai-grok-shell, not tools).
-CodeDoggy does **not** ship a BM25 registry. Host must provide either:
-
-  extra['mcp_tool_index']  — object with search(query, limit=...) or search_snapshot
-  extra['mcp_tools']       — list[dict] catalog (simple token filter, not BM25)
-
-No invented mcp_registry.py.
+Source: implementations/search_tool/mod.rs
+  - description_template
+  - empty index → JSON note (exact string)
+  - search_snapshot → group by server → status ready/partial
+Pure: grok_build/search_tool_logic.py
+Index: tools/mcp/tool_index.py (Grok shell Bm25ToolSearchIndex)
 """
 
 from __future__ import annotations
@@ -16,6 +13,17 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from codedoggy.tools.grok_build.search_tool_logic import (
+    MAX_MCP_DESCRIPTION_LENGTH,
+    NO_MCP_CONFIGURED_JSON,
+    NO_MCP_CONFIGURED_NOTE,
+    SEARCH_TOOL_DESCRIPTION,
+    ServerSummary,
+    build_server_reminder,
+    format_search_snapshot_response,
+    sanitize_description,
+    truncate_description,
+)
 from codedoggy.tools.kinds import ToolKind, ToolNamespace
 from codedoggy.tools.runtime import (
     ListToolsContext,
@@ -25,26 +33,6 @@ from codedoggy.tools.runtime import (
     ToolError,
     ToolId,
 )
-
-_DESC = """\
-Search for MCP tools by keyword and retrieve their input schemas.
-
-If status is "partial", some servers may still be connecting.
-Include the server name and action for best results (e.g. "linear create issue").
-"""
-
-MAX_MCP_DESCRIPTION_LENGTH = 2048
-_TRUNC = "… [truncated]"
-
-
-def truncate_description(s: str) -> str:
-    """Port of search_tool::truncate_description (char-boundary)."""
-    if len(s) <= MAX_MCP_DESCRIPTION_LENGTH or len(s) <= MAX_MCP_DESCRIPTION_LENGTH:
-        # Grok also checks chars().count(); for ASCII-heavy schemas len is fine.
-        if sum(1 for _ in s) <= MAX_MCP_DESCRIPTION_LENGTH:
-            return s
-    budget = MAX_MCP_DESCRIPTION_LENGTH - len(_TRUNC)
-    return "".join(list(s)[:budget]) + _TRUNC
 
 
 class SearchToolTool(Tool):
@@ -58,23 +46,28 @@ class SearchToolTool(Tool):
         return ToolKind.SearchTool
 
     def description(self, _ctx: ListToolsContext | None = None) -> ToolDescription:
-        return ToolDescription(name="search_tool", description=_DESC.strip())
+        return ToolDescription(name="search_tool", description=SEARCH_TOOL_DESCRIPTION)
 
     def parameters_schema(self) -> dict[str, Any]:
+        # Grok SearchToolInput
         return {
             "type": "object",
             "properties": {
+                # Grok SearchToolInput
                 "query": {
                     "type": "string",
                     "description": (
-                        "Keywords to match against tool names, server names, and descriptions."
+                        "Keywords to match against tool names, server names, "
+                        "and descriptions. Include the server name and action "
+                        "for best results (e.g. \"linear create issue\", "
+                        '"slack read thread history").'
                     ),
                 },
                 "limit": {
                     "type": "integer",
                     "description": "Maximum number of results to return (default 5).",
                     "minimum": 0,
-                    "maximum": 50,
+                    "maximum": 255,
                 },
             },
             "required": ["query"],
@@ -90,106 +83,107 @@ class SearchToolTool(Tool):
         limit = max(0, int(limit))
 
         extra = ctx.extra or {}
-        index = extra.get("mcp_tool_index")
-        if index is not None:
-            snap = getattr(index, "search_snapshot", None)
-            if callable(snap):
-                try:
-                    result = snap(query, limit)
-                except Exception as e:  # noqa: BLE001
-                    raise ToolError(f"search_tool failed: {e}", code="mcp_error") from e
-                return _format_snapshot(result)
-            search = getattr(index, "search", None)
-            if callable(search):
-                try:
-                    result = search(query, limit=limit)
-                except Exception as e:  # noqa: BLE001
-                    raise ToolError(f"search_tool failed: {e}", code="mcp_error") from e
-                if isinstance(result, str):
-                    return result
-                return str(result)
+        # Grok: shell injects ToolIndex after MCP init
+        try:
+            from codedoggy.tools.mcp.tool_index import ensure_mcp_tool_index
 
-        tools = extra.get("mcp_tools")
-        if isinstance(tools, list):
-            if not tools:
-                return "No MCP tools registered."
-            return _filter_catalog(tools, query, limit)
+            ensure_mcp_tool_index(extra)
+        except Exception:  # noqa: BLE001
+            pass
 
-        return "No MCP tools registered."
+        from codedoggy.tools.mcp.types import unwrap_tool_index
 
+        index = unwrap_tool_index(extra.get("mcp_tool_index"))
+        if index is None:
+            # Grok: no ToolIndex in resources
+            return json.dumps(NO_MCP_CONFIGURED_JSON, indent=2, ensure_ascii=False)
 
-def _filter_catalog(tools: list[Any], query: str, limit: int) -> str:
-    """Host-provided catalog: simple multi-token substring filter (not BM25)."""
-    tokens = [t.lower() for t in query.split() if t.strip()]
-    scored: list[tuple[int, dict[str, Any]]] = []
-    for raw in tools:
-        if not isinstance(raw, dict):
-            continue
-        name = str(raw.get("name") or "")
-        desc = str(raw.get("description") or "")
-        server = str(raw.get("server") or "")
-        hay = f"{name} {desc} {server}".lower()
-        if tokens:
-            hits = sum(1 for t in tokens if t in hay)
-            if hits == 0:
-                continue
-            score = hits
-        else:
-            score = 1
-        scored.append((score, raw))
-    scored.sort(key=lambda x: (-x[0], str(x[1].get("name") or "")))
-    if limit == 0:
-        return "No matching MCP tools."
-    top = scored[:limit]
-    if not top:
-        return "No matching MCP tools."
-    parts = [f"Found {len(top)} MCP tool(s):\n"]
-    for score, t in top:
-        name = t.get("name", "")
-        desc = truncate_description(str(t.get("description") or ""))
-        server = t.get("server") or ""
-        schema = t.get("parameters") or t.get("input_schema") or {}
-        parts.append(f"\n### {name} (score≈{score}, server: {server})\n")
-        if desc:
-            parts.append(f"{desc}\n")
-        if schema:
-            parts.append("input_schema:\n")
-            parts.append(json.dumps(schema, ensure_ascii=False, indent=2))
-            parts.append("\n")
-    return "".join(parts)
+        # Grok ToolSearchIndex::search_snapshot only
+        try:
+            result = index.search_snapshot(query, limit)
+        except TypeError:
+            try:
+                result = index.search_snapshot(query, limit=limit)  # type: ignore[call-arg]
+            except Exception as e:  # noqa: BLE001
+                raise ToolError(f"search_tool failed: {e}", code="mcp_error") from e
+        except Exception as e:  # noqa: BLE001
+            raise ToolError(f"search_tool failed: {e}", code="mcp_error") from e
+        return _format_grok_snapshot(result)
 
 
-def _format_snapshot(result: Any) -> str:
+def _format_grok_snapshot(result: Any) -> str:
+    """Map SearchSnapshot / dict → Grok grouped JSON (mod.rs run)."""
     if isinstance(result, str):
         return result
     results = getattr(result, "results", None)
+    total_hidden = getattr(result, "total_hidden_tools", 0)
+    is_ready = getattr(result, "is_ready", True)
     if results is None and isinstance(result, dict):
         results = result.get("results")
+        total_hidden = result.get("total_hidden_tools", 0)
+        is_ready = result.get("is_ready", True)
+        if result.get("note") == NO_MCP_CONFIGURED_NOTE:
+            return json.dumps(result, indent=2, ensure_ascii=False)
     if not results:
-        return "No matching MCP tools."
-    parts = [f"Found {len(results)} MCP tool(s):\n"]
-    for r in results:
-        if isinstance(r, dict):
-            name = r.get("tool_name") or r.get("name") or ""
-            server = r.get("server_name") or r.get("server") or ""
-            desc = truncate_description(str(r.get("description") or ""))
-            score = r.get("score", 0)
-            schema = r.get("input_schema") or {}
-        else:
-            name = getattr(r, "tool_name", getattr(r, "name", ""))
-            server = getattr(r, "server_name", getattr(r, "server", ""))
-            desc = truncate_description(str(getattr(r, "description", "") or ""))
-            score = getattr(r, "score", 0)
-            schema = getattr(r, "input_schema", {}) or {}
-        parts.append(f"\n### {name} (score: {score:.2f}, server: {server})\n")
-        if desc:
-            parts.append(f"{desc}\n")
-        if schema:
-            parts.append("input_schema:\n")
-            parts.append(
-                json.dumps(schema, ensure_ascii=False, indent=2)
-                if not isinstance(schema, str)
-                else schema
+        return format_search_snapshot_response(
+            [],
+            total_hidden_tools=int(total_hidden or 0),
+            is_ready=bool(is_ready),
+        )
+    return format_search_snapshot_response(
+        list(results),
+        total_hidden_tools=int(total_hidden or 0),
+        is_ready=bool(is_ready),
+    )
+
+
+def mcp_server_reminder_from_extra(extra: dict[str, Any] | None) -> str | None:
+    bag = extra or {}
+    index = bag.get("mcp_tool_index")
+    if index is not None:
+        list_fn = getattr(index, "list_server_summaries", None)
+        if callable(list_fn):
+            try:
+                summaries = list_fn()
+                from codedoggy.tools.mcp.tool_index import ServerSummary as IdxSum
+
+                servers: list[ServerSummary] = []
+                for s in summaries or []:
+                    if isinstance(s, ServerSummary):
+                        servers.append(s)
+                    elif hasattr(s, "name"):
+                        servers.append(
+                            ServerSummary(
+                                name=s.name,
+                                tool_count=int(getattr(s, "tool_count", 0) or 0),
+                                description=getattr(s, "description", None),
+                                tool_names=list(getattr(s, "tool_names", []) or []),
+                            )
+                        )
+                return build_server_reminder(servers)
+            except Exception:  # noqa: BLE001
+                pass
+    raw = bag.get("mcp_servers")
+    if not isinstance(raw, list) or not raw:
+        return None
+    servers = []
+    for item in raw:
+        if isinstance(item, dict) and item.get("name"):
+            servers.append(
+                ServerSummary(
+                    name=str(item["name"]),
+                    tool_count=int(item.get("tool_count") or item.get("count") or 0),
+                    description=item.get("description"),
+                    tool_names=item.get("tool_names") or [],
+                )
             )
-            parts.append("\n")
-    return "".join(parts)
+    return build_server_reminder(servers)
+
+
+__all__ = [
+    "MAX_MCP_DESCRIPTION_LENGTH",
+    "SearchToolTool",
+    "mcp_server_reminder_from_extra",
+    "truncate_description",
+    "sanitize_description",
+]

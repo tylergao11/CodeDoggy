@@ -61,7 +61,7 @@ def run_agent_loop(
         Polled between steps; when true, returns ``cancelled=True``.
     hooks:
         Optional ``after_sample`` / ``after_tool`` / ``after_mutation`` /
-        ``on_turn_end`` (flush deferred non-P0 audit notes).
+        ``on_turn_end``.
     context_budget / context_compactor:
         Grok-style in-session window control (prune tool noise, fold middle).
         Hermes MEMORY in system messages is never dropped.
@@ -175,10 +175,7 @@ def run_agent_loop(
         body = text if text is not None else final_text
         deferred = _call_on_turn_end(hook_impl, _hctx(rounds))
         if deferred:
-            # Legacy end-of-turn hook notes only (audit package when explicitly enabled)
             meta["turn_end_notes"] = deferred
-            # Keep old key for any leftover test/host readers
-            meta["shadow_deferred"] = deferred
             body = f"{body}\n\n{deferred}" if body else deferred
             note_msg = Message(
                 role=Role.USER,
@@ -266,6 +263,13 @@ def run_agent_loop(
                     cres.folded_messages,
                 )
 
+        # Dynamic tool descriptions (skill <available_skills>) re-render each turn.
+        bind = getattr(tools, "bind_list_context", None)
+        if callable(bind):
+            try:
+                bind(cwd=cwd_path, extra=extra)
+            except Exception:  # noqa: BLE001
+                logger.debug("bind_list_context failed", exc_info=True)
         tool_specs = tools.tool_definitions()
         # Grok: tools_reserve counts against the window every sample
         if context_compactor is not None:
@@ -527,7 +531,7 @@ def run_agent_loop(
                     abort_reason = abort
                 continue
 
-            # Optional after_mutation (legacy audit only on product path)
+            # Optional after_mutation
             has_mut = bool(getattr(record, "mutations", None) or record.mutation)
             if has_mut:
                 mut_decision = _call_hook(hook_impl, "after_mutation", record, hctx)

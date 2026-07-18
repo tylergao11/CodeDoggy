@@ -52,14 +52,11 @@ class LoopHooks(Protocol):
     def after_mutation(
         self, record: ToolResultRecord, ctx: HookContext
     ) -> HookDecision | None:
-        """After a mutating tool (edit/write/delete/move) succeeds.
-
-        Resident audit: P0 red cards here; non-P0 buffered until on_turn_end.
-        """
+        """After a mutating tool (edit/write/delete/move) succeeds."""
         ...
 
     def on_turn_end(self, ctx: HookContext) -> str | None:
-        """Flush deferred (non-P0) audit notes at end of the agentic turn."""
+        """Optional end-of-turn note text (appended to the model transcript)."""
         ...
 
 

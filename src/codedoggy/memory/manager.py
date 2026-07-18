@@ -424,7 +424,8 @@ class MemoryManager:
 
         self._submit_background(_run)
 
-    def as_audit_selector(self) -> Any:
+    def as_memory_selector(self) -> Any:
+        """Hermes multi-source selector for turn prefetch."""
         from codedoggy.memory.hermes_select import HermesMemorySelector
 
         return HermesMemorySelector(
@@ -432,24 +433,77 @@ class MemoryManager:
             session_store=self.session_store,
         )
 
-    def notify_memory_write(self, target: str = "memory") -> None:
-        """Hermes on_memory_write spirit — refresh freeze after curated write."""
+    def notify_memory_write(
+        self,
+        target: str = "memory",
+        *,
+        action: str = "add",
+        content: str = "",
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        """Hermes on_memory_write — refresh freeze + mirror to external providers.
+
+        Skips builtin_* sources of the write (Hermes skips name=='builtin').
+        """
         store = self.curated_store
-        if store is None:
-            return
-        refresh = getattr(store, "refresh_system_prompt_snapshot", None)
-        if callable(refresh):
-            try:
-                refresh()
-            except Exception as e:  # noqa: BLE001
-                logger.warning("notify_memory_write refresh failed: %s", e)
-        for p in self._providers:
-            hook = getattr(p, "on_memory_write", None)
-            if callable(hook):
+        if store is not None:
+            refresh = getattr(store, "refresh_system_prompt_snapshot", None)
+            if callable(refresh):
                 try:
-                    hook("write", target, "")
-                except Exception:  # noqa: BLE001
-                    logger.debug("on_memory_write failed", exc_info=True)
+                    refresh()
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("notify_memory_write refresh failed: %s", e)
+        self.on_memory_write(action, target, content, metadata=metadata)
+
+    def on_memory_write(
+        self,
+        action: str,
+        target: str,
+        content: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        """Notify external providers when curated memory tool writes (Hermes)."""
+        for p in self._providers:
+            name = str(getattr(p, "name", "") or "")
+            if name == "builtin" or name.startswith("builtin"):
+                continue
+            hook = getattr(p, "on_memory_write", None)
+            if not callable(hook):
+                continue
+            try:
+                try:
+                    hook(action, target, content, metadata=dict(metadata or {}))
+                except TypeError:
+                    hook(action, target, content)
+            except Exception as e:  # noqa: BLE001
+                logger.debug(
+                    "Memory provider '%s' on_memory_write failed: %s", p.name, e
+                )
+
+    def on_delegation(
+        self,
+        task: str,
+        result: str,
+        *,
+        child_session_id: str = "",
+        **kwargs: Any,
+    ) -> None:
+        """Hermes on_delegation — parent observes subagent task+result."""
+        for p in self._providers:
+            hook = getattr(p, "on_delegation", None)
+            if not callable(hook):
+                continue
+            try:
+                hook(
+                    task or "",
+                    result or "",
+                    child_session_id=child_session_id,
+                    **kwargs,
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.debug(
+                    "Memory provider '%s' on_delegation failed: %s", p.name, e
+                )
 
     def flush_pending(self, timeout: float | None = None) -> bool:
         """Hermes flush_pending — barrier on single-worker queue."""

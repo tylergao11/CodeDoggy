@@ -269,7 +269,6 @@ def test_build_session_wires_parallel_coordinator(tmp_path: Path) -> None:
 
     s = build_session(tmp_path, main_client=Fake(), enable_memory=False, enable_graph=False)
     try:
-        assert s.extensions.audit is None
         k = s.extensions.kernel
         assert k is not None
         assert k.subagent_coordinator is not None

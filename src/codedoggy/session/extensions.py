@@ -26,7 +26,6 @@ class SessionExtensions:
     memory: Any | None = None  # MemoryStore (curated)
     memory_manager: Any | None = None  # MemoryManager
     session_store: Any | None = None  # SessionStore
-    audit: Any | None = None  # AuditServices / Shadow
     graph: Any | None = None
     policy: Any | None = None  # WorkspacePolicy
     kernel: Any | None = None  # RuntimeKernel (state spine)
@@ -39,7 +38,6 @@ class SessionExtensions:
             "memory": self.memory,
             "memory_manager": self.memory_manager,
             "session_store": self.session_store,
-            "audit": self.audit,
             "graph": self.graph,
             "policy": self.policy,
             "kernel": self.kernel,
@@ -55,9 +53,6 @@ class SessionExtensions:
 
     def with_memory(self, memory: Any) -> SessionExtensions:
         return self._copy(memory=memory)
-
-    def with_audit(self, audit: Any) -> SessionExtensions:
-        return self._copy(audit=audit)
 
     def with_session_store(self, session_store: Any) -> SessionExtensions:
         return self._copy(session_store=session_store)

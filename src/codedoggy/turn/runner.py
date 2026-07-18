@@ -134,25 +134,11 @@ class AgentTurnRunner:
                 f"{system_prompt}\n\n{blocks}" if system_prompt else blocks
             )
 
-        # Lazy imports avoid audit ↔ turn package cycles at import time.
-        from codedoggy.audit.hooks import resolve_audit_hooks
-        from codedoggy.audit.memory_select import CuratedMemorySelector
         from codedoggy.memory.hermes_select import HermesMemorySelector
 
-        audit = getattr(ext, "audit", None) if ext is not None else None
         selector = None
-        if audit is not None:
-            sel = getattr(audit, "memory_selector", None)
-            selector = sel
-            if isinstance(sel, CuratedMemorySelector) and sel.store is None and mem is not None:
-                sel.bind_store(mem)
-            if isinstance(sel, HermesMemorySelector):
-                if sel.curated_store is None and mem is not None:
-                    sel.bind_curated(mem)
-                if sel.session_store is None and session_store is not None:
-                    sel.bind_session_store(session_store)
-        elif memory_manager is not None:
-            selector = memory_manager.as_audit_selector()
+        if memory_manager is not None:
+            selector = memory_manager.as_memory_selector()
         elif mem is not None or session_store is not None:
             selector = HermesMemorySelector(
                 curated_store=mem,
@@ -170,19 +156,14 @@ class AgentTurnRunner:
             session=session,
         )
 
-        hooks = resolve_audit_hooks(session, explicit_hooks=self.hooks)
+        hooks = self.hooks
 
-        # Optional: use audit model as cheap summarizer for context fold.
         compactor = self.context_compactor
         if compactor is None:
             from codedoggy.context.compactor import ContextCompactor
 
-            summary_client = None
-            if audit is not None:
-                auditor = getattr(audit, "auditor", None)
-                summary_client = getattr(auditor, "client", None)
             compactor = ContextCompactor.from_env(
-                summary_client=summary_client,
+                summary_client=None,
                 memory_store=mem,
                 session_store=session_store,
                 memory_manager=memory_manager,

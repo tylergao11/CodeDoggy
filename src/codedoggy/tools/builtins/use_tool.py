@@ -14,15 +14,15 @@ Host-owned (not CodeDoggy):
   - MCP transport, auth, process isolation
   - BM25 tool index (optional extra['mcp_tool_index'])
 
-**Host mutation contract (required for write tools):**
+**Host mutation contract (for write tools):**
 
 If ``mcp_dispatch`` returns only a plain string (or unstructured blob),
-Shadow never sees file side effects — the host MUST return structured
-mutations for any workspace write, or Shadow is blind.
+workspace side effects are not recorded on the tool context. Hosts that
+mutate files SHOULD return structured mutations so ``set_mutation`` can run.
 
 Accepted return shapes (any combination; relative paths preferred)::
 
-  # preferred — multi path with optional before/after for restore
+  # preferred — multi path with optional before/after
   {"text": "...", "mutations": [
       {"path": "rel/a.py", "before": "...", "after": "...",
        "is_create": false, "is_delete": false}, ...]}
@@ -30,17 +30,16 @@ Accepted return shapes (any combination; relative paths preferred)::
   # single mutation object
   {"output": "...", "mutation": {"path": "rel/a.py", "after": "..."}}
 
-  # minimal path list (Shadow sees paths; before/after optional)
+  # minimal path list
   {"result": "...", "mutated_paths": ["rel/a.py", "rel/b.py"]}
 
   # single path shortcut
   {"text": "...", "mutated_path": "rel/a.py", "before": None, "after": "..."}
 
-Policy on *returned* paths: always ``set_mutation`` when ``path`` is present
-(Shadow truth). ``ToolCallContext.set_mutation`` attaches ``args["_policy"]``
-when policy is present — do not drop escaped/denied paths after the fact
-(pre-dispatch tool_input paths are still gated by
-``enforce_mcp_tool_input_policy``).
+When path is present on a structured entry, always call ``ctx.set_mutation``
+(policy notes attach via ``args["_policy"]`` when policy is present).
+Pre-dispatch tool_input paths are still gated by
+``enforce_mcp_tool_input_policy``.
 
 Model observation text is taken from ``text`` / ``output`` / ``result`` /
 ``content`` when the host returns a dict envelope.
@@ -61,12 +60,18 @@ from codedoggy.tools.runtime import (
     ToolId,
 )
 
-_DESC = """\
-Call an MCP integration tool.
+from codedoggy.tools.grok_build.use_tool_logic import (
+    USE_TOOL_DESCRIPTION,
+    UseToolInput,
+    UseToolParams,
+    gateway_result_is_error,
+    gateway_result_to_text,
+    native_tool_correction_message,
+    normalize_mcp_arguments,
+    unqualified_mcp_name_message,
+)
 
-The `tool_name` must be the qualified `server__tool` name (e.g., `linear__save_issue`).
-The `tool_input` must conform exactly to the input schema returned by `search_tool`.
-"""
+_DESC = USE_TOOL_DESCRIPTION
 
 # Path-like keys scanned in tool_input for workspace policy (glue only).
 _WRITE_PATH_KEYS = frozenset(
@@ -100,25 +105,24 @@ _LIST_PATH_KEYS = frozenset({"paths", "files", "file_paths"})
 
 
 def lookup_mcp_tool_schema(extra: dict[str, Any], tool_name: str) -> dict[str, Any] | None:
-    """Resolve input schema from host catalog when available.
-
-    Sources (first hit wins):
-      - extra['mcp_tools']: list of {name, parameters|input_schema}
-      - extra['mcp_tool_index']: get_schema/schema_for/get/lookup, or .catalog/.tools
-    Returns None when catalog missing or tool has no schema (dispatch still allowed).
-    """
+    """Resolve input schema from the host catalog / Grok ToolIndex."""
     name = tool_name.strip()
+    # Auto-build BM25 ToolIndex from catalog (Grok shell injects ToolIndex)
+    try:
+        from codedoggy.tools.mcp.tool_index import ensure_mcp_tool_index
+
+        ensure_mcp_tool_index(extra)
+    except Exception:  # noqa: BLE001
+        pass
+
     tools = extra.get("mcp_tools")
     if isinstance(tools, list):
         for raw in tools:
             if not isinstance(raw, dict):
                 continue
-            if str(raw.get("name") or "") != name:
+            if str(raw.get("name") or raw.get("tool_name") or "") != name:
                 continue
-            schema = raw.get("parameters") or raw.get("input_schema")
-            if isinstance(schema, dict) and schema:
-                return schema
-            return None
+            return _schema_from_catalog_item(raw)
 
     index = extra.get("mcp_tool_index")
     if index is None:
@@ -126,6 +130,9 @@ def lookup_mcp_tool_schema(extra: dict[str, Any], tool_name: str) -> dict[str, A
 
     for meth in ("get_schema", "schema_for", "get", "lookup"):
         fn = getattr(index, meth, None)
+        if not callable(fn):
+            inner = getattr(index, "index", None)
+            fn = getattr(inner, meth, None) if inner is not None else None
         if not callable(fn):
             continue
         try:
@@ -135,15 +142,13 @@ def lookup_mcp_tool_schema(extra: dict[str, Any], tool_name: str) -> dict[str, A
         schema = _schema_from_catalog_item(item)
         if schema is not None:
             return schema
-        # Explicit schema lookup returned empty — stop; do not invent schema
         if meth in {"get_schema", "schema_for"}:
             return None
 
     for attr in ("catalog", "tools", "by_name"):
         bag = getattr(index, attr, None)
         if isinstance(bag, dict):
-            item = bag.get(name)
-            schema = _schema_from_catalog_item(item)
+            schema = _schema_from_catalog_item(bag.get(name))
             if schema is not None:
                 return schema
         elif isinstance(bag, list):
@@ -323,11 +328,10 @@ def _record_host_mutations(
     tool_input: dict[str, Any],
     result: Any,
 ) -> Any:
-    """Capture host-reported mutations for Shadow; return model text.
+    """Capture host-reported mutations on the tool context; return model text.
 
     Plain string / non-dict returns produce **no** mutation (no false positives).
-    When path is present on a structured entry, always call ``ctx.set_mutation``
-    (Shadow truth) — policy notes attach via ``set_mutation`` / ``args["_policy"]``.
+    When path is present on a structured entry, always call ``ctx.set_mutation``.
     """
     if not isinstance(result, dict):
         return result
@@ -336,7 +340,6 @@ def _record_host_mutations(
         path = m.get("path")
         if not isinstance(path, str) or not path.strip():
             continue
-        # Always record for Shadow; set_mutation attaches _policy when present.
         ctx.set_mutation(
             path=path.strip(),
             before=m.get("before") if isinstance(m.get("before"), (str, type(None))) else None,
@@ -364,6 +367,7 @@ class UseToolTool(Tool):
         return ToolDescription(name="use_tool", description=_DESC.strip())
 
     def parameters_schema(self) -> dict[str, Any]:
+        # Grok UseToolInput doc comments → schemars descriptions (exact).
         return {
             "type": "object",
             "properties": {
@@ -371,12 +375,17 @@ class UseToolTool(Tool):
                     "type": "string",
                     "description": (
                         "The qualified name of the integration tool to call "
-                        '(e.g., "linear__save_issue").'
+                        '(e.g., "linear__save_issue"). '
+                        "Must be a tool previously discovered via `search_tool`."
                     ),
                 },
                 "tool_input": {
                     "type": "object",
-                    "description": "Arguments to pass to the tool as a JSON object.",
+                    "description": (
+                        "The arguments to pass to the tool, as a JSON object. "
+                        "Use the parameter schema returned by `search_tool` "
+                        "to construct this."
+                    ),
                     "additionalProperties": True,
                 },
             },
@@ -391,20 +400,58 @@ class UseToolTool(Tool):
         tool_input = args.get("tool_input")
         if tool_input is None:
             tool_input = {}
+        tool_input = normalize_mcp_arguments(tool_input)
         if not isinstance(tool_input, dict):
             raise ToolError.invalid_arguments("tool_input must be a JSON object")
+        # Grok UseToolInput surface
+        _ = UseToolInput(tool_name=name, tool_input=tool_input)
 
-        # Grok: native-tool correction when name looks like a built-in
+        extra = ctx.extra or {}
+        # Grok UseToolParams.native_tool_correction (default true)
+        correction_raw = extra.get("native_tool_correction")
+        params = UseToolParams(
+            native_tool_correction=True if correction_raw is None else bool(correction_raw)
+        )
+        correction = params.native_tool_correction
+        native_names = extra.get("enabled_native_tool_names") or extra.get(
+            "native_tool_names"
+        )
+        is_native = False
+        if correction and isinstance(native_names, (set, list, tuple, frozenset)):
+            is_native = name in set(native_names)
+        # Also treat known finalized short-ids as native when no catalog
+        if correction and not is_native and "__" not in name:
+            # soft native guess: host tools without server__ prefix
+            is_native = bool(extra.get("treat_unqualified_as_native", False))
+
         if "__" not in name and not name.startswith("MCP:"):
-            return (
-                f"Error: `{name}` is not a valid MCP tool name. "
-                f"If this is a built-in tool, call it directly (not via use_tool)."
+            if is_native or name in {
+                "read_file",
+                "search_replace",
+                "write",
+                "grep",
+                "list_dir",
+                "run_terminal_command",
+                "run_terminal_cmd",
+                "spawn_subagent",
+                "skill",
+            }:
+                raise ToolError.invalid_arguments(native_tool_correction_message(name))
+            raise ToolError.invalid_arguments(
+                unqualified_mcp_name_message(name, "search_tool")
             )
 
-        # Prepare (schema + policy) before host dispatch — gate spirit
         prepare_mcp_dispatch(name, tool_input, ctx)
 
-        dispatch = (ctx.extra or {}).get("mcp_dispatch")
+        # Ensure BM25 index exists for schema lookup path (same as search_tool)
+        try:
+            from codedoggy.tools.mcp.tool_index import ensure_mcp_tool_index
+
+            ensure_mcp_tool_index(extra)
+        except Exception:  # noqa: BLE001
+            pass
+
+        dispatch = extra.get("mcp_dispatch")
         if not callable(dispatch):
             raise ToolError(
                 "MCP dispatch is not available (host must provide extra['mcp_dispatch']).",
@@ -414,6 +461,15 @@ class UseToolTool(Tool):
             result = dispatch(name, tool_input)
         except Exception as e:  # noqa: BLE001
             raise ToolError(f"Failed to call {name}: {e}", code="mcp_error") from e
+
+        # Grok gateway content[] shape
+        if isinstance(result, dict) and (
+            "content" in result or "isError" in result or "is_error" in result
+        ):
+            text = gateway_result_to_text(result)
+            if gateway_result_is_error(result):
+                return f"Error from MCP tool {name}: {text}"
+            result = text
 
         result = _record_host_mutations(
             ctx, tool_name=name, tool_input=tool_input, result=result

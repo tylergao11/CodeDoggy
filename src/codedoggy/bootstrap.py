@@ -25,14 +25,12 @@ def build_session(
     system_prompt: str | None = None,
     enable_memory: bool = True,
     enable_session_store: bool = True,
-    enable_audit: bool = False,
     enable_policy: bool = True,
     enable_graph: bool = True,
     memory_dir: str | Path | None = None,
     session_db: str | Path | None = None,
     profiles: ModelProfiles | None = None,
     main_client: ChatClient | None = None,
-    audit_client: ChatClient | None = None,
     tools: FinalizedToolset | None = None,
     session_id: str | None = None,
 ) -> Session:
@@ -44,17 +42,9 @@ def build_session(
     - **MAIN parallel bias**: system prompt + tools; MAIN decides when to fan out
       (harness does **not** auto-split or auto-parallelize work for MAIN)
     - **Graph**: ``CodebaseGraph`` (xai-codebase-graph API spirit)
-
-    Shadow/audit is **removed from the product path**. ``enable_audit`` remains
-    only for legacy unit tests of the unused ``codedoggy.audit`` package; product
-    sessions must leave it ``False`` (the default).
     """
     prof = profiles or model_profiles_from_env()
     main = main_client or prof.main_client()
-    # audit_client kept for signature/compat; only used if enable_audit (tests).
-    audit_cli = None
-    if enable_audit:
-        audit_cli = audit_client or prof.audit_client()
     cwd_path = Path(cwd).resolve()
 
     # Memory pillar FIRST so external provider tools can be injected into the
@@ -101,20 +91,6 @@ def build_session(
         except Exception:  # noqa: BLE001
             pass
 
-    audit_svc = None
-    if enable_audit:
-        # Legacy/test-only path — product default is off (no Shadow).
-        from codedoggy.audit.model_auditor import ModelAuditor
-        from codedoggy.audit.services import AuditServices
-
-        selector = memory_manager.as_audit_selector() if memory_manager else None
-        audit_svc = AuditServices.create(
-            auditor=ModelAuditor(audit_cli),
-            memory_selector=selector,
-            memory_store=memory,
-            agent_id="main",
-        )
-
     policy: WorkspacePolicy | None = None
     if enable_policy:
         policy = WorkspacePolicy.from_env(cwd_path)
@@ -133,8 +109,16 @@ def build_session(
 
     from codedoggy.context.compactor import ContextCompactor
 
+    # Optional fold summarizer: use aux model when distinct from main
+    summary_client = None
+    try:
+        if prof.aux.model != prof.main.model or prof.aux.base_url != prof.main.base_url:
+            summary_client = prof.aux_client()
+    except Exception:  # noqa: BLE001
+        summary_client = None
+
     compactor = ContextCompactor.from_env(
-        summary_client=audit_cli if enable_audit else None,
+        summary_client=summary_client,
         memory_store=memory,
         session_store=session_store,
         memory_manager=memory_manager,
@@ -176,7 +160,6 @@ def build_session(
             memory=memory,
             memory_manager=memory_manager,
             session_store=session_store,
-            audit=audit_svc,
             policy=policy,
             graph=graph,
         ),
@@ -220,7 +203,6 @@ def build_session(
         memory=memory,
         memory_manager=memory_manager,
         session_store=session_store,
-        audit=audit_svc,
         policy=policy,
         graph=graph,
         session_mode_state=mode_state,
@@ -321,30 +303,7 @@ def build_session(
 
 
 def _default_system_prompt(goal: str | None) -> str:
-    lines = [
-        "You are CodeDoggy, the MAIN coding agent with full tool access in the workspace.",
-        "Prefer dedicated tools (read_file, search_replace, grep, list_dir, code_nav) over shell when possible.",
-        "Use code_nav for go-to-definition / find-references (code graph); grep for free text.",
-        "Use session_search for past conversations; curated MEMORY.md is injected at session start.",
-        "Workspace policy may deny writes to protected paths (.git, .env, …).",
-        "",
-        "## Your posture: strong parallel tendency (you decide — nothing auto-fans-out)",
-        "The harness does **not** split work or run agents for you. Parallelism happens only "
-        "when **you** call tools. Cultivate a strong bias: if work can be split, you prefer "
-        "to dispatch multiple subagents rather than grinding every independent piece yourself.",
-        "",
-        "When you choose to parallelize, think in two lanes you still own:",
-        "  (A) **Parallel slices** — independent work you hand to children;",
-        "  (B) **Serial / critical path** — ordering, integration, synthesis — you do this.",
-        "If you start children and still have (B), keep advancing (B) instead of idle-waiting: "
-        "e.g. `parallel_tasks` with `wait=false`, or several `spawn_subagent` (background), "
-        "then your serial tools, then join with `wait_commands_or_subagents` / "
-        "`get_command_or_subagent_output`. If pure fan-out and you have nothing else to do, "
-        "`parallel_tasks` with wait=true (default) is fine.",
-        "Tools: `parallel_tasks`, `spawn_subagent`, wait/get output. "
-        "Types: explore (read-only), plan (plan file), general-purpose (slice worker).",
-        "Children return summary fold-backs only. You alone produce the final user-facing answer.",
-    ]
-    if goal and goal.strip():
-        lines.append(f"Session goal: {goal.strip()}")
-    return "\n".join(lines)
+    """Grok ``prompt.md`` structure (source-level) + CodeDoggy product appendix."""
+    from codedoggy.prompt.grok_system import build_main_system_prompt
+
+    return build_main_system_prompt(goal)

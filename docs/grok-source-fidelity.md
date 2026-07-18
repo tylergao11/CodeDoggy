@@ -26,7 +26,7 @@
 | `computer/local/shell_state.rs` | `tools/util/shell_state.py` | **A** | cwd+env probe + `shell_env_overrides`；无 Unix FD dump |
 | `bash` bg op / timeout helpers | `grok_build/bash_bg_op.py` + `bash_params.py` | **S** | `&` 检测 + should_reject；auto-bg wait=min(timeout,budget) |
 | `bash` description template | `builtins/run_terminal_cmd.py` | **S** | Job Object 文案与 Grok 模板一致 |
-| Win32 Job Object kill | `tools/util/job_object.py` + bash/task_manager | **C** | 真 Create/Assign/Terminate；失败回退 taskkill /T |
+| Win32 Job Object kill | `tools/util/job_object.py` + bash/task_manager | **C** | Grok ProcessGroup：Create/Assign/TerminateJobObject + child kill；**无 taskkill** |
 | `grok_build/bash` terminal actor | `task_manager` + run_terminal | **A** | 非 Grok actor；杀树路径已接 Job Object |
 | host memory_backend | `host/memory_backend.py` | **C/A** | MemoryStore 子串检索；非 Grok 全量 backend |
 | host ask_user_cli | `host/ask_user_cli.py` | **C** | stdin 多选；TTY 自动注入 |
@@ -40,8 +40,14 @@
 | `memory/search_tool.rs` | `memory_search.py` + `host/memory_backend.py` | **C** | schema+软文案 S；产品默认注入子串 backend（非 Grok 全量） |
 | `memory/get_tool.rs` | `tools/builtins/memory_get.py` | **S** | `format_with_line_numbers` + `**File:**`/`**Lines:**`/软文案；slice=storage.read_file；host=`memory_store`（非 MemoryBackend） |
 | `grok_build/lsp` | `tools/builtins/lsp.py` | **X** | schema S；**无** graph 顶替；需 `lsp_backend` |
-| `search_tool` / `tool_index` | `tools/builtins/search_tool.py` | **X** | 需 host index；无 BM25 注册表 |
-| `use_tool` | `tools/builtins/use_tool.py` | **X** | 需 host `mcp_dispatch` |
+| `types/tool_index.rs` DTOs + trait | `tools/mcp/types.py` | **S** | `ToolSearchResult`/`SearchSnapshot`/`ServerSummary`/`ToolSearchIndex`/`ToolIndex` 字段名对齐；`McpDispatch` host glue |
+| `search_tool` / truncate / sanitize / reminder | `search_tool_logic.py` + `builtins/search_tool.py` | **S** | `SearchToolInput` + 文案+截断+FNV+reminder + grouped JSON ready/partial + 无连接 note |
+| shell `Bm25ToolSearchIndex` | `tools/mcp/tool_index.py` | **S** (algo spirit) | split_identifier / normalize_query / exact-match / Okapi BM25 / list_server_summaries；无 Rust bm25 crate |
+| auto index from `mcp_tools` | `ensure_mcp_tool_index` | **S** glue | 注入 `ToolIndex(Bm25…)` 对齐 shell `ToolIndex(Arc<dyn ToolSearchIndex>)` |
+| `use_tool` | `use_tool_logic.py` + `builtins/use_tool.py` | **S** (types/strings) / **C** (host) | `UseToolInput`/`UseToolParams` **S**；native correction **S**；`mcp_dispatch` host；**transport X** |
+| `skills/types.rs` + `skill.rs` | `skill_logic.py` | **S** | `SkillInfo`/`SkillInput`/`SkillOutput`/`SkillRef` + `<skill>` 信封 + substitutions |
+| `skills/discovery.rs` | `skill_discovery.py` | **S** | `normalize_skill_name`/`ParsedFrontmatter`/`find_skill_md_paths`/`walk` depth5；**PyYAML** = serde_yaml 管线（safe_load → quote retry → recover_scalar） |
+| `skill` tool + OpenCode DESCRIPTION | `builtins/skill.py` + `build_skill_tool_description` | **S/C** | 动态 `<available_skills>` **S**；`SkillInput`/invoke/discovery **S/C**；list_ctx 接线 **C** |
 | `image_gen` / `image_edit` | `imagine_api.py` + `builtins/image_gen.py` | **S** (HTTP) / **X** (tier) | endpoint/payload/save `images/n.jpg`/MediaGen JSON；无 SuperGrok upsell |
 | `video_gen` client + tools | `video_api.py` + `builtins/video_gen.py` | **S** (HTTP) / **X** (ZDR) | generations+poll+download；**无** ZDR/S3 |
 | `web_search` Responses API | `grok_build/web_search.py` + `util/web_search_api.py` | **S** (HTTP path) | 无 key→`not_supported`；无 DDG mock |
@@ -66,10 +72,14 @@
 | `scheduler/actor.rs` Create/Delete/List/fire | `tools/scheduler.py` | **S/C** | 命令+fire/missed **S**；**无** tokio timer/notifications **X** |
 | host poll / tick (not actor timer) | `host/scheduler_tick.py` | **A/X** | `poll_due`/`fire_due`/`run_tick_loop` 调 store；**无** ToolNotificationHandle **X**；host 必须自注入 prompt |
 | `scheduler/{create,delete,list}.rs` | `builtins/scheduler_tools.py` | **S** | schema/描述/成功失败串；durable 持久化 host **X** |
-| `task` / `TaskToolInput` + formatters | `grok_build/task_format.py` + `builtins/spawn_subagent.py` | **S** (schema/strings) / **C** (dispatch) / **X** (cwd+model pin, general-purpose catalog) | wire id `task`→product `spawn_subagent`; `run_in_background`→`background`; depth/cwd mutex/error 串/background 通知/completion meta **S**；host=`subagent_coordinator`+`subagent_run_fn`；isolation=worktree 走既有 coordinator **C**；显式 `cwd`/`model` 校验但未钉进 child **X**；Grok `general-purpose` 在 schema 广告，host agent_def 现仅 explore/plan **X** |
-| `task_output/mod.rs` + `xai-tool-types` task.rs | `grok_build/task_output_logic.py` + `builtins/get_task_output.py` | **S/A** | schema/waits/cap/`MAX_MULTI_WAIT_IDS`/not-found/Result+Multi card **S**；wait 为 shared-deadline poll 非 Notify **A** |
-| `task_output/wait_tasks.rs` | `builtins/wait_tasks.py` | **S/A** | wait_all/wait_any + omit/0→30s 阻塞 + multi summary **S**；event-driven join **A** |
-| `kill_task/mod.rs` | `builtins/kill_task.py` + `task_manager.kill` | **S/C** | 消息串 **S**；Windows 优先 Job Object，失败 taskkill /T |
+| `task` / `TaskToolInput` + formatters | `grok_build/task_format.py` + `builtins/spawn_subagent.py` | **S** (schema/strings) / **C** (dispatch) / **X** (cwd+model pin) | wire id `task`→product `spawn_subagent`; `build_task_description` product names + `by_kind.plan`→`todo_write` **S**；host coordinator **C** |
+| Main `prompt.md` | `prompt/grok_system.py` `render_grok_base_prompt` | **S** (sections) / **C** (label CodeDoggy; no liquid) | action_safety / tool_calling / output_efficiency / formatting 源码级；identity 用产品 label |
+| Subagent `subagent_prompt.md` | `render_grok_subagent_base` | **S** (structure) / **C** (no hashline branch) | Parallelize tool calls + AGENTS.md + user_info **S**；role-instructions 为 Doggy |
+| Product appendix | `codedoggy_product_appendix` | **Doggy** | MAIN 并行倾向、code_nav、session_search — **非** Grok |
+| `task_output/mod.rs` + `xai-tool-types` task.rs | `grok_build/task_output_logic.py` + `builtins/get_task_output.py` | **S/A** | `build_task_output_description` cli_default 锁死 **S**；schema/waits/cap/cards **S**；wait poll 非 Notify **A** |
+| `task_output/wait_tasks.rs` | `builtins/wait_tasks.py` | **S/A** | `build_wait_tasks_description` 含 `background=true or background=true` **S**；wait_all/any **S**；join **A** |
+| `kill_task/mod.rs` + `build_kill_task_description` | `builtins/kill_task.py` + `task_output_logic` | **S/C** | 描述 OS 动词 **S**；kill=TerminateJobObject+child kill（对齐 terminal.rs，无 taskkill）**C** |
+| `use_tool` UseToolInput docs | `builtins/use_tool.py` + `use_tool_logic` | **S** (desc/schema) / **C** (dispatch) | description_template + schemars 字段文案 **S** |
 | `monitor/{types,event,rate_limiter,tool}.rs` | `grok_build/monitor_*.py` + `builtins/monitor.py` | **S/A/X** | constants/validate/start 文案/line+rate pure **S**；spawn+PYTHONUNBUFFERED **S**；无 MonitorEvent 通知管线 **X** |
 
 ## 已删除的脑补（禁止再加）
@@ -100,6 +110,7 @@
 3. 不能 1:1 的标 **A/X**，禁止在文档写「完美」。
 4. 测试尽量搬 Grok 同名用例语义。
 5. **禁止**用 graph/BM25/假后端冒充 Grok runtime；缺 backend 就报 unavailable / soft text。
+6. **禁止发明「兜底 / 降级」路径。** Grok 源码没有的第二套机制（如 taskkill 顶 Job Object）不准加。Grok 协议里的固定两步（如 hard-kill 先 Job 再 `start_kill`）是协议本身，不是 degrade ladder。未做完就标等级，别用替代实现糊墙。
 
 ## 当前冲刺顺序
 

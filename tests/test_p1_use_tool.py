@@ -1,6 +1,7 @@
 """Attack-style P1: use_tool must prepare (schema/policy) before host mcp_dispatch.
 
-Before fix: bad args and path escapes went straight to host; Shadow saw no MCP mutations.
+Before fix: bad args and path escapes went straight to host; mutations were not recorded.
+Also locks Grok UseTool description_template + UseToolInput schemars text.
 """
 
 from __future__ import annotations
@@ -10,6 +11,8 @@ from pathlib import Path
 import pytest
 
 from codedoggy.tools import ToolRegistryBuilder
+from codedoggy.tools.builtins.use_tool import UseToolTool
+from codedoggy.tools.grok_build.use_tool_logic import USE_TOOL_DESCRIPTION
 from codedoggy.tools.policy import WorkspacePolicy
 from codedoggy.tools.runtime import ToolCallContext, ToolError
 
@@ -18,8 +21,28 @@ def _tools():
     return ToolRegistryBuilder.new().finalize()
 
 
+def test_use_tool_description_and_schemars_match_grok() -> None:
+    """Grok UseTool description_template + UseToolInput field docs."""
+    tool = UseToolTool()
+    assert tool.description(None).description.strip() == USE_TOOL_DESCRIPTION.strip()
+    assert "`search_tool`" in tool.description(None).description
+    props = tool.parameters_schema()["properties"]
+    assert props["tool_name"]["description"] == (
+        "The qualified name of the integration tool to call "
+        '(e.g., "linear__save_issue"). '
+        "Must be a tool previously discovered via `search_tool`."
+    )
+    assert props["tool_input"]["description"] == (
+        "The arguments to pass to the tool, as a JSON object. "
+        "Use the parameter schema returned by `search_tool` "
+        "to construct this."
+    )
+    assert props["tool_input"].get("additionalProperties") is True
+    assert tool.parameters_schema()["required"] == ["tool_name", "tool_input"]
+
+
 def test_attack_missing_catalog_still_dispatches(tmp_path: Path) -> None:
-    """No catalog / no schema → still call host dispatch (glue, not full MCP)."""
+    """No catalog / no schema: still call host dispatch (glue, not full MCP)."""
     tools = _tools()
     calls: list[tuple[str, dict]] = []
 
@@ -257,3 +280,4 @@ def test_mcp_tool_index_schema_validation(tmp_path: Path) -> None:
         )
     assert ei.value.code == "invalid_arguments"
     assert calls == []
+

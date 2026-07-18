@@ -4,8 +4,8 @@ Ported from:
   grok-build/.../implementations/grok_build/bash/mod.rs
   computer/local/shell_state.rs (shell_env_overrides subset)
 
-Kill path on Windows uses taskkill /T (honest A/X vs Grok Job Object).
-Description still matches Grok product Job Object wording (template source).
+Description matches Grok product Job Object wording on Windows.
+Kill path: TerminateJobObject + child kill (Grok terminal.rs; no taskkill).
 """
 
 from __future__ import annotations
@@ -83,7 +83,7 @@ def _description() -> str:
             f"(up to {BASH_DEFAULT_MAX_TIMEOUT_MS}ms). "
             f"If not specified, commands will timeout after {BASH_DEFAULT_TIMEOUT_MS}ms."
         )
-    # Grok template: Windows Job Object wording (product); runtime is taskkill /T (A/X).
+    # Grok template: Windows Job Object wording (matches runtime TerminateJobObject).
     if sys.platform == "win32":
         timeout_enforcement = (
             "  - Timeout enforcement: when the timeout fires, the wrapper terminates the child's "

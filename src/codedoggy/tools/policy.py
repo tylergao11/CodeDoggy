@@ -1,8 +1,7 @@
 """Workspace tool policy — Grok-style guardrails at the tool boundary.
 
-Fuses with resident audit:
-  - denied writes never set mutation (no false audit)
-  - allowed writes can attach policy note for auditor context
+  - denied writes never set mutation
+  - allowed writes can attach policy notes on the tool context
   - policy is workspace-scoped (cwd), not a full OS sandbox
 """
 
@@ -13,7 +12,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-# Shared deny table — tools + audit + docs stay aligned
+# Shared deny table — tools + docs stay aligned
 DEFAULT_DENY_WRITE: tuple[str, ...] = (
     ".git",
     ".git/",

@@ -36,7 +36,6 @@ class RuntimeKernel:
     memory: Any = None
     memory_manager: Any = None
     session_store: Any = None
-    audit: Any = None
     policy: Any = None
     graph: Any = None
     # Grok orchestration handles
@@ -85,7 +84,6 @@ class RuntimeKernel:
             "policy",
             "memory_manager",
             "graph",
-            "audit",
             "session_mode_state",
             "interjection_buffer",
             "subagent_coordinator",
@@ -132,8 +130,6 @@ class RuntimeKernel:
             extra["memory_manager"] = self.memory_manager
         if self.graph is not None:
             extra["graph"] = self.graph
-        if self.audit is not None:
-            extra["audit"] = self.audit
         if self.session_mode_state is not None:
             extra["session_mode_state"] = self.session_mode_state
         if self.interjection_buffer is not None:

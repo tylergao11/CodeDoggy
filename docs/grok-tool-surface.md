@@ -57,10 +57,10 @@ Wire-id aliases still resolve on `call()` so tests/legacy callers can use either
 | `search_tool` | `mcp_tool_index` or `mcp_tools` list | "No MCP tools registered." |
 | `use_tool` | `mcp_dispatch` | ToolError mcp_dispatch_missing |
 
-### `use_tool` host mutation contract (Shadow)
+### `use_tool` host mutation contract
 
-If `mcp_dispatch` returns only a plain string, **Shadow is blind** to MCP file
-side effects. For write tools the host **MUST** return a structured envelope:
+If `mcp_dispatch` returns only a plain string, workspace side effects are not
+recorded. For write tools the host **SHOULD** return a structured envelope:
 
 | Shape | Example |
 |-------|---------|
@@ -70,8 +70,7 @@ side effects. For write tools the host **MUST** return a structured envelope:
 | single `mutated_path` | `{"text": "...", "mutated_path": "rel/a.py", "before"?, "after"?}` |
 
 - Relative paths preferred. Each entry with a non-empty `path` → `ctx.set_mutation`.
-- Returned paths are **always recorded** (Shadow truth); policy attaches
-  `args["_policy"]` via `set_mutation` (pre-dispatch tool_input paths still gated).
+- Policy attaches `args["_policy"]` via `set_mutation` (pre-dispatch tool_input paths still gated).
 - Model text from `text` / `output` / `result` / `content` when present.
 - Plain string return → no mutation (no false positives).
 
@@ -104,7 +103,7 @@ Uses **normal HTTP API** (xAI / OpenAI-compatible), not a mock-only path:
 | Full language-server `lsp` | **X** — host backend only |
 | Full ShellState dump (fd 3/4) | **A** — cwd probe + env overlays |
 | Image multimodal presentation | metadata only without host vision |
-| Job Object / cgroup | Win32 Job Object kill tree (**C**) + taskkill fallback; Linux cgroup **X** |
+| Job Object / cgroup | Win32 TerminateJobObject + child kill (**C**, no taskkill); Linux cgroup **X** |
 | MCP BM25 index | host-owned; tools only wire |
 | Behavior versions / legacy-0.4.10 | not versioned |
 | Monitor `MonitorEvent` chat inject | **X** — events on output_file; no pager notification bridge |

@@ -19,10 +19,15 @@ Local rev: `C:\Ai\grok-build\SOURCE_REV`.
 | Resume completed-only / fail copy | shell `subagent/handle_request.rs` | `SubagentCoordinator.resume` |
 | Plan edit gate | plan mode edit gate | `plan_mode_edit_gate` |
 | Tool batch phase-2 path locks | shell `tool_calls.rs` + `tool_dispatch.rs` | `execute_approved_batch` + main `loop` phase-2 |
+| Main system prompt structure | `xai-grok-agent/templates/prompt.md` | `prompt/grok_system.py` `render_grok_base_prompt` + CodeDoggy appendix |
+| Subagent system prompt | `templates/subagent_prompt.md` | `render_grok_subagent_base` + role-instructions |
+| Compact system prompt | `prompt/template.rs` COMPACT_SYSTEM_PROMPT | `prompt/grok_system.COMPACT_SYSTEM_PROMPT` |
 | Tool renames | grok-agent tool surface | `tools/grok_surface.py` |
 | Task output / multi-wait / kill messages | `xai-tool-types/task.rs` + `grok_build/task_output` + `kill_task` + `types/output.rs` | `tools/grok_build/task_output_logic.py` + builtins |
 | Monitor constants / line / rate-limit / start text | `grok_build/monitor/{types,event,rate_limiter,tool}.rs` | `tools/grok_build/monitor_*.py` + `builtins/monitor.py` |
-| Hermes memory lifecycle | `C:\Ai\hermes-agent` | `memory/hermes_seam.py` |
+| Hermes memory lifecycle | `C:\Ai\hermes-agent` | `memory/hermes_seam.py` + `manager.py` |
+| Hermes fence + stream scrubber | `agent/memory_manager.py` | `memory/context_fence.py` |
+| Hermes on_delegation | `memory_provider.on_delegation` | parent after subagent complete |
 
 ## CodeDoggy glue only (cannot full-port)
 
@@ -34,7 +39,7 @@ Local rev: `C:\Ai\grok-build\SOURCE_REV`.
 | Progressive sample deltas | Host CLI/ACP display | Optional `stream_sample` / `on_sample_delta` |
 | Monitor notification pipeline | `ToolNotificationHandle` + pager auto-wake | Output file + get_task_output poll |
 | Multi-wait event-driven | `wait_*_event_driven` Notify/join_all | Shared-deadline poll on task_manager |
-| Kill Job Object (Windows) | terminal actor Job Object | `util/job_object.py` + taskkill fallback |
+| Kill Job Object (Windows) | terminal actor ProcessGroup / TerminateJobObject | `util/job_object.py` (no taskkill) |
 
 ## Deleted inventions (do not reintroduce)
 

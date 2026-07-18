@@ -1,6 +1,6 @@
 """Best-effort detect workspace file writes from shell commands.
 
-Used for policy + shadow. Regex is not a sandbox — it feeds policy checks
+Used for policy. Regex is not a sandbox — it feeds policy checks
 before execution. Prefer dedicated file tools for mutations.
 """
 
@@ -141,7 +141,7 @@ def record_shell_mutations(
 ) -> bool:
     """Record first-hand mutations for *all* paths the shell may have written.
 
-    Grok: partial writes after non-zero exit still need Shadow review — do not
+    Grok: partial writes after non-zero exit are still recorded — do not
     require exit_ok. Multi-file commands record every existing path.
     """
     set_mut = getattr(ctx, "set_mutation", None)

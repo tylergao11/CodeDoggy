@@ -1,11 +1,11 @@
-"""Attack-style P1: MCP host mutation contract for Shadow.
+"""Attack-style P1: MCP host mutation contract.
 
-If host mcp_dispatch returns only text, Shadow never sees file side effects.
+If host mcp_dispatch returns only text, workspace mutations are not recorded.
 use_tool must:
   - set_mutation from structured host shapes (mutations / mutation /
     mutated_paths / mutated_path)
   - not invent mutations from plain string returns
-  - still record path-escape mutations reported by host (Shadow truth +
+  - still record path-escape mutations reported by host (recorded mutation +
     args["_policy"] via set_mutation)
 """
 
@@ -23,7 +23,7 @@ def _tools():
 
 
 def test_attack_dispatch_mutations_list_populates_ctx_extra(tmp_path: Path) -> None:
-    """Host returns mutations list → ctx.extra mutations populated for Shadow."""
+    """Host returns mutations list → ctx.extra mutations populated ."""
     tools = _tools()
 
     def dispatch(name: str, args: dict) -> dict:
@@ -69,7 +69,7 @@ def test_attack_dispatch_mutations_list_populates_ctx_extra(tmp_path: Path) -> N
 
 
 def test_attack_dispatch_plain_string_no_false_mutation(tmp_path: Path) -> None:
-    """Dispatch returns only string → no mutation invented (Shadow not lied to)."""
+    """Dispatch returns only string → no mutation invented (not invented)."""
     tools = _tools()
 
     def dispatch(name: str, args: dict) -> str:
@@ -90,7 +90,7 @@ def test_attack_dispatch_plain_string_no_false_mutation(tmp_path: Path) -> None:
 
 
 def test_attack_mutated_paths_minimal_shape(tmp_path: Path) -> None:
-    """Host minimal mutated_paths: [path] still records for Shadow."""
+    """Host minimal mutated_paths: [path] still records ."""
     tools = _tools()
 
     def dispatch(name: str, args: dict) -> dict:
@@ -166,7 +166,7 @@ def test_attack_mutated_path_shortcut(tmp_path: Path) -> None:
 def test_attack_path_escape_in_returned_mutation_still_recorded(
     tmp_path: Path,
 ) -> None:
-    """Path escape in *returned* mutation is still recorded (Shadow truth).
+    """Path escape in *returned* mutation is still recorded (recorded mutation).
 
     Choice: always record when host reports a path; set_mutation attaches
     ``args["_policy"]`` with allowed=False. Pre-dispatch tool_input paths
@@ -207,7 +207,7 @@ def test_attack_path_escape_in_returned_mutation_still_recorded(
     mut = (ctx.extra or {}).get("mutation")
     assert mut is not None
     assert mut.path == outside
-    # Shadow truth: recorded even when policy would deny write
+    # recorded mutation: recorded even when policy would deny write
     pol = (mut.args or {}).get("_policy")
     assert isinstance(pol, dict)
     assert pol.get("allowed") is False
@@ -251,3 +251,4 @@ def test_attack_empty_path_entries_skipped_no_false_mutation(tmp_path: Path) -> 
     assert out == "noop"
     assert (ctx.extra or {}).get("mutations") in (None, [])
     assert (ctx.extra or {}).get("mutation") is None
+

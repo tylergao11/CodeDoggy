@@ -568,14 +568,22 @@ def make_child_runner(
             background=definition.background,
         )
 
-        # Resume may pin a prior system prompt (frozen at first spawn)
-        base_prompt = request.system_prompt or parent_system_prompt
-        agent = build_agent(
-            definition,
-            parent_tools=parent_tools,
-            base_system_prompt=base_prompt if request.system_prompt is None else None,
-        )
-        system_prompt = request.system_prompt or agent.system_prompt
+        # System prompt: Grok subagent_prompt base + role-instructions (product).
+        # Do not inherit full MAIN prompt — matches Grok child prompt isolation.
+        if request.system_prompt:
+            system_prompt = request.system_prompt
+            agent = build_agent(
+                definition,
+                parent_tools=parent_tools,
+                base_system_prompt=None,
+            )
+        else:
+            agent = build_agent(
+                definition,
+                parent_tools=parent_tools,
+                base_system_prompt=None,
+            )
+            system_prompt = None  # filled after worktree cwd known
         child_tools = _strip_nested_spawn(agent.tools)
 
         compactor = None
@@ -629,7 +637,7 @@ def make_child_runner(
                     resume_count=1 if is_resume else 0,
                 )
 
-        # Product path: no Shadow/audit hooks on children.
+
         child_hooks = None
 
         tool_extra: dict[str, Any] = {
@@ -658,6 +666,16 @@ def make_child_runner(
                 logger.debug("child worktree policy bind failed", exc_info=True)
 
         prior = _hydrate_prior_messages(request.prior_messages)
+
+        if system_prompt is None:
+            from codedoggy.prompt.grok_system import build_subagent_system_prompt
+
+            system_prompt = build_subagent_system_prompt(
+                definition.system_prompt_body,
+                cwd=child_cwd,
+                memory_enabled=True,
+                persona_instructions=request.persona,
+            )
 
         try:
             loop = run_agent_loop(
@@ -690,6 +708,22 @@ def make_child_runner(
         )
         if loop.max_turns_reached and not loop.completed:
             status = "completed"
+
+        # Hermes: parent memory provider observes delegation (child has no provider)
+        if parent_session is not None and status == "completed":
+            try:
+                from codedoggy.memory.hermes_seam import on_delegation
+
+                ext = getattr(parent_session, "extensions", None)
+                mm = getattr(ext, "memory_manager", None) if ext else None
+                on_delegation(
+                    mm,
+                    task=request.prompt or "",
+                    result=summary or "",
+                    child_session_id=request.id,
+                )
+            except Exception:  # noqa: BLE001
+                logger.debug("parent on_delegation failed", exc_info=True)
 
         live = _serialize_messages(loop.messages)
         return SubagentSnapshot(

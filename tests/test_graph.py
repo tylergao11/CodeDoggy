@@ -165,8 +165,6 @@ def test_build_session_has_graph(tmp_path: Path) -> None:
     s = build_session(
         tmp_path,
         main_client=main,
-        audit_client=main,
-        enable_audit=False,
         enable_memory=False,
         enable_session_store=False,
         enable_graph=True,

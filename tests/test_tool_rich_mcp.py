@@ -127,7 +127,8 @@ def test_search_tool_empty_catalog(tmp_path: Path) -> None:
     tools = _tools()
     ctx = ToolCallContext(cwd=tmp_path, extra={})
     out = tools.call("search_tool", {"query": "anything"}, ctx)
-    assert "No MCP tools registered" in out
+    # Grok search_tool/mod.rs — exact empty-index note
+    assert "No integration tools are configured" in out
 
 
 def test_builtins_include_mcp_and_memory() -> None:

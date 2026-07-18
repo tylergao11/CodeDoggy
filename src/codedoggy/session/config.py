@@ -20,7 +20,7 @@ class SessionConfig:
     """If omitted, a new id is generated."""
 
     goal: str | None = None
-    """Session-level intent anchor for resident audit (and later Hermes memory select)."""
+    """Session-level intent anchor (Hermes memory select / goal mode)."""
 
     enable_memory: bool = False
     """Enable cross-session memory when that subsystem is wired."""

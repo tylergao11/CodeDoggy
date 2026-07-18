@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import threading
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable
 
 from codedoggy.tools.config import ToolConfig, ToolServerConfig
@@ -174,7 +175,7 @@ class ToolRegistryBuilder:
             if entry.short_id != client_name:
                 by_client.setdefault(entry.short_id, ft)
 
-        return FinalizedToolset(by_client_name=by_client)
+        return FinalizedToolset(by_client_name=by_client, list_ctx=list_ctx)
 
 
 class FinalizeError(Exception):
@@ -196,18 +197,49 @@ class _FinalizedTool:
 
 @dataclass
 class FinalizedToolset(ToolDispatch):
-    """Immutable tool table ready for listing and dispatch."""
+    """Immutable tool table ready for listing and dispatch.
+
+    ``list_ctx`` can be rebound each turn so dynamic tools (skill) re-render
+    descriptions from discovery / host registry (Grok AvailableSkills spirit).
+    """
 
     by_client_name: dict[str, _FinalizedTool] = field(default_factory=dict)
+    list_ctx: ListToolsContext | None = None
 
-    def tool_definitions(self) -> list[ToolSpec]:
+    def bind_list_context(
+        self,
+        list_ctx: ListToolsContext | None = None,
+        *,
+        cwd: Path | str | None = None,
+        extra: dict[str, Any] | None = None,
+    ) -> None:
+        """Attach/update list-tools context for dynamic descriptions."""
+        if list_ctx is not None:
+            self.list_ctx = list_ctx
+            return
+        self.list_ctx = ListToolsContext(
+            cwd=Path(cwd).resolve() if cwd is not None else None,
+            extra=extra,
+        )
+
+    def tool_definitions(
+        self, list_ctx: ListToolsContext | None = None
+    ) -> list[ToolSpec]:
+        ctx = list_ctx if list_ctx is not None else self.list_ctx
         by_qid: dict[str, ToolSpec] = {}
         for name, ft in self.by_client_name.items():
             if name != ft.client_name:
                 continue
+            description = ft.description
+            # Re-render tools with dynamic descriptions (skill available_skills).
+            if ft.tool.has_dynamic_description():
+                try:
+                    description = ft.tool.description(ctx).description
+                except Exception:  # noqa: BLE001
+                    description = ft.description
             by_qid[ft.qualified_id] = ToolSpec(
                 name=ft.client_name,
-                description=ft.description,
+                description=description,
                 parameters=ft.parameters,
             )
         specs = list(by_qid.values())

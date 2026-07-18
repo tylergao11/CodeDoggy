@@ -112,10 +112,12 @@ def build_agent(
     return Agent(definition=definition, system_prompt=prompt, tools=tools)
 
 
-# ── Built-in definitions (Grok explore / plan spirit) ───────────────────
+# ── Built-in role-instructions (appended to Grok subagent_prompt base) ──
+# Base template: codedoggy.prompt.grok_system.render_grok_subagent_base
+# Role bodies are CodeDoggy / product; structure matches Grok <role-instructions>.
 
 EXPLORE_PROMPT = """\
-You are an explore subagent (read-only codebase reconnaissance).
+Role: explore (read-only codebase reconnaissance).
 
 Hard constraints:
 - Do not edit, write, delete, or run shell commands that change state.
@@ -135,7 +137,7 @@ No implementation — exploration only.
 """
 
 PLAN_PROMPT = """\
-You are a plan-mode agent. Produce an actionable plan only.
+Role: plan-mode agent. Produce an actionable plan only.
 
 Hard constraints (enforced by the plan gate, not optional):
 - You may only edit the plan file (default plan.md). Other workspace writes are rejected.
@@ -148,6 +150,22 @@ Plan quality:
 - Keep the plan file updated as your single deliverable
 
 When the plan is ready, stop — the parent will implement.
+"""
+
+GENERAL_PURPOSE_PROMPT = """\
+Role: general-purpose subagent for a focused slice of a larger task.
+
+Hard constraints:
+- Do not spawn further subagents (including parallel_tasks).
+- Stay inside the prompt's scope; return a concise report to MAIN.
+- Prefer dedicated tools over shell when possible.
+
+Method:
+1. Do the assigned work thoroughly within your slice.
+2. Surface failures and open questions clearly.
+3. End with a short summary MAIN can synthesise with sibling reports.
+
+MAIN owns final aggregation — do not assume other children's results.
 """
 
 
@@ -169,7 +187,8 @@ def builtin_explore() -> AgentDefinition:
         ],
         capability_mode=CapabilityMode.READ_ONLY,
         system_prompt_body=EXPLORE_PROMPT,
-        prompt_mode="extend",
+        # full: child runner supplies Grok subagent base; body is role only
+        prompt_mode="full",
         background=True,
         max_turns=16,
     )
@@ -194,27 +213,10 @@ def builtin_plan() -> AgentDefinition:
         capability_mode=CapabilityMode.READ_WRITE,
         session_mode=SessionMode.PLAN,
         system_prompt_body=PLAN_PROMPT,
-        prompt_mode="extend",
+        prompt_mode="full",
         background=False,
         max_turns=12,
     )
-
-
-GENERAL_PURPOSE_PROMPT = """\
-You are a general-purpose subagent working a focused slice of a larger task.
-
-Hard constraints:
-- Do not spawn further subagents (including parallel_tasks).
-- Stay inside the prompt's scope; return a concise report to MAIN.
-- Prefer dedicated tools over shell when possible.
-
-Method:
-1. Do the assigned work thoroughly within your slice.
-2. Surface failures and open questions clearly.
-3. End with a short summary MAIN can synthesise with sibling reports.
-
-MAIN owns final aggregation — do not assume other children's results.
-"""
 
 
 def builtin_general_purpose() -> AgentDefinition:
@@ -222,11 +224,10 @@ def builtin_general_purpose() -> AgentDefinition:
     return AgentDefinition(
         name="general-purpose",
         description="Focused worker for a slice of MAIN's parallel fan-out",
-        # Empty tools = all tools allowed by capability (minus nested spawn strip).
         tools=[],
         capability_mode=CapabilityMode.ALL,
         system_prompt_body=GENERAL_PURPOSE_PROMPT,
-        prompt_mode="extend",
+        prompt_mode="full",
         background=True,
         max_turns=24,
     )

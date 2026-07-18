@@ -51,7 +51,7 @@ def execute_tool_call(
     """Run one tool call; ToolError becomes an observation, not a crash.
 
     Mutations are collected even when the tool returns non-zero / ToolError
-    after partial writes (shell multi-file) — Shadow must see them.
+    after partial writes (shell multi-file).
     """
     kind = tools.kind_of(call.name)
     ctx = ToolCallContext(cwd=cwd, session_id=session_id, extra=dict(extra or {}))

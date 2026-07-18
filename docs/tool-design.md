@@ -12,9 +12,12 @@ in each common tool and why.
 4. **Defaults are finite** — omitted args never mean “unbounded dump.”
 5. **Descriptions state hard constraints** (timeouts, missing unix utils, FG-only).
 6. **Claim matches implement** — do not advertise capabilities we do not have.
-   Windows shell kill uses real Job Objects when assign succeeds (with taskkill
-   fallback). Do not claim full Grok terminal actor or Linux cgroup. PDF/image
-   multimodal and MCP transport stay host-scoped until wired for real.
+7. **No invented degrade / “兜底” paths.** Mature systems (and Grok source) do not
+   silently fall back to a second mechanism we invented. If Grok does A then B,
+   that is the protocol (e.g. hard-kill always does Job kill **and** child
+   `start_kill`) — not “Job failed so try taskkill.” Missing backend → hard
+   unavailable / error, never a fake substitute (no graph-as-LSP, no taskkill
+   as Job substitute). Incomplete ports are labeled **C/A/X**, not papered over.
 
 ## Per-tool details
 
@@ -80,7 +83,7 @@ in each common tool and why.
 | Shell detect | pwsh → powershell → git bash → cmd | Matches host, not assumed bash |
 | UTF-8 env | `PYTHONUTF8`, `PYTHONIOENCODING` | Child tools don’t mojibake |
 | Default timeout | 120s, max 300s; `0`→default | Finite by default |
-| Timeout kill | Windows: Job Object terminate (fallback `taskkill /T`); POSIX: process group SIGTERM→SIGKILL | Descendants die with the shell |
+| Timeout kill | Windows: TerminateJobObject + child kill (Grok; no taskkill); POSIX: killpg SIGTERM→SIGKILL | Descendants die with the shell |
 | Output card | first line `exit: N` or `exit: killed (timeout)` | Always parseable |
 | Output cap | 20_000 chars | Shell is noisy; hard stop |
 | `description` required | yes | Forces intentional shell use |

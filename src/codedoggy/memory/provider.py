@@ -113,15 +113,30 @@ class BaseMemoryProvider:
         *,
         parent_session_id: str = "",
         reset: bool = False,
+        rewound: bool = False,
         **kwargs: Any,
     ) -> None:
-        """Hermes: session_id rotated without provider teardown."""
+        """Hermes: session_id rotated without provider teardown.
+
+        ``rewound=True``: same id, truncated transcript — invalidate turn caches.
+        """
         self._session_id = new_session_id  # type: ignore[attr-defined]
         return None
 
     def on_memory_write(
         self, action: str, target: str, content: str, metadata: Any = None
     ) -> None:
+        return None
+
+    def on_delegation(
+        self,
+        task: str,
+        result: str,
+        *,
+        child_session_id: str = "",
+        **kwargs: Any,
+    ) -> None:
+        """Hermes: parent observes subagent task+result (subagent has no provider)."""
         return None
 
     def shutdown(self) -> None:
@@ -166,10 +181,12 @@ class SessionFtsProvider(BaseMemoryProvider):
         *,
         parent_session_id: str = "",
         reset: bool = False,
+        rewound: bool = False,
         **kwargs: Any,
     ) -> None:
         self._session_id = new_session_id
-        if reset:
+        # Hermes rewound: invalidate per-turn warm cache for truncated transcript
+        if reset or rewound or kwargs.get("rewound"):
             self._warm = ""
             self._warm_query = ""
             self._warm_cwd = ""

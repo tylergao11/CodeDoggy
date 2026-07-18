@@ -90,7 +90,7 @@ def test_kernel_new_session_rotates_id(tmp_path: Path) -> None:
 def test_session_new_session_api(tmp_path: Path) -> None:
     from codedoggy.bootstrap import build_session
 
-    s = build_session(tmp_path, enable_audit=False, enable_graph=False)
+    s = build_session(tmp_path, enable_graph=False)
     old = str(s.id)
     new_id = s.new_session(title="fresh")
     assert new_id != old

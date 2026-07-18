@@ -262,14 +262,50 @@ def on_session_close(
         logger.warning("memory shutdown failed", exc_info=True)
 
 
-def notify_curated_write(memory_manager: Any | None, target: str = "memory") -> None:
-    """After MEMORY.md/USER.md mutation or flush — refresh freeze spine."""
+def notify_curated_write(
+    memory_manager: Any | None,
+    target: str = "memory",
+    *,
+    action: str = "add",
+    content: str = "",
+    metadata: dict[str, Any] | None = None,
+) -> None:
+    """After MEMORY.md/USER.md mutation or flush — refresh freeze + provider mirror."""
     if memory_manager is None:
         return
     try:
-        memory_manager.notify_memory_write(target)
+        fn = getattr(memory_manager, "notify_memory_write", None)
+        if callable(fn):
+            try:
+                fn(target, action=action, content=content, metadata=metadata)
+            except TypeError:
+                fn(target)
     except Exception:  # noqa: BLE001
         logger.debug("notify_memory_write failed", exc_info=True)
+
+
+def on_delegation(
+    memory_manager: Any | None,
+    *,
+    task: str,
+    result: str,
+    child_session_id: str = "",
+    **kwargs: Any,
+) -> None:
+    """Hermes: parent memory observes completed subagent (skip_memory on child)."""
+    if memory_manager is None:
+        return
+    try:
+        hook = getattr(memory_manager, "on_delegation", None)
+        if callable(hook):
+            hook(
+                task or "",
+                result or "",
+                child_session_id=child_session_id,
+                **kwargs,
+            )
+    except Exception:  # noqa: BLE001
+        logger.debug("on_delegation failed", exc_info=True)
 
 
 def sample_messages_with_memory(

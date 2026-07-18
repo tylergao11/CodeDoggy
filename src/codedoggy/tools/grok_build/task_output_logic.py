@@ -31,6 +31,7 @@ Function map:
 from __future__ import annotations
 
 import os
+import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -110,26 +111,20 @@ def build_task_output_description(
     bash_background_param: Optional[str] = "background",
     subagent_background_param: Optional[str] = "background",
 ) -> str:
-    """Grok build_task_output_description (product param names)."""
+    """Grok ``build_task_output_description`` (exact product default naming)."""
     monitor_present = monitor_tool is not None
     subagent_present = subagent_background_param is not None
     target_suffix = _lifecycle_target_suffix(
         monitor_present=monitor_present, subagent_present=subagent_present
     )
+    # Grok does not de-dupe: product renames yield
+    # "background=true commands or background=true subagents".
     sources: list[str] = []
     if bash_background_param:
         sources.append(f"{bash_background_param}=true commands")
     if subagent_background_param:
-        # After product rename both params may be "background"; keep distinct labels.
         sources.append(f"{subagent_background_param}=true subagents")
-    # de-dupe while preserving order (product renames can collapse param names)
-    seen_src: set[str] = set()
-    uniq: list[str] = []
-    for s in sources:
-        if s not in seen_src:
-            seen_src.add(s)
-            uniq.append(s)
-    sources_s = " or ".join(uniq)
+    sources_s = " or ".join(sources)
     monitor_note = _monitor_task_id_note(monitor_tool)
     read_note = (
         f"\n- If output is large, use {read_tool} on the output_file path"
@@ -153,10 +148,16 @@ def build_kill_task_description(
     monitor_tool: Optional[str] = "monitor",
     subagent_present: bool = True,
     bash_present: bool = True,
-    # CodeDoggy glue: no Job Object — honest taskkill / process-group wording.
+    is_windows: Optional[bool] = None,
     kill_action: Optional[str] = None,
 ) -> str:
-    """Grok build_kill_task_description with portable kill verb (not Job Object)."""
+    """Grok ``build_kill_task_description`` (exact OS verb + target clauses).
+
+    On Windows the model-facing text says Job Object (matches Grok product and
+    ``util/job_object`` TerminateJobObject — no taskkill; Grok has none).
+    """
+    if is_windows is None:
+        is_windows = sys.platform == "win32"
     monitor_present = monitor_tool is not None
     target_suffix = _lifecycle_target_suffix(
         monitor_present=monitor_present, subagent_present=subagent_present
@@ -165,27 +166,25 @@ def build_kill_task_description(
 
     if kill_action is not None:
         action = kill_action
-    elif bash_present:
-        # Honest Windows: taskkill /F /T; Unix: process group SIGTERM/SIGKILL.
-        # Grok Windows says "Terminates the Job Object" — we document that as X.
-        parts = [
-            "Terminates the process tree of a bash task"
-            " (Windows: taskkill /T; Unix: SIGTERM/SIGKILL to process group)"
-        ]
-        if monitor_present:
-            parts[0] = parts[0].replace("a bash task", "a bash task or monitor")
-        if subagent_present:
-            parts.append("; sends Cancel+Shutdown to a subagent")
-        action = "".join(parts)
-    elif subagent_present:
-        action = "Sends Cancel+Shutdown to a subagent"
-    elif monitor_present:
-        action = (
-            "Terminates the process tree of a monitor "
-            "(Windows: taskkill /T; Unix: SIGTERM/SIGKILL to process group)"
-        )
     else:
-        action = ""
+        verb = (
+            "Terminates the Job Object of"
+            if is_windows
+            else "Sends SIGTERM/SIGKILL to"
+        )
+        if bash_present:
+            s = f"{verb} a bash task"
+            if monitor_present:
+                s += " or monitor"
+            if subagent_present:
+                s += "; sends Cancel+Shutdown to a subagent"
+            action = s
+        elif subagent_present:
+            action = "Sends Cancel+Shutdown to a subagent"
+        elif monitor_present:
+            action = f"{verb} a monitor"
+        else:
+            action = ""
 
     return (
         f"Terminate a running background task{target_suffix}.\n\n"
@@ -202,20 +201,15 @@ def build_wait_tasks_description(
     bash_background_param: Optional[str] = "background",
     subagent_background_param: Optional[str] = "background",
 ) -> str:
-    """Grok build_wait_tasks_description."""
+    """Grok ``build_wait_tasks_description`` (exact; does not de-dupe sources)."""
+    # Grok product renames collapse both params to "background", yielding
+    # "background=true or background=true" — lock that shape, do not de-dupe.
     sources: list[str] = []
     if bash_background_param:
         sources.append(f"{bash_background_param}=true")
     if subagent_background_param:
         sources.append(f"{subagent_background_param}=true")
-    # de-dupe (product renames collapse is_background / run_in_background → background)
-    seen_src: set[str] = set()
-    uniq: list[str] = []
-    for s in sources:
-        if s not in seen_src:
-            seen_src.add(s)
-            uniq.append(s)
-    sources_s = " or ".join(uniq)
+    sources_s = " or ".join(sources)
     return (
         f"Wait for multiple background tasks or subagents to complete.\n\n"
         f"Prefer {background_retrieval_tool} with task_ids and a positive timeout_ms. "

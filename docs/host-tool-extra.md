@@ -64,9 +64,12 @@ Host or session UI injects these. Refresh **preserves** them.
 |-----|----------|----------|
 | `lsp_backend` | `.dispatch(args)` or `.run(args)` → str/dict | `lsp` |
 | `memory_backend` | `.search(query, max_results=…, min_score=…)` → ranked hits | `memory_search` only |
-| `mcp_dispatch` | `callable(tool_name, tool_input)` | `use_tool` |
-| `mcp_tools` | `list[dict]` catalog (`name`, `description`, `parameters`/`input_schema`, …) | `search_tool`, schema prep for `use_tool` |
-| `mcp_tool_index` | `.search` / `.search_snapshot` and/or schema lookup | `search_tool`, `use_tool` schema |
+| `mcp_dispatch` | `McpDispatch`：`callable(tool_name, tool_input)` | `use_tool` (**transport 仍 host**) |
+| `mcp_tools` | `list[dict]` catalog (`name`, `description`, `parameters`/`input_schema`, …) | `search_tool`, schema prep；无 index 时自动建 BM25 |
+| `mcp_tool_index` | Grok `ToolIndex` / `ToolSearchIndex`（`.search_snapshot` / `.list_server_summaries`；可选 `.get`） | `search_tool`；`ensure_mcp_tool_index` 从 catalog 生成 `ToolIndex(Bm25…)` |
+| `mcp_servers` / `mcp_initialized` | server 列表 + 是否 ready | BM25 `is_ready` / system-reminder |
+| `skills_registry` / `skill_paths` | `list[SkillInfo\|dict]` 或额外目录 | `skill` tool；否则扫 `.codedoggy/skills` / `.grok/skills` |
+| `native_tool_correction` | Grok `UseToolParams` bool（默认 true） | `use_tool` 原生工具纠错 |
 | `ask_user_fn` | `fn(list[question_dict])` → answers | `ask_user_question` |
 | `plan_mode_consent_fn` | `fn() -> bool` | `enter_plan_mode` (decline → soft string) |
 | `plan_mode_exit_fn` | host outcome hook | `exit_plan_mode` |
@@ -77,10 +80,12 @@ Host or session UI injects these. Refresh **preserves** them.
 | `prefetch_user_block` | Hermes fence text | runner → loop |
 | `writes_paused` | pause mutating tools | registry gate |
 
-### MCP mutation envelope (Shadow)
+### MCP mutation envelope
 
-If `mcp_dispatch` returns only a plain string, **Shadow cannot see** workspace writes.
-For write tools host **must** return structured shapes (`mutations` / `mutation` / `mutated_paths` / `mutated_path`). See `docs/grok-tool-surface.md`.
+If `mcp_dispatch` returns only a plain string, workspace side effects are not
+recorded on the tool context. For write tools host **should** return structured
+shapes (`mutations` / `mutation` / `mutated_paths` / `mutated_path`). See
+`docs/grok-tool-surface.md`.
 
 ---
 
@@ -94,7 +99,7 @@ For write tools host **must** return structured shapes (`mutations` / `mutation`
 | `memory` (Doggy) | `memory_store` | `ToolError` `memory_not_configured` |
 | `session_search` | `session_store` | `ToolError` `session_store_not_configured` |
 | `code_nav` | `graph` | `ToolError` `not_available` (graph — **not** LSP) |
-| `search_tool` | `mcp_tool_index` or `mcp_tools` | Soft: *“No MCP tools registered.”* |
+| `search_tool` | `mcp_tool_index` or `mcp_tools` | Soft Grok note: *“No integration tools are configured. MCP servers are not connected.”* |
 | `use_tool` | `mcp_dispatch` | `ToolError` `mcp_dispatch_missing` |
 | `ask_user_question` | `ask_user_fn` | `MIGRATION_FALLBACK=True` → QuestionsSent soft text + `pending_user_questions` stash; no real UI wait |
 | `spawn_subagent` / `parallel_tasks` | `subagent_coordinator` + `subagent_run_fn` | `ToolError` `missing_resource` |
@@ -117,7 +122,7 @@ Do **not** add or reintroduce:
 |-----------|----------------|
 | **graph-as-LSP** | `code_nav` is graph; `lsp` needs real `lsp_backend`. No fallback between them. |
 | **BM25 registry as Grok MCP index** | No in-tree `mcp_registry` BM25. Host owns `mcp_tool_index` / simple `mcp_tools` filter. |
-| **Fake Job Object** | Runtime uses real Win32 Job Object when assign succeeds (`util/job_object.py`); falls back to taskkill /T. Do not claim full Grok terminal actor / cgroup. |
+| **Invented degrade / taskkill-as-Job** | Forbidden. Kill path is Grok protocol only: TerminateJobObject then child kill. Missing full actor → label **C**, do not invent a second mechanism. |
 | Token-scored `MemoryStore` as `memory_search` | Search is only `memory_backend`; store is for get/write. |
 | Mid-stream interjection interrupt as product | Deleted invention; interjections drain at safe points only. |
 

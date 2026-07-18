@@ -1,13 +1,15 @@
 """Windows Job Object helpers for shell process trees.
 
-Ported intent from Grok bash timeout wording (Job Object kill descendants).
-Uses Win32 APIs via ctypes — **real** Job Objects, not a claim over taskkill alone.
+Ported from Grok (behavior, not line-for-line Rust):
+  crates/codegen/xai-tty-utils/src/lib.rs  ProcessGroup (Windows)
+    CreateJobObjectW + JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+    AssignProcessToJobObject
+    TerminateJobObject
+  crates/codegen/xai-grok-tools/src/computer/local/terminal.rs
+    send_sigkill_to_group: ProcessGroup.kill() **then** child.start_kill()
+    (both steps always; not a degrade ladder — Grok has no taskkill)
 
-Fidelity: **C** — Create/Assign/Terminate/Close; no full Grok cgroup/terminal actor.
-Fallback: callers still may use taskkill if Job Object APIs fail.
-
-Source reference (behavior, not line-port of Rust):
-  grok-build bash timeout enforcement on Windows → Job Object kill
+Project rule: do **not** invent silent alternate kill mechanisms.
 """
 
 from __future__ import annotations
@@ -23,7 +25,10 @@ def job_objects_supported() -> bool:
 
 
 def create_and_assign_job(pid: int) -> bool:
-    """Create a Job Object and assign *pid* to it. Returns True on success."""
+    """Create a Job Object and assign *pid* to it. Returns True on success.
+
+    Grok ``ProcessGroup::new`` + ``attach_pid`` spirit.
+    """
     if not job_objects_supported():
         return False
     try:
@@ -48,21 +53,10 @@ def create_and_assign_job(pid: int) -> bool:
         CloseHandle.argtypes = [wintypes.HANDLE]
         CloseHandle.restype = wintypes.BOOL
 
-        # Enough rights to assign into a job (and terminate later via the job).
+        # Grok OpenProcess: PROCESS_SET_QUOTA | PROCESS_TERMINATE
         PROCESS_SET_QUOTA = 0x0100
         PROCESS_TERMINATE = 0x0001
-        PROCESS_DUP_HANDLE = 0x0040
-        PROCESS_QUERY_INFORMATION = 0x0400
-        PROCESS_SUSPEND_RESUME = 0x0800
-        SYNCHRONIZE = 0x00100000
-        access = (
-            PROCESS_SET_QUOTA
-            | PROCESS_TERMINATE
-            | PROCESS_DUP_HANDLE
-            | PROCESS_QUERY_INFORMATION
-            | PROCESS_SUSPEND_RESUME
-            | SYNCHRONIZE
-        )
+        access = PROCESS_SET_QUOTA | PROCESS_TERMINATE
 
         job = CreateJobObjectW(None, None)
         if not job:
@@ -80,7 +74,7 @@ def create_and_assign_job(pid: int) -> bool:
         finally:
             CloseHandle(hproc)
 
-        # Kill-on-close so abandoning the handle still reaps the tree when we CloseHandle
+        # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE (Grok SetInformationJobObject)
         try:
             _set_kill_on_job_close(kernel32, job)
         except Exception:  # noqa: BLE001
@@ -96,7 +90,6 @@ def _set_kill_on_job_close(kernel32: Any, job: Any) -> None:
     import ctypes
     from ctypes import wintypes
 
-    # JOBOBJECT_EXTENDED_LIMIT_INFORMATION is large; use basic limit info path
     JobObjectExtendedLimitInformation = 9
     JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000
 
@@ -152,7 +145,10 @@ def _set_kill_on_job_close(kernel32: Any, job: Any) -> None:
 
 
 def terminate_job_for_pid(pid: int, exit_code: int = 1) -> bool:
-    """Terminate Job Object for *pid* if we created one. Returns True if used."""
+    """Terminate Job Object for *pid* if we created one. Returns True if used.
+
+    Grok ``ProcessGroup::terminate_job`` / ``TerminateJobObject``.
+    """
     if not job_objects_supported():
         return False
     job = _job_handles.pop(int(pid), None)
@@ -177,7 +173,11 @@ def terminate_job_for_pid(pid: int, exit_code: int = 1) -> bool:
 
 
 def release_job_for_pid(pid: int) -> None:
-    """Close job handle without terminate (process already exited)."""
+    """Close job handle without terminate (process already exited).
+
+    Grok Drop of ProcessGroup closes the job handle (KILL_ON_JOB_CLOSE may
+    still reap remaining members).
+    """
     job = _job_handles.pop(int(pid), None)
     if job is None:
         return
@@ -195,14 +195,18 @@ def release_job_for_pid(pid: int) -> None:
 
 
 def kill_process_tree(proc: Any) -> None:
-    """Shared kill path for bash FG timeout and task_manager.
+    """Shared kill path — Grok ``send_sigkill_to_group`` (exact step order).
 
-    Windows: TerminateJobObject if we own a job for *proc.pid*, else taskkill /T.
-    POSIX: SIGTERM process group, then SIGKILL after ~1s.
+    Windows (terminal.rs hard-kill, both steps always):
+      1. ProcessGroup.kill → TerminateJobObject when we hold a job for pid
+      2. child.start_kill → proc.kill() on the immediate child
+
+    POSIX:
+      1. killpg SIGTERM, then SIGKILL after ~1s
+      2. proc.kill() (same “always also kill child” step as Grok)
     """
     import os
     import signal
-    import subprocess
     import time
 
     if proc is None:
@@ -217,27 +221,19 @@ def kill_process_tree(proc: Any) -> None:
 
     pid = proc.pid
     if job_objects_supported():
-        if terminate_job_for_pid(pid):
-            try:
-                proc.wait(timeout=2.0)
-            except Exception:  # noqa: BLE001
-                pass
-            return
+        # Grok: process_group.kill() then child.start_kill()
+        terminate_job_for_pid(pid)
         try:
-            subprocess.run(
-                ["taskkill", "/F", "/T", "/PID", str(pid)],
-                capture_output=True,
-                timeout=10,
-                check=False,
-            )
-        except (OSError, subprocess.TimeoutExpired):
-            try:
-                proc.kill()
-            except OSError:
-                pass
+            proc.kill()
+        except OSError:
+            pass
+        try:
+            proc.wait(timeout=2.0)
+        except Exception:  # noqa: BLE001
+            pass
         return
 
-    # POSIX
+    # POSIX — Grok killpg SIGTERM / SIGKILL + child start_kill spirit
     try:
         os.killpg(pid, signal.SIGTERM)
     except (ProcessLookupError, PermissionError, OSError):
@@ -257,3 +253,7 @@ def kill_process_tree(proc: Any) -> None:
             proc.kill()
         except OSError:
             pass
+    try:
+        proc.kill()
+    except OSError:
+        pass

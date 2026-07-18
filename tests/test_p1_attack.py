@@ -1,10 +1,9 @@
-"""Attack-style regressions for audit P1s (meaningful, not happy-path fluff)."""
+"""Attack-style regressions for P1s (meaningful, not happy-path fluff)."""
 
 from __future__ import annotations
 
 from pathlib import Path
 
-from codedoggy.audit.restore import restore_mutation_before
 from codedoggy.context.budget import ContextBudget, needs_compaction
 from codedoggy.memory.redact import redact_secrets
 from codedoggy.memory.session_store import SessionStore
@@ -53,24 +52,6 @@ def test_p1_busy_handle_prompt_is_queued_not_completed(tmp_path: Path) -> None:
     t.join(timeout=5.0)
     assert s.phase is SessionPhase.IDLE
 
-
-def test_p1_shadow_restore_reverse_order_same_path(tmp_path: Path) -> None:
-    """A→B→C mutations: reverse restore must end at A, not B."""
-    p = tmp_path / "f.txt"
-    p.write_text("A", encoding="utf-8")
-    muts = [
-        FileMutation(
-            path="f.txt", tool_name="t", call_id="1", before="A", after="B"
-        ),
-        FileMutation(
-            path="f.txt", tool_name="t", call_id="2", before="B", after="C"
-        ),
-    ]
-    p.write_text("C", encoding="utf-8")
-    # Simulate hooks reverse restore
-    for mut in reversed(muts):
-        restore_mutation_before(tmp_path, mut)
-    assert p.read_text(encoding="utf-8") == "A"
 
 
 def test_p1_ensure_session_does_not_rewrite_cwd(tmp_path: Path) -> None:

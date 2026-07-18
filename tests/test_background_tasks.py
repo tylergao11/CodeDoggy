@@ -244,20 +244,78 @@ def test_capped_wait_timeout_clamps() -> None:
 
 
 def test_description_builders_product_names() -> None:
+    """Lock Grok xai-tool-types task.rs cli_default product strings."""
+    import sys
+
+    # get_task_output — task_output_matches_cli_default
     td = build_task_output_description()
-    assert "background task, monitor, or subagent" in td
-    assert "monitor" in td
-    assert "read_file" in td
-    assert "background=true" in td
+    assert td == (
+        "Get output and status from a background task, monitor, or subagent.\n\n"
+        "Usage notes:\n"
+        "- Pass task_ids with one or more ids from background=true commands or "
+        "background=true subagents (a monitor's task_id is returned by monitor); "
+        "for a single task use a one-element array. Multiple ids with a positive "
+        "timeout_ms wait until all complete\n"
+        "- Omit timeout_ms or pass 0 for a non-blocking status snapshot; set a "
+        "positive timeout_ms to wait up to that many milliseconds, capped at ~10 min\n"
+        "- Returns current output, status, and exit code if completed\n"
+        "- If output is large, use read_file on the output_file path"
+    )
 
+    # kill_task — OS verb from is_windows (Grok kill_task_matches_cli_default_*)
+    kd_win = build_kill_task_description(is_windows=True)
+    assert kd_win == (
+        "Terminate a running background task, monitor, or subagent.\n\n"
+        "Usage notes:\n"
+        "- Pass its task_id (a monitor's task_id is returned by monitor).\n"
+        "- Terminates the Job Object of a bash task or monitor; "
+        "sends Cancel+Shutdown to a subagent.\n"
+        "- Returns success if the task was killed or had already exited."
+    )
+    kd_posix = build_kill_task_description(is_windows=False)
+    assert kd_posix == (
+        "Terminate a running background task, monitor, or subagent.\n\n"
+        "Usage notes:\n"
+        "- Pass its task_id (a monitor's task_id is returned by monitor).\n"
+        "- Sends SIGTERM/SIGKILL to a bash task or monitor; "
+        "sends Cancel+Shutdown to a subagent.\n"
+        "- Returns success if the task was killed or had already exited."
+    )
+    # Default follows host OS
     kd = build_kill_task_description()
-    assert "Terminate a running background task" in kd
-    assert "taskkill" in kd or "process tree" in kd
-    assert "Job Object" not in kd  # honest Windows wording (X for Job Object)
+    if sys.platform == "win32":
+        assert "Job Object" in kd
+    else:
+        assert "SIGTERM/SIGKILL" in kd
 
+    # wait_tasks — wait_tasks_matches_cli_default (no source de-dupe)
     wd = build_wait_tasks_description()
-    assert "get_command_or_subagent_output" in wd
-    assert "wait_all" in wd and "wait_any" in wd
+    assert wd == (
+        "Wait for multiple background tasks or subagents to complete.\n\n"
+        "Prefer get_command_or_subagent_output with task_ids and a positive "
+        "timeout_ms. This tool is kept for compatibility.\n\n"
+        "Usage notes:\n"
+        "- task_ids: list of task IDs from background=true or background=true\n"
+        "- mode: 'wait_all' or 'wait_any'\n"
+        "- timeout_ms: optional max wait, default 30s, capped at ~10 min"
+    )
+
+
+def test_kill_task_subagent_only_toolbox() -> None:
+    """Grok kill_task_subagent_only_toolbox."""
+    desc = build_kill_task_description(
+        monitor_tool=None,
+        subagent_present=True,
+        bash_present=False,
+        is_windows=False,
+    )
+    assert desc == (
+        "Terminate a running background task or subagent.\n\n"
+        "Usage notes:\n"
+        "- Pass its task_id.\n"
+        "- Sends Cancel+Shutdown to a subagent.\n"
+        "- Returns success if the task was killed or had already exited."
+    )
 
 
 def test_monitor_line_processor_and_wrap() -> None:

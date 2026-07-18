@@ -11,8 +11,6 @@ Coding agent harness (Python).
 - **Parallel MAIN** = **MAIN 自己的强并行倾向**（prompt + 可选工具）；**不是** runtime 替他自动并行
 - **Graph** = 挂在读能力上的代码导航
 
-**Shadow（写时软质检）已从产品路径移除** — 不再默认审计。
-
 详见 [`SCHEME.md`](SCHEME.md)。
 
 ## Layout
@@ -25,7 +23,6 @@ Coding agent harness (Python).
 - `context/` — Grok 窗口预算与压缩
 - `tools/` — 注册、Gate 权限、builtins（含 MAIN 可选的 `parallel_tasks`）
 - `graph/` — 代码图导航（`code_nav`）
-- `audit/` — **legacy only**（单测可 `enable_audit=True`；产品默认关闭）
 
 ### Main brain + optional multi-agent tools
 

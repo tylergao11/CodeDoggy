@@ -150,6 +150,11 @@ def test_build_task_description_lists_agents() -> None:
     assert "resume_from" in desc
     assert "worktree" in desc
     assert "No explicit model slugs" in desc
+    # Grok by_kind.plan → todo_write (not enter_plan_mode)
+    assert "todo_write" in desc
+    assert "enter_plan_mode" not in desc
+    assert "run_terminal_command" in desc
+    assert "Has access to all tools:" in desc
 
 
 def test_task_model_guidance_with_slugs() -> None:

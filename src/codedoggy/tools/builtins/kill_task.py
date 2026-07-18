@@ -7,8 +7,9 @@ Ported from:
 
 Grok product name: kill_command_or_subagent.
 
-Kill path: shared ``job_object.kill_process_tree`` (Win32 Job Object when
-assigned, else taskkill /T; POSIX process group). Not a full Grok terminal actor.
+Description: Grok ``build_kill_task_description`` (Job Object verb on Windows).
+Kill path: shared ``job_object.kill_process_tree`` — Windows TerminateJobObject
++ child kill (Grok start_kill); POSIX killpg. **No taskkill** (Grok has none).
 """
 
 from __future__ import annotations

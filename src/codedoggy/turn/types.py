@@ -55,7 +55,7 @@ class SampleResult:
 
 @dataclass(slots=True)
 class FileMutation:
-    """Workspace mutation — Grok hunk unit for Shadow (multi per tool call)."""
+    """Workspace mutation — one path hunk unit (multi per tool call)."""
 
     path: str
     tool_name: str
@@ -86,7 +86,7 @@ class HookDecision:
 
     # Extra text appended to the tool observation the model sees.
     append_observation: str | None = None
-    # Stop the loop early (e.g. hard quality gate / shadow P0).
+    # Stop the loop early (hard gate from hooks).
     abort: bool = False
     abort_reason: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)

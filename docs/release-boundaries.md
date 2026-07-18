@@ -21,7 +21,7 @@ Do not claim features outside this file. Port rules: [`docs/grok-source-map.md`]
 | **apply_patch Move** | Path escape denied; source kept; `.env` deny before unlink; successful Move emits delete+create mutations | `tests/test_p0_attack.py` |
 | **Context overflow** | Overflow resubmit bounded (`max_turns` + compact budget); no infinite sample spin | `tests/test_p0_attack.py` |
 | **tool_call ids** | Fallback ids unique across samples; sanitize keeps multi-round results with colliding ids (FIFO) | `tests/test_p0_attack.py` |
-| **Policy / gate** | Case-insensitive deny; shell protected-path detect; central gate blocks writes; missing tool results filled | `tests/test_kernel_audit_fixes.py` |
+| **Policy / gate** | Case-insensitive deny; shell protected-path detect; central gate blocks writes; missing tool results filled | `tests/test_p1_attack.py` |
 
 ### Major P1s (done)
 
@@ -41,7 +41,6 @@ Do not claim features outside this file. Port rules: [`docs/grok-source-map.md`]
 
 | Area | What ships | Tests |
 |------|------------|-------|
-| **Default no Shadow** | `build_session` `enable_audit=False`; no system-prompt Shadow; children get no audit hooks | `tests/test_bootstrap.py`, `tests/test_parallel_tasks.py` |
 | **MAIN parallel tendency** | System prompt biases MAIN to prefer multi-agent when work splits; **no runtime forced fan-out** | `tests/test_parallel_tasks.py` |
 | **`parallel_tasks` tool** | Opt-in tool when MAIN calls it; `wait` true/false is MAIN's choice | `tests/test_parallel_tasks.py` |
 | **Coordinator** | Executes what MAIN spawned (`spawn_many` / `wait_all`); not a policy engine | `tests/test_parallel_tasks.py` |
@@ -60,7 +59,7 @@ Related suites: `tests/test_orchestration.py`, `tests/test_hermes_seam.py`, `tes
 | **SessionActor spine** | `RuntimeKernel` + turn loop + prompt queue / interjection (spirit map in `SCHEME.md`) | Full Grok `SessionActor` (ACP session, all host channels, complete actor state machine) |
 | **Stream deltas** | Optional `stream_sample` / `on_sample_delta` for host UI | Mid-stream interjection interrupt (explicitly deleted invention) |
 | **Resume transcript** | Serialize `Message` dicts for prior live | Full ConversationItem / sampling-type store from Grok |
-| **Shell process kill** | Win32 Job Object when available + taskkill fallback; POSIX process group | Full Grok terminal actor + Linux cgroup |
+| **Shell process kill** | Win32 TerminateJobObject + child kill (no taskkill); POSIX killpg | Full Grok terminal actor + Linux cgroup |
 | **Subagent pool** | Thread-pool runs children MAIN spawned; `parallel_tasks` is opt-in | Auto task-split; full Grok multi-agent kernel / channel RPC |
 | **Batch tool dispatch** | Phase-1 prepare all + phase-2 path-lock parallel execute (Grok `tool_calls` / `tool_dispatch` spirit); writeback in emission order | Full tokio FuturesUnordered + interruptible wait tools |
 
@@ -70,9 +69,8 @@ Related suites: `tests/test_orchestration.py`, `tests/test_hermes_seam.py`, `tes
 
 | Area | Status | Notes |
 |------|--------|-------|
-| **Shadow / write-time audit** | **Removed from product path** | `enable_audit` default `False`. Package `codedoggy.audit` remains for unit tests only. |
-| **Shadow soft restore** | Not product | Legacy tests may still exercise package code with `enable_audit=True`. |
-| **Full TX Shadow** | Never shipped | Not re-planned as product. |
+| **Write-time soft quality reviewer (former product)** | **Deleted** | Package and hooks removed; no P0 footnotes, no soft restore. |
+| **Full TX write-time reviewer** | Never shipped | Do not reintroduce. |
 
 ---
 
@@ -100,7 +98,7 @@ Before calling a build release-ready for audit boundaries, these **must** pass:
 pytest tests/test_p0_attack.py tests/test_p1_attack.py -q
 
 # Kernel / gate regressions
-pytest tests/test_kernel_audit_fixes.py -q
+pytest tests/test_p1_attack.py -q
 
 # Parallel MAIN product path + Grok batch dispatch
 pytest tests/test_parallel_tasks.py tests/test_bootstrap.py tests/test_batch_parallel.py -q
@@ -114,19 +112,12 @@ pytest tests/test_p1_graph.py tests/test_p1_graph_internal.py \
 pytest tests/test_hermes_seam.py tests/test_grok_fidelity.py -q
 ```
 
-Legacy Shadow package unit tests (optional; not product path):
-
-```bash
-pytest tests/test_shadow_restore.py tests/test_audit_p0.py tests/test_audit.py -q
-```
-
 One-shot product gate:
 
 ```bash
 pytest \
   tests/test_p0_attack.py \
   tests/test_p1_attack.py \
-  tests/test_kernel_audit_fixes.py \
   tests/test_parallel_tasks.py \
   tests/test_bootstrap.py \
   tests/test_p1_graph.py \

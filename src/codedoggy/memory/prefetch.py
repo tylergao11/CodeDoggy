@@ -34,7 +34,7 @@ def prefetch_for_turn(
     if selector is None:
         return None
     try:
-        from codedoggy.audit.types import MemorySelectRequest, MutationEvent
+        from codedoggy.memory.select_types import MemorySelectRequest
 
         goal = getattr(session, "goal", None) if session is not None else None
         cwd = None
@@ -43,12 +43,7 @@ def prefetch_for_turn(
             cwd = str(c) if c is not None else None
         req = MemorySelectRequest(
             goal=goal if isinstance(goal, str) else None,
-            mutation=MutationEvent(
-                path="(prefetch)",
-                tool_name="prefetch",
-                call_id="prefetch",
-                after="",
-            ),
+            path="",
             trajectory_summary="(main-agent turn prefetch)",
             session_id=session_id,
             query_hint=(user_text or "")[:240],

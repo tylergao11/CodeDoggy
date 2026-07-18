@@ -13,8 +13,6 @@
 | **Parallel MAIN** | 主 agent **强并行倾向**（prompt + 可选工具）；MAIN 自己决定何时派工 | runtime 替 MAIN 自动拆任务/自动并行 |
 | **Graph** | 挂在 Grok 读能力上的**代码导航** | 另起索引/权限/生命周期 |
 
-**Shadow（写时软质检）已从产品路径移除** — 不再默认审计 mutation；`codedoggy.audit` 仅保留给遗留单测（`enable_audit=True`）。
-
 **生长规则（必须同时满足）：**
 
 1. 新能力先问：是否服从 Grok 的 context / tool / permission / transcript 边界？  
@@ -139,7 +137,7 @@ user prompt
            same file_path/path/target_file → mutex; else concurrent
            shell / apply_patch often no path key → no lock (GLUE)
          Phase3 writeback in *model emission order* + after_tool / after_mutation
-           hooks optional (product default: no Shadow); abort stops *next sample*, not un-run phase2
+           hooks optional; abort stops *next sample*, not un-run phase2
        exit: completed | max_turns | cancelled | permission_reject | aborted | error
   → carry live_messages into next handle_prompt
 ```
@@ -147,7 +145,6 @@ user prompt
 - `max_turns`: sampling rounds per prompt; `None` = unlimited
 - Tool errors / soft denies become observations (do not crash the loop)
 - **Hard** prepare outcomes cancel remainder of *prepare*; already-approved still execute in phase 2
-- **Shadow removed** from product path (`enable_audit=False`); `after_mutation` only if host wires legacy hooks
 - **Live** window may be pruned; **archive** is create-time full fidelity
 
 ### Two “parallel” layers (do not confuse)
@@ -227,11 +224,9 @@ before each sample → bind tools_reserve → ContextCompactor.ensure:
   - bundled example external: ``CODEDOGGY_MEMORY_PROVIDER=notes``
   - docs: ``docs/hermes-groke-seam.md``
 - Shell: scrub known API keys from child env; mutations recorded even on
-  non-zero exit (Shadow partial-write path)
+  non-zero exit (partial-write path)
 - Graph: incremental events mark dirty; real `respect_gitignore`; cache
   format version; reindex rebinds watcher manager
-- Shadow P0: optional soft restore from mutation `before`
-  (`CODEDOGGY_SHADOW_RESTORE`, default on) — best-effort, not full sandbox TX
 - Busy `handle_prompt` → Grok interject queue (soft result, no crash)
 - seed prior transcript: sanitize tool pairs before next sample
 - **Port rule:** Grok from `C:\\Ai\\grok-build` only; wrong inventions **deleted**.
@@ -257,40 +252,9 @@ ModelConfig { provider, model, base_url, api_key, temperature, … }
 - Stock providers: `ollama` (default), `openai_compat` / `openai` / `custom`
 - Bootstrap: `build_session()` wires `ChatSampler(main)` + tools + parallel coordinator
 - Env main: `CODEDOGGY_PROVIDER`, `CODEDOGGY_MODEL`, `CODEDOGGY_BASE_URL`, `CODEDOGGY_API_KEY`
+- Optional aux (fold summarizer): `CODEDOGGY_AUX_MODEL` / `CODEDOGGY_AUX_*`
 - Ollama default: `http://127.0.0.1:11434/v1` + model `qwen3:8b`
 - Transport: OpenAI-compatible `chat/completions` (stdlib HTTP)
-- Legacy: `CODEDOGGY_AUDIT_*` / dual profiles still exist for unused audit package tests
-
-## Shadow 影子 (REMOVED from product path)
-
-Package `codedoggy.audit` remains importable for legacy unit tests only.
-Product sessions: `build_session(..., enable_audit=False)` (default). No
-resident mutation auditor, no soft restore in the live agent path.
-
-### Historical notes (legacy package only; not product)
-
-<details><summary>Former Shadow design (do not re-enable by default)</summary>
-
-## Shadow 影子 (write-time soft review — not a normal audit)
-
-```
-mutation (search_replace first-hand before/after)
-  → MutationTrajectory (session write log)
-  → MemorySelector (Hermes curated + FTS)
-  → ShadowAuditor / ModelAuditor.review (model brain)
-  → pass: silent | fail: soft observation footnote (rethink)
-```
-
-- **Name:** former product **Shadow / 影子**; code package `codedoggy.audit` (legacy)
-- **Differs from normal audit:** in-loop, per mutation, soft only, no repo report
-- Session **goal** = intent anchor (`session.goal` / `set_goal`)
-- Shadow **must not write** workspace
-- **P0 (`critical`)**: immediate red card on tool observation; prune/fold preserve
-- **Non-P0**: buffered → turn end (`metadata.shadow_deferred`)
-- Handle: `SessionExtensions.audit` (historical field name)
-- Aliases: `ShadowAuditor`, `ShadowHooks`, `ShadowServices`
-
-</details>
 
 ## Memory (Hermes-style: curated + big session store)
 

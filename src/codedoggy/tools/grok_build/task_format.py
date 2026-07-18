@@ -279,13 +279,14 @@ class SubagentDescriptor:
     tools: str | None = None
 
 
-# Grok BUILTIN_SUBAGENTS with product tool names already substituted
-# (Grok keeps ${{ tools.by_kind.* }} placeholders; Doggy has no TemplateRenderer).
+# Grok BUILTIN_SUBAGENTS tools_template with product tool names substituted
+# (Grok keeps ${{ tools.by_kind.* }}; Doggy has no TemplateRenderer).
+# by_kind.plan → todo_write (ToolKind::Plan), NOT enter_plan_mode (EnterPlan).
 _GENERAL_PURPOSE_TOOLS = (
     "Has access to all tools: "
     "run_terminal_command, read_file, search_replace, "
     "list_dir, grep, web_search, "
-    "and enter_plan_mode."
+    "and todo_write."
 )
 _EXPLORE_TOOLS = (
     "Read-only \u2014 has access to: "
@@ -296,7 +297,7 @@ _PLAN_TOOLS = (
     "Read-only \u2014 has access to all tools except file editing "
     "(search_replace is not available): "
     "read_file, list_dir, grep, "
-    "web_search, and enter_plan_mode."
+    "web_search, and todo_write."
 )
 
 BUILTIN_SUBAGENT_DESCRIPTORS: tuple[SubagentDescriptor, ...] = (

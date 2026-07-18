@@ -62,7 +62,7 @@ def main() -> int:
 
     prof = model_profiles_from_env()
     print(f"main={prof.main.model} @ {prof.main.base_url}")
-    print(f"audit={prof.audit.model} @ {prof.audit.base_url}")
+    print(f"aux={prof.aux.model} @ {prof.aux.base_url}")
     print(f"cwd={work}")
     print(
         f"budget max_chars={os.environ['CODEDOGGY_CONTEXT_MAX_CHARS']} "
@@ -88,7 +88,6 @@ def main() -> int:
         work,
         goal="Keep stress_app.py coherent; prefer small safe edits; document JWT choice in memory if decided.",
         max_turns=10,
-        enable_audit=False,
         enable_memory=True,
         enable_session_store=True,
         memory_dir=mem_dir,
@@ -151,7 +150,6 @@ def main() -> int:
                 "context_last": (result.metadata or {}).get("context_last"),
                 "resumed_prior": (result.metadata or {}).get("resumed_prior"),
                 "live_messages": (result.metadata or {}).get("live_messages"),
-                "shadow_deferred": bool((result.metadata or {}).get("shadow_deferred")),
                 "error": result.error,
                 "secs": round(dt, 1),
                 "final_preview": _safe(result.final_text, 280),
@@ -187,8 +185,6 @@ def main() -> int:
             hits = store.search("stress_app add", limit=5)
             report["checks"]["fts_hits"] = len(hits)
 
-        traj = session.extensions.audit.trajectory if session.extensions.audit else None
-        report["checks"]["mutation_count"] = len(traj) if traj is not None else 0
         report["checks"]["any_compaction"] = any(
             (p.get("compactions") or 0) > 0 for p in report["prompts"]
         )

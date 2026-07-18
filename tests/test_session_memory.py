@@ -5,9 +5,9 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from codedoggy.audit.types import MemorySelectRequest, MutationEvent
 from codedoggy.bootstrap import build_session
 from codedoggy.memory import HermesMemorySelector, MemoryStore, SessionStore
+from codedoggy.memory.select_types import MemorySelectRequest
 from codedoggy.memory.redact import redact_secrets
 from codedoggy.model import CompletionResult
 from codedoggy.tools import ToolCallContext, ToolRegistryBuilder
@@ -97,9 +97,7 @@ def test_hermes_select_scopes_fts_with_cwd_and_roles(tmp_path: Path) -> None:
     res = sel.select(
         MemorySelectRequest(
             goal="auth",
-            mutation=MutationEvent(
-                path="auth.py", tool_name="search_replace", call_id="1", after="x"
-            ),
+            path="auth.py",
             trajectory_summary="(none)",
             session_id="current",
             query_hint="JWT login",
@@ -122,9 +120,7 @@ def test_hermes_select_scopes_fts_with_cwd_and_roles(tmp_path: Path) -> None:
     ).select(
         MemorySelectRequest(
             goal="auth",
-            mutation=MutationEvent(
-                path="auth.py", tool_name="t", call_id="1", after="x"
-            ),
+            path="auth.py",
             trajectory_summary="(none)",
             session_id="sid-now",
             query_hint="JWT login unique",
@@ -138,9 +134,7 @@ def test_hermes_select_scopes_fts_with_cwd_and_roles(tmp_path: Path) -> None:
     with_tool = sel.select(
         MemorySelectRequest(
             goal="auth",
-            mutation=MutationEvent(
-                path="auth.py", tool_name="t", call_id="1", after="x"
-            ),
+            path="auth.py",
             trajectory_summary="(none)",
             session_id="current",
             query_hint="raw tool dump JWT",
@@ -234,12 +228,7 @@ def test_hermes_selector_combines_sources(tmp_path: Path) -> None:
     res = sel.select(
         MemorySelectRequest(
             goal="auth timeout",
-            mutation=MutationEvent(
-                path="auth.py",
-                tool_name="search_replace",
-                call_id="1",
-                after="x",
-            ),
+            path="auth.py",
             trajectory_summary="(none)",
             session_id="current",
             query_hint="auth login",
@@ -273,9 +262,7 @@ def test_hermes_selector_live_and_same_session(tmp_path: Path) -> None:
     )
     req = MemorySelectRequest(
         goal="auth",
-        mutation=MutationEvent(
-            path="auth.py", tool_name="search_replace", call_id="1", after="x"
-        ),
+        path="auth.py",
         trajectory_summary="(none)",
         session_id="sid-1",
         query_hint="JWT login",
@@ -408,41 +395,6 @@ def test_shell_write_denied_by_policy_before_exec(tmp_path: Path) -> None:
     assert not (tmp_path / ".env").exists()
 
 
-def test_auditor_prompt_includes_policy() -> None:
-    from codedoggy.audit.model_auditor import ModelAuditor
-    from codedoggy.audit.types import (
-        AuditContext,
-        MemorySelectResult,
-        MutationEvent,
-    )
-    from codedoggy.model import CompletionResult, ModelConfig
-
-    class CapClient:
-        config = ModelConfig(provider="x", model="m", base_url="http://x")
-        last = None
-
-        def complete(self, messages, **kw):
-            self.last = messages
-            return CompletionResult(content='{"ok": true}', model="m")
-
-    client = CapClient()
-    aud = ModelAuditor(client)  # type: ignore[arg-type]
-    mem = MemorySelectResult(raw={"policy": {"enabled": True, "deny_write_globs": [".git"]}})
-    ctx = AuditContext(
-        goal="ship",
-        mutation=MutationEvent(
-            path="a.py", tool_name="search_replace", call_id="1", after="x"
-        ),
-        trajectory_summary="(none)",
-        memory=mem,
-        cwd=".",
-    )
-    aud.review(ctx)
-    assert client.last
-    blob = "\n".join(m.content or "" for m in client.last)
-    assert "Workspace policy" in blob
-    assert ".git" in blob
-
 
 def test_policy_denies_pem_and_ssh(tmp_path: Path) -> None:
     from codedoggy.tools.policy import WorkspacePolicy
@@ -502,7 +454,6 @@ def test_build_session_persists_turn(tmp_path: Path) -> None:
         goal="say ok",
         max_turns=3,
         main_client=main,
-        audit_client=audit,
         enable_memory=True,
         enable_session_store=True,
         memory_dir=tmp_path / "mem",
@@ -521,44 +472,6 @@ def test_build_session_persists_turn(tmp_path: Path) -> None:
     finally:
         s.close()
 
-
-def test_shell_write_triggers_mutation_audit(tmp_path: Path) -> None:
-    """Shell redirect / python open into cwd should produce a mutation."""
-    from codedoggy.tools import ToolCallContext, ToolRegistryBuilder
-    from codedoggy.tools.util.write_detect import (
-        detect_shell_write_paths,
-        record_shell_mutations,
-    )
-
-    assert detect_shell_write_paths('echo hi > out.txt')
-    assert detect_shell_write_paths(
-        "python -c \"open('wrote.txt','w',encoding='utf-8').write('x')\""
-    )
-    paths = detect_shell_write_paths(
-        "python -c \"open('wrote.txt','w',encoding='utf-8').write('x')\""
-    )
-    assert any("wrote" in p for p in paths)
-
-    (tmp_path / "redir.txt").write_text("via redirect detect", encoding="utf-8")
-    ctx2 = ToolCallContext(cwd=tmp_path)
-    ok = record_shell_mutations(
-        ctx2, "echo x > redir.txt", exit_ok=True, tool_name="run_terminal_cmd"
-    )
-    assert ok
-    mut = ctx2.extra.get("mutation")
-    assert mut is not None
-    assert "redir" in mut.path
-    assert mut.after and "redirect" in mut.after
-
-    (tmp_path / "wrote.txt").write_text("shell body", encoding="utf-8")
-    ctx3 = ToolCallContext(cwd=tmp_path)
-    ok3 = record_shell_mutations(
-        ctx3,
-        "python -c \"open('wrote.txt','w').write('shell body')\"",
-        exit_ok=True,
-    )
-    assert ok3
-    assert "wrote" in ctx3.extra["mutation"].path
 
 
 def test_main_prefetch_injects_session_hits(tmp_path: Path) -> None:
@@ -582,7 +495,6 @@ def test_main_prefetch_injects_session_hits(tmp_path: Path) -> None:
         goal="auth timeout",
         max_turns=3,
         main_client=main,
-        audit_client=audit,
         enable_memory=True,
         enable_session_store=True,
         memory_dir=tmp_path / "mem",
@@ -629,7 +541,6 @@ def test_cross_prompt_live_resume(tmp_path: Path) -> None:
         goal="auth work",
         max_turns=4,
         main_client=main,
-        audit_client=audit,
         enable_memory=False,
         enable_session_store=True,
         session_db=tmp_path / "state.db",

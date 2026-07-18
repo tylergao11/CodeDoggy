@@ -27,9 +27,15 @@ class ToolDescription:
 
 @dataclass(slots=True)
 class ListToolsContext:
-    """Per-turn context for listing/description (usually unused)."""
+    """Per-turn context for listing/description.
 
-    pass
+    Grok injects Resources (AvailableSkills, Cwd) at list-tools time.
+    Doggy passes optional ``cwd`` / ``extra`` so dynamic tools (skill) can
+    discover host state without a full Resource bag.
+    """
+
+    cwd: Path | None = None
+    extra: dict[str, Any] | None = None
 
 
 @dataclass(slots=True)

@@ -35,6 +35,7 @@ def register_builtins(builder: ToolRegistryBuilder) -> None:
     from codedoggy.tools.builtins.search_replace import SearchReplaceTool
     from codedoggy.tools.builtins.search_tool import SearchToolTool
     from codedoggy.tools.builtins.session_search import SessionSearchTool
+    from codedoggy.tools.builtins.skill import SkillTool
     from codedoggy.tools.builtins.parallel_tasks import ParallelTasksTool
     from codedoggy.tools.builtins.spawn_subagent import (
         GetSubagentOutputTool,
@@ -81,6 +82,8 @@ def register_builtins(builder: ToolRegistryBuilder) -> None:
     # MCP discovery / dispatch (host injects mcp_tools + mcp_dispatch)
     builder.register(SearchToolTool())
     builder.register(UseToolTool())
+    # Skills (SKILL.md discovery + substitution)
+    builder.register(SkillTool())
     # Scheduler
     builder.register(SchedulerCreateTool())
     builder.register(SchedulerDeleteTool())

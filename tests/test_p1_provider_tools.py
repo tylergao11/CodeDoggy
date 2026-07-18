@@ -95,8 +95,6 @@ def test_p1_bootstrap_wires_notes_when_env_set(
     s = build_session(
         tmp_path,
         main_client=_Client(),
-        audit_client=_Client(),
-        enable_audit=False,
         enable_graph=False,
         enable_policy=False,
         memory_dir=home / "memories",

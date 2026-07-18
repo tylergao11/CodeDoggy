@@ -109,7 +109,7 @@ class Session:
 
     @property
     def goal(self) -> str | None:
-        """Session-level intent anchor (resident audit + future memory select)."""
+        """Session-level intent anchor (goal mode + memory select)."""
         return self._goal
 
     def set_goal(self, goal: str | None) -> None:

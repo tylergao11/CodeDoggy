@@ -30,12 +30,8 @@ from codedoggy.context.memory_flush import (
 )
 from codedoggy.context.mode import CompactionMode
 from codedoggy.context.pruning import (
-    collect_p0_footers,
-    extract_audit_p0_footer,
-    has_audit_p0_footer,
     prune_oversized_tool_results,
     prune_retained_tool_results,
-    reinject_missing_p0,
 )
 from codedoggy.context.segments import compaction_dir, write_segment
 from codedoggy.context.suppress import CompactionSuppressor, SuppressLevel
@@ -66,12 +62,8 @@ __all__ = [
     "needs_compaction",
     "tokenizer_backend",
     "process_flush_response",
-    "collect_p0_footers",
-    "extract_audit_p0_footer",
-    "has_audit_p0_footer",
     "prune_oversized_tool_results",
     "prune_retained_tool_results",
-    "reinject_missing_p0",
     "run_memory_flush",
     "seed_messages",
     "should_flush",

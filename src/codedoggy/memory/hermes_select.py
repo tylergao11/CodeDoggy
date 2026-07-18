@@ -1,18 +1,17 @@
-"""Hermes-style multi-source memory selection for resident audit."""
+"""Hermes-style multi-source memory selection for turn prefetch."""
 
 from __future__ import annotations
 
 from typing import Any
 
-from codedoggy.audit.types import MemorySelectRequest, MemorySelectResult
+from codedoggy.memory.select_types import MemorySelectRequest, MemorySelectResult
 from codedoggy.memory.session_store import SessionStore
 
 
 class HermesMemorySelector:
     """Combine curated MEMORY/USER blocks + session FTS hits.
 
-    This is the production selector for CodeDoggy audit (and later main-agent
-    prefetch). Provider hits stay empty until external plugins land.
+    Used by main-agent prefetch. Provider hits stay empty until plugins fill them.
 
     Parameters
     ----------
@@ -55,7 +54,7 @@ class HermesMemorySelector:
             raw={
                 "source": "hermes",
                 "goal": request.goal,
-                "path": request.mutation.path,
+                "path": request.path,
                 "prefer_frozen": self.prefer_frozen,
                 "include_current_session": self.include_current_session,
                 "curated_n": len(curated),
@@ -74,14 +73,12 @@ class HermesMemorySelector:
                 if text and text.strip():
                     blocks.append(text.strip())
         else:
-            # Live path: mid-session writes visible without waiting for freeze.
             live_fn = getattr(self.curated_store, "live_system_prompt_blocks", None)
             if callable(live_fn):
                 text = live_fn()
                 if text and text.strip():
                     blocks.append(text.strip())
             else:
-                # Fallback: render individual live blocks if store is partial.
                 for key in ("user", "memory"):
                     fmt = getattr(self.curated_store, "format_live_block", None)
                     if callable(fmt):
@@ -96,37 +93,37 @@ class HermesMemorySelector:
         query = (
             (request.query_hint or "").strip()
             or (request.goal or "").strip()
-            or request.mutation.path
+            or (request.path or "").strip()
         )
+        if not query or query == "(prefetch)":
+            # Still allow query_hint / goal only
+            query = (
+                (request.query_hint or "").strip()
+                or (request.goal or "").strip()
+            )
         if not query:
             return []
         extra = request.extra or {}
-        # Roles: default user+assistant — exclude raw tool dumps from FTS hits
-        # unless the caller explicitly requests other roles.
         roles = extra.get("roles")
         if roles is None:
             roles = ["user", "assistant"]
         elif not roles:
-            roles = None  # explicit empty → no role filter
+            roles = None
         else:
             roles = [str(r) for r in roles]
 
         cwd = extra.get("cwd")
         cwd_s = str(cwd) if cwd else None
 
-        # Optional hard filter to one session (extra.session_id), else None.
         session_filter = extra.get("session_id")
         if isinstance(session_filter, str) and session_filter.strip():
             session_filter = session_filter.strip()
         else:
             session_filter = None
 
-        # include_current_session=False → cross-session only (exclude current).
-        # When True, prior turns of the same session_id may match (no exclude).
         exclude: str | None = None
         if not self.include_current_session and request.session_id:
             exclude = request.session_id
-            # Filtering *to* the excluded session is empty — drop the filter.
             if session_filter == exclude:
                 session_filter = None
 

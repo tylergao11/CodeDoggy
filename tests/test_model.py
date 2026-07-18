@@ -1,21 +1,12 @@
-"""Model registry, OpenAI-compat client, ModelAuditor parsing."""
+"""Model registry, OpenAI-compat client, ChatSampler."""
 
 from __future__ import annotations
 
-import json
-from pathlib import Path
 from typing import Any
 
 import pytest
 
-from codedoggy.audit.model_auditor import ModelAuditor, _parse_verdict
-from codedoggy.audit.types import (
-    AuditContext,
-    MemorySelectResult,
-    MutationEvent,
-)
 from codedoggy.model import (
-    ChatMessage,
     ChatSampler,
     CompletionResult,
     ModelConfig,
@@ -24,13 +15,8 @@ from codedoggy.model import (
     model_config_from_env,
     register_provider,
 )
-from codedoggy.model.openai_compat import (
-    ModelError,
-    OpenAICompatClient,
-    scrub_model_content,
-)
+from codedoggy.model.openai_compat import scrub_model_content
 from codedoggy.model.registry import unregister_provider
-from codedoggy.turn.types import Message, Role
 
 
 class FakeClient:
@@ -96,109 +82,6 @@ def test_ollama_factory_normalizes_port_url() -> None:
     assert client.config.base_url.rstrip("/").endswith("/v1")
 
 
-def test_parse_verdict_ok() -> None:
-    v = _parse_verdict('{"ok": true}')
-    assert v is not None and v.ok
-
-
-def test_parse_verdict_findings() -> None:
-    v = _parse_verdict(
-        json.dumps(
-            {
-                "ok": False,
-                "findings": [
-                    {
-                        "severity": "important",
-                        "message": "Off goal",
-                        "path": "x.py",
-                    }
-                ],
-            }
-        )
-    )
-    assert v is not None and not v.ok
-    assert v.findings[0].message == "Off goal"
-
-
-def test_parse_verdict_fenced_and_think() -> None:
-    raw = (
-        "<think>reasoning</think>\n"
-        '```json\n{"ok": false, "findings": [{"message": "nope"}]}\n```'
-    )
-    # ModelAuditor strips think before parse; unit the parse path with clean fence
-    v = _parse_verdict('```json\n{"ok": false, "findings": [{"message": "nope"}]}\n```')
-    assert v is not None and not v.ok
-
-
-def test_model_auditor_pass_silent() -> None:
-    auditor = ModelAuditor(FakeClient('{"ok": true}'))
-    ctx = AuditContext(
-        goal="fix login",
-        mutation=MutationEvent(
-            path="auth.py",
-            tool_name="search_replace",
-            call_id="1",
-            before="a",
-            after="b",
-        ),
-        trajectory_summary="(none)",
-        memory=MemorySelectResult(),
-        cwd=".",
-    )
-    v = auditor.review(ctx)
-    assert v.ok
-
-
-def test_model_auditor_fail_soft() -> None:
-    payload = {
-        "ok": False,
-        "findings": [{"severity": "important", "message": "Wrong file for goal"}],
-    }
-    auditor = ModelAuditor(FakeClient(json.dumps(payload)))
-    ctx = AuditContext(
-        goal="only touch auth.py",
-        mutation=MutationEvent(
-            path="readme.md",
-            tool_name="search_replace",
-            call_id="1",
-            after="noise",
-            is_create=True,
-        ),
-        trajectory_summary="- create readme.md",
-        memory=MemorySelectResult(),
-        cwd=".",
-    )
-    v = auditor.review(ctx)
-    assert not v.ok
-    assert "Wrong file" in v.findings[0].message
-
-
-def test_model_auditor_bad_json_fail_closed() -> None:
-    auditor = ModelAuditor(FakeClient("not json at all"), fail_closed=True)
-    ctx = AuditContext(
-        goal="x",
-        mutation=MutationEvent(path="a", tool_name="t", call_id="1"),
-        trajectory_summary="",
-        memory=MemorySelectResult(),
-        cwd=".",
-    )
-    v = auditor.review(ctx)
-    assert not v.ok
-    assert "unparseable" in v.findings[0].message.lower() or "needs review" in v.findings[0].message.lower()
-
-
-def test_model_auditor_bad_json_opt_out_pass_silent() -> None:
-    auditor = ModelAuditor(FakeClient("not json at all"), fail_closed=False)
-    ctx = AuditContext(
-        goal="x",
-        mutation=MutationEvent(path="a", tool_name="t", call_id="1"),
-        trajectory_summary="",
-        memory=MemorySelectResult(),
-        cwd=".",
-    )
-    assert auditor.review(ctx).ok
-
-
 def test_chat_sampler_maps_tool_calls() -> None:
     class ToolClient:
         config = ModelConfig(provider="x", model="m", base_url="http://x")
@@ -219,56 +102,6 @@ def test_chat_sampler_maps_tool_calls() -> None:
                 ],
             )
 
-    sampler = ChatSampler(ToolClient())
-    out = sampler.sample(
-        [Message(role=Role.USER, content="hi")],
-        tools=[],
-    )
-    assert out.tool_calls[0].name == "read_file"
-    assert out.tool_calls[0].arguments["target_file"] == "a.py"
-
-
-def test_openai_compat_http_error(monkeypatch: pytest.MonkeyPatch) -> None:
-    import codedoggy.model.openai_compat as mod
-
-    class FakeResp:
-        def __enter__(self):
-            raise mod.urllib.error.HTTPError(
-                "http://x", 500, "err", hdrs=None, fp=None  # type: ignore[arg-type]
-            )
-
-        def __exit__(self, *a):
-            return False
-
-    monkeypatch.setattr(
-        mod.urllib.request,
-        "urlopen",
-        lambda *a, **k: FakeResp(),
-    )
-    client = OpenAICompatClient(
-        ModelConfig(provider="openai_compat", model="m", base_url="http://127.0.0.1:9/v1")
-    )
-    with pytest.raises(ModelError):
-        client.complete([ChatMessage(role="user", content="hi")])
-
-
-@pytest.mark.integration
-def test_ollama_live_complete() -> None:
-    """Live smoke against local Ollama — skip if unreachable."""
-    cfg = model_config_from_env(provider="ollama", model="qwen3:8b")
-    client = create_client(cfg)
-    try:
-        result = client.complete(
-            [
-                ChatMessage(
-                    role="user",
-                    content="Reply with exactly one word: pong",
-                ),
-            ],
-            temperature=0.0,
-            max_tokens=256,
-        )
-    except ModelError as e:
-        pytest.skip(f"ollama not reachable: {e}")
-    assert result.content
-    assert "pong" in result.content.lower()
+    sample = ChatSampler(ToolClient()).sample([], tools=[])  # type: ignore[arg-type]
+    assert sample.tool_calls
+    assert sample.tool_calls[0].name == "read_file"

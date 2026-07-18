@@ -68,6 +68,9 @@ session.close
 | `commit_session_boundary` | `new_session` |
 | `on_session_close` | `close` |
 | `notify_curated_write` | MEMORY/USER 写后 / flush |
+| `on_delegation` | 父 session 子 agent completed（Hermes 父观察） |
+
+源码级对照表：[`hermes-memory-fidelity.md`](hermes-memory-fidelity.md)。
 
 ## 关键文件
 
@@ -75,11 +78,12 @@ session.close
 |------|------|
 | `memory/hermes_seam.py` | **唯一**生命周期编排入口 |
 | `memory/manager.py` | Hermes MemoryManager |
-| `memory/context_fence.py` | fence / ephemeral inject 原语 |
+| `memory/context_fence.py` | fence / ephemeral inject / StreamingContextScrubber |
 | `memory/store.py` | MEMORY.md / USER.md |
-| `memory/session_store.py` | FTS archive |
+| `memory/session_store.py` | FTS archive（Doggy 增强） |
 | `turn/runner.py` | turn 级 seam |
 | `turn/loop.py` | sample-time inject via seam |
 | `context/compactor.py` | pre_compress + rewound + flush notify |
 | `session/kernel.py` | new_session / close |
 | `bootstrap.py` | bind_session |
+| `orchestration/subagent.py` | completed → `on_delegation` |

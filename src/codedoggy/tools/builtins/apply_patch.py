@@ -193,7 +193,7 @@ def _apply_delete(ctx: ToolCallContext, hunk: DeleteFile) -> str:
 def _apply_update(ctx: ToolCallContext, hunk: UpdateFile) -> str:
     """Update in place, or Move: policy **both** paths before any write/delete.
 
-    Move mutations (Shadow can restore):
+    Move mutations:
       1. source delete (before=old content, after=None, is_delete)
       2. dest create/edit (before=prior dest or None, after=new content)
     """

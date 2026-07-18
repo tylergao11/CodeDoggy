@@ -222,6 +222,7 @@ def test_run_terminal_cmd_description_mentions_tree_kill(tmp_path: Path) -> None
     # Grok product client name
     desc = (defs.get("run_terminal_command") or defs["run_terminal_cmd"]).description or ""
     # Grok Timeout enforcement wording (Job Object on Windows; SIGTERM group on Unix).
-    # We also document taskkill /T as the practical Windows mechanism.
+    # No taskkill in product description (Grok has none).
     assert "Timeout enforcement" in desc or "timeout" in desc.lower()
-    assert "taskkill" in desc or "process group" in desc or "SIGTERM" in desc or "Job Object" in desc
+    assert "taskkill" not in desc
+    assert "process group" in desc or "SIGTERM" in desc or "Job Object" in desc

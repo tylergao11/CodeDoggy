@@ -7,6 +7,7 @@ import time
 from pathlib import Path
 from types import SimpleNamespace
 
+import codedoggy.tui.app as tui_app
 from prompt_toolkit.input.defaults import create_pipe_input
 from prompt_toolkit.output import DummyOutput
 from prompt_toolkit.utils import get_cwidth
@@ -14,8 +15,10 @@ from prompt_toolkit.utils import get_cwidth
 from codedoggy.session.types import TurnResult, TurnStatus
 from codedoggy.tui.app import (
     CodeDoggyTUI,
+    _compact_task_stage_text,
     _render_doggy_empty,
     _task_activity_text,
+    _task_status_style,
     _task_stage_text,
     agent_text_from_messages,
     task_report_from_agent,
@@ -72,7 +75,9 @@ def test_ledger_keeps_agents_under_their_task_and_exposes_parallel_stage() -> No
     ledger.set_task_phase(task.id, "parallel")
     snapshot = ledger.snapshots()[0]
     assert _task_stage_text(snapshot) == "2 个 Agent 并行中"
+    assert _compact_task_stage_text(snapshot) == "2 并行"
     assert _task_activity_text(snapshot) == "2 个 Agent 正在并行…"
+    assert _task_status_style(snapshot) == "class:task.status.running"
 
     ledger.update_agent(
         task.id,
@@ -82,7 +87,9 @@ def test_ledger_keeps_agents_under_their_task_and_exposes_parallel_stage() -> No
         output="实现完成",
     )
     ledger.set_task_phase(task.id, "reporting")
-    assert _task_stage_text(ledger.snapshots()[0]) == "MAIN 汇总中"
+    snapshot = ledger.snapshots()[0]
+    assert _task_stage_text(snapshot) == "MAIN 汇总中"
+    assert _task_status_style(snapshot) == "class:task.status.reporting"
 
 
 def test_agent_detail_contains_assistant_output_not_tool_records() -> None:
@@ -109,16 +116,36 @@ def test_task_report_is_the_agents_first_brief_paragraph() -> None:
     assert task_report_from_agent("x" * 400).endswith("…")
 
 
-def test_empty_state_renders_speeding_frenchie_without_overflow() -> None:
-    first = "".join(fragment[1] for fragment in _render_doggy_empty(36, now=0.0))
-    moving = "".join(fragment[1] for fragment in _render_doggy_empty(36, now=0.25))
+def test_empty_state_is_only_neon_doggy_city_art_without_overflow() -> None:
+    narrow_fragments = _render_doggy_empty(36, now=0.0)
+    pulse_fragments = _render_doggy_empty(36, now=0.25)
+    wide_fragments = _render_doggy_empty(80, now=0.0)
+    narrow = "".join(fragment[1] for fragment in narrow_fragments)
+    wide = "".join(fragment[1] for fragment in wide_fragments)
 
-    assert "CODEDOGGY" not in first
-    assert "风驰电掣" not in first and "并行开工" not in first
-    assert "D   o   g   g   y" in first
-    assert "ᴥ" in first and "════════" in first
-    assert first != moving
-    assert all(get_cwidth(line) <= 36 for line in first.splitlines())
+    assert "— DOGGY —" in narrow
+    assert "D   o   g   g   y" not in narrow
+    for accidental_label in (
+        "DOGGY DRIVE",
+        "SPEED",
+        "GEAR",
+        "HEAT",
+        "SWAG",
+        "[A/D]",
+        "[W]",
+        "[S]",
+        "[Q]",
+        "风驰电掣",
+        "并行开工",
+    ):
+        assert accidental_label not in narrow
+    styles = " ".join(fragment[0] for fragment in wide_fragments)
+    assert "#16dfe5" in styles
+    assert "#f12698" in styles
+    assert "#ffc21a" in styles
+    assert narrow_fragments != pulse_fragments
+    assert all(get_cwidth(line) <= 36 for line in narrow.splitlines())
+    assert all(get_cwidth(line) <= 80 for line in wide.splitlines())
 
 
 def test_parallel_runtime_uses_child_descriptions_as_clickable_participants() -> None:
@@ -160,6 +187,89 @@ def test_parallel_runtime_uses_child_descriptions_as_clickable_participants() ->
         assert _task_stage_text(snapshot) == "3 个 Agent 并行中"
         rendered = "".join(fragment[1] for fragment in tui._render_tasks())
         assert "API 入口" in rendered and "交互验证" in rendered
+        assert rendered.count("╭") >= 3
+        assert "正在检查 API" in rendered
+        assert "正在验证交互" in rendered
+
+
+def test_task_panel_keeps_reference_layout_across_terminal_widths(
+    monkeypatch: object,
+) -> None:
+    with create_pipe_input() as pipe_input:
+        tui = CodeDoggyTUI(_Session(), input=pipe_input, output=DummyOutput())
+        task = tui.ledger.create("CLI 内部任务面板美术设计")
+        tui.ledger.update_agent(
+            task.id,
+            "sub_builder",
+            label="builder",
+            status="running",
+            output="正在实现任务面板与状态样式。",
+        )
+        tui.ledger.update_agent(
+            task.id,
+            "sub_tester",
+            label="tester",
+            status="pending",
+            output="测试计划已准备，等待可执行版本。",
+        )
+        tui.ledger.set_task_phase(task.id, "parallel")
+
+        monkeypatch.setattr(tui_app, "_terminal_height", lambda: 36)  # type: ignore[attr-defined]
+        for width in (20, 24, 32, 36, 48, 80, 120):
+            monkeypatch.setattr(  # type: ignore[attr-defined]
+                tui_app,
+                "_terminal_width",
+                lambda width=width: width,
+            )
+            rendered = "".join(fragment[1] for fragment in tui._render_tasks())
+            assert all(get_cwidth(line) <= width for line in rendered.splitlines())
+            header = "".join(fragment[1] for fragment in tui._render_header())
+            assert get_cwidth(header) <= width
+            assert header.startswith("  CODEDOGGY")
+            assert "main ·" not in header
+            assert "▼" in rendered
+            expected_stage = "3 并行" if width < 36 else "3 个 Agent 并行中"
+            assert expected_stage in rendered
+            if width >= 36:
+                assert "BUILDER" in rendered and "TESTER" in rendered
+            else:
+                assert "BUI" in rendered and "TES" in rendered
+            assert "正在实现" in rendered
+            assert "测试计划" in rendered
+
+        assert "正在实现任务面板与状态样式。" in rendered
+        assert "测试计划已准备，等待可执行版本。" in rendered
+
+
+def test_running_status_and_feedback_fit_narrow_terminals(monkeypatch: object) -> None:
+    with create_pipe_input() as pipe_input:
+        tui = CodeDoggyTUI(_Session(), input=pipe_input, output=DummyOutput())
+        task = tui.ledger.create("并行状态栏宽度验证")
+        tui._active_task_id = task.id
+        tui._task_started_at = time.monotonic() - 2.0
+        monkeypatch.setattr(tui, "_is_running", lambda: True)  # type: ignore[attr-defined]
+
+        for width in (20, 24, 32, 36, 48, 80, 120):
+            monkeypatch.setattr(  # type: ignore[attr-defined]
+                tui_app,
+                "_terminal_width",
+                lambda width=width: width,
+            )
+            status = "".join(fragment[1] for fragment in tui._render_turn_status())
+            assert get_cwidth(status) <= width
+            expected_stop = "[停]" if width < 36 else "[停止]"
+            assert expected_stop in status
+
+        monkeypatch.setattr(tui, "_is_running", lambda: False)  # type: ignore[attr-defined]
+        tui._set_feedback("MAIN 已完成一段非常长的任务汇总反馈", "success")
+        for width in (20, 24, 32, 36):
+            monkeypatch.setattr(  # type: ignore[attr-defined]
+                tui_app,
+                "_terminal_width",
+                lambda width=width: width,
+            )
+            feedback = "".join(fragment[1] for fragment in tui._render_turn_status())
+            assert get_cwidth(feedback) <= width
 
 
 def test_full_screen_agent_window_is_opaque_and_interactive() -> None:
@@ -192,7 +302,8 @@ def test_full_screen_agent_window_is_opaque_and_interactive() -> None:
         assert _wait_until(lambda: tui.ledger.snapshots()[0].phase == "done")
         task_text = "".join(fragment[1] for fragment in tui._render_tasks())
         assert "已完成 · 1 个 Agent" in task_text
-        assert "└─ MAIN" in task_text
+        assert "│ MAIN  › │" in task_text
+        assert "已完成：实现 CLI" in task_text
 
         pipe_input.send_text("\t\r")
         assert _wait_until(lambda: tui._modal_open)
