@@ -63,8 +63,11 @@ def create_client(config: ModelConfig, *, require_auth: bool | None = None) -> C
     False for api_key providers. Pass explicitly to override.
     """
     from codedoggy.model.auth.resolve import apply_auth_to_config
+    from codedoggy.model.context_limits import ensure_model_context_window
 
     cfg = apply_auth_to_config(config, require=require_auth)
+    # Always re-derive window from provider+model (never trust a stale 32k).
+    cfg = ensure_model_context_window(cfg)
     key = (cfg.provider or "openai_compat").strip().lower()
     canon = resolve_profile_name(key) or key
     profile = get_profile(key) or get_profile(canon)
@@ -131,21 +134,23 @@ def model_config_from_env(
     if prov == "ollama":
         resolved_base = _normalize_ollama_base(resolved_base)
 
+    resolved_model = (
+        model
+        or os.environ.get("CODEDOGGY_MODEL")
+        or default_model
+    ).strip()
+    from codedoggy.model.context_limits import ensure_model_context_window
+
     # Leave api_key as explicit only; create_client / apply_auth fills OAuth.
     cfg = ModelConfig(
         provider=prov,
-        model=(
-            model
-            or os.environ.get("CODEDOGGY_MODEL")
-            or default_model
-        ).strip(),
+        model=resolved_model,
         base_url=str(resolved_base).strip(),
         api_key=api_key if api_key is not None else os.environ.get("CODEDOGGY_API_KEY"),
         temperature=_env_float("CODEDOGGY_TEMPERATURE", 0.2),
         max_tokens=_env_int("CODEDOGGY_MAX_TOKENS", None),
         timeout_s=_env_float("CODEDOGGY_TIMEOUT_S", 120.0) or 120.0,
-        context_window=_env_int("CODEDOGGY_CONTEXT_WINDOW", None)
-        or _env_int("CODEDOGGY_CONTEXT_MAX_TOKENS", 32768),
+        context_window=None,  # filled by ensure_model_context_window
         extra=_reasoning_extra_from_env(),
     )
     # Soft hydrate: fill tokens when present; do not raise LoginRequired here
@@ -156,7 +161,7 @@ def model_config_from_env(
         cfg = apply_auth_to_config(cfg, require=False)
     except Exception:  # noqa: BLE001
         logger.debug("auth hydrate skipped", exc_info=True)
-    return cfg
+    return ensure_model_context_window(cfg)
 
 
 def _reasoning_extra_from_env() -> dict[str, Any]:

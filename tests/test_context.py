@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from codedoggy.context import (
     COMPACTION_PREFIX,
     CompactionMode,
@@ -512,12 +514,17 @@ def test_loop_compacts_before_sample(tmp_path: Path) -> None:
     assert systems and "KEEP_SYSTEM" in systems[0]
 
 
-def test_runner_binds_model_window_from_sampler(tmp_path: Path) -> None:
-    """AgentTurnRunner residual: ModelConfig.context_window → compactor budget."""
+def test_runner_binds_model_window_from_sampler(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AgentTurnRunner residual: ModelConfig window → compactor budget."""
     from codedoggy.model.types import ModelConfig
     from codedoggy.tools import ToolRegistryBuilder
     from codedoggy.turn.runner import AgentTurnRunner, _bind_compactor_model_window
     from codedoggy.turn.types import SampleResult
+
+    # Env is the only hard override; product no longer trusts a bare 32k on config.
+    monkeypatch.setenv("CODEDOGGY_CONTEXT_WINDOW", "32000")
 
     class FakeClient:
         def __init__(self) -> None:

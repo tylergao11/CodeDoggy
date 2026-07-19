@@ -19,10 +19,11 @@ from codedoggy.context.tokens import (
 )
 from codedoggy.turn.types import Message
 
-# Grok-like defaults when model profile omits context_window
-DEFAULT_CONTEXT_WINDOW = 32_768
+# Last-resort only when provider+model cannot be resolved (see context_limits).
+from codedoggy.model.context_limits import DEFAULT_CONTEXT_WINDOW
+
 DEFAULT_COMPLETION_RESERVE = 4_096
-DEFAULT_THRESHOLD_PERCENT = 85  # Grok intra trigger_threshold_percent default
+DEFAULT_THRESHOLD_PERCENT = 85
 
 
 @dataclass(slots=True)
@@ -122,19 +123,31 @@ class ContextBudget:
         *,
         context_window: int | None = None,
         completion_reserve: int | None = None,
+        provider: str | None = None,
+        model: str | None = None,
+        base_url: str | None = None,
     ) -> ContextBudget:
         pct = _env_int("CODEDOGGY_CONTEXT_THRESHOLD_PERCENT", 0)
         if not pct:
             pct = DEFAULT_THRESHOLD_PERCENT
         target = _env_int("CODEDOGGY_CONTEXT_TARGET_PERCENT", 50) or 50
-        win = context_window or _env_int(
-            "CODEDOGGY_CONTEXT_WINDOW",
-            _env_int("CODEDOGGY_CONTEXT_MAX_TOKENS", DEFAULT_CONTEXT_WINDOW)
-            or DEFAULT_CONTEXT_WINDOW,
-        )
+        if context_window and int(context_window) > 0:
+            win = int(context_window)
+        else:
+            from codedoggy.model.context_limits import resolve_context_window
+
+            # Prefer explicit connection identity; else env CODEDOGGY_PROVIDER/MODEL.
+            win = resolve_context_window(
+                provider or os.environ.get("CODEDOGGY_PROVIDER"),
+                model or os.environ.get("CODEDOGGY_MODEL"),
+                base_url=base_url or os.environ.get("CODEDOGGY_BASE_URL"),
+                probe=True,
+            )
         # Explicit CODEDOGGY_CONTEXT_MAX_CHARS only as last-resort window≈chars/4
-        if not context_window and not os.environ.get("CODEDOGGY_CONTEXT_WINDOW") and not os.environ.get(
-            "CODEDOGGY_CONTEXT_MAX_TOKENS"
+        if (
+            not context_window
+            and not os.environ.get("CODEDOGGY_CONTEXT_WINDOW")
+            and not os.environ.get("CODEDOGGY_CONTEXT_MAX_TOKENS")
         ):
             mc = _env_int("CODEDOGGY_CONTEXT_MAX_CHARS", 0)
             if mc > 0:

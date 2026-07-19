@@ -62,12 +62,12 @@ Reminder list for model-facing tool contracts. Not orchestration (turn/session).
 - [x] Auto-background on long FG wait (flag `BASH_AUTO_BACKGROUND_ON_TIMEOUT`, default off)
 - [x] Trailing `&` rejection (use is_background=true instead)
 - [x] Timeout process-tree / process-group kill (honest description)
-- [x] Persistent shell state (cwd/env probe; Grok full FD dump = A/X)
-- [x] Exit-code formatting: `exit: N` / `exit: killed (timeout)` (+ Grok truncated annotations)
+- [x] Persistent shell state (cwd/env probe)
+- [x] Exit-code formatting: `exit: N` / `exit: killed (timeout)` (+ truncated annotations)
 - [x] Auto-bg card: `[Command moved to background]` + partial output + output file
 - [x] `get_task_output` / `kill_task` (bash + subagent unified lookup; product renames)
-- [x] memory_get Grok body: `**File:**` / `**Lines:**` / `N→`
-- [x] memory_search Grok body: `### Result N (score, source)`
+- [x] memory_get body: `**File:**` / `**Lines:**` / `N→`
+- [x] memory_search body: `### Result N (score, source)`
 
 ## Grep / search
 
@@ -77,7 +77,7 @@ Reminder list for model-facing tool contracts. Not orchestration (turn/session).
 - [x] Workspace result wrappers / “Found N matching lines”
 - [ ] Deny globs / ignore wiring
 
-## Orchestration tools (GrokBuild)
+## Orchestration tools
 
 - [x] `todo_write` (merge/replace)
 - [x] `update_goal` (message / completed / blocked)
@@ -93,9 +93,9 @@ Reminder list for model-facing tool contracts. Not orchestration (turn/session).
 - [x] MCP dynamic tools (search_tool / use_tool + host-injected catalog)
 - [x] Web search / web fetch (SSRF; DDG / custom search backend)
 - [x] Monitor / scheduler (session scheduler; host polls due_tasks / `host.scheduler_tick`)
-- [x] Memory search/get (separate from Hermes memory write tool)
+- [x] Memory search/get (separate from curated `memory` write tool)
 - [ ] LSP tool (code_nav graph remains default navigation)
-- [ ] Image/video gen (needs Imagine API wiring)
+- [x] Image/video gen (follow ActiveConnection; endpoint capability gates)
 
 ## Explicitly NOT tool-class (remind separately)
 

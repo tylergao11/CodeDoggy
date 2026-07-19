@@ -304,6 +304,11 @@ class ContextCompactor:
         memory_store: Any | None = None,
         session_store: Any | None = None,
         memory_manager: Any | None = None,
+        budget: ContextBudget | None = None,
+        provider: str | None = None,
+        model: str | None = None,
+        base_url: str | None = None,
+        context_window: int | None = None,
     ) -> ContextCompactor:
         mode = CompactionMode.parse(os.environ.get("CODEDOGGY_COMPACTION_MODE", "summary"))
         flush_on = os.environ.get("CODEDOGGY_MEMORY_FLUSH", "1").strip().lower() not in {
@@ -318,8 +323,15 @@ class ContextCompactor:
             "off",
             "no",
         }
+        if budget is None:
+            budget = ContextBudget.from_env(
+                context_window=context_window,
+                provider=provider,
+                model=model,
+                base_url=base_url,
+            )
         return cls(
-            budget=ContextBudget.from_env(),
+            budget=budget,
             mode=mode,
             flush_config=MemoryFlushConfig(enabled=flush_on),
             summary_client=summary_client,

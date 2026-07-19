@@ -14,6 +14,7 @@ from typing import Any, Literal
 
 from codedoggy.model.auth import auth_kind_for_provider, auth_status, is_imperial
 from codedoggy.model.chat_sampler import ChatSampler
+from codedoggy.model.context_limits import ensure_model_context_window
 from codedoggy.model.profile_registry import get_profile
 from codedoggy.model.provider_switch import rewrite_system_model_identity
 from codedoggy.model.registry import create_client, model_config_from_env
@@ -260,13 +261,13 @@ class ConnectionService:
             cfg = model_config_from_env(provider=prov, model=mod)
             if prov != cur.provider:
                 cfg = _clean_cross_provider_config(cfg, provider=prov)
+            # After cross-provider base_url clean, re-derive window once.
+            cfg = ensure_model_context_window(cfg)
             # Preserve session sampling knobs when env does not override.
             if cfg.temperature is None:
                 cfg = replace_config(cfg, temperature=cur.temperature)
             if cfg.max_tokens is None and cur.max_tokens is not None:
                 cfg = replace_config(cfg, max_tokens=cur.max_tokens)
-            if cfg.context_window is None and cur.context_window is not None:
-                cfg = replace_config(cfg, context_window=cur.context_window)
 
             try:
                 # Ollama is deliberately credential-free.  The TUI hard auth

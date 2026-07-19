@@ -1,4 +1,7 @@
-"""CodeDoggy CLI: parallel-first task cockpit with a plain fallback."""
+"""Doggy CLI: parallel-first task cockpit with a plain fallback.
+
+Install entry point: ``doggy``.
+"""
 
 from __future__ import annotations
 
@@ -12,8 +15,8 @@ from codedoggy.model.profiles import model_profiles_from_env
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        prog="codedoggy",
-        description="CodeDoggy parallel coding agent",
+        prog="doggy",
+        description="Doggy — coding agent cockpit",
     )
     parser.add_argument(
         "prompt",

@@ -8,6 +8,7 @@ import threading
 import time
 from collections.abc import Callable
 from itertools import groupby
+from pathlib import Path
 from typing import Any
 
 from prompt_toolkit.application import Application
@@ -26,6 +27,7 @@ from prompt_toolkit.layout import (
     VSplit,
     Window,
 )
+from prompt_toolkit.layout.dimension import Dimension
 from prompt_toolkit.layout.margins import ScrollbarMargin
 from prompt_toolkit.layout.screen import Point
 from prompt_toolkit.layout.processors import (
@@ -40,6 +42,11 @@ from prompt_toolkit.utils import get_cwidth
 from prompt_toolkit.widgets import TextArea
 
 from codedoggy.session.types import SessionPhase, TurnStatus
+from codedoggy.tui.clipboard_image import (
+    get_system_clipboard_text,
+    insert_path_token,
+    save_clipboard_image,
+)
 from codedoggy.tui.agent_detail import (
     DETAIL_FILTERS,
     DETAIL_FILTER_LABELS,
@@ -138,6 +145,9 @@ def _live_messages_signature(messages: list[Any]) -> tuple[Any, ...]:
 # Box + doggy motif (rounded frames ∪･ω･∪ are the visual signature).
 _DOG_FACE = "∪･ω･∪"
 _DOG_EAR = "∪"
+_INPUT_MAX_LINES = 8
+_DETAIL_INPUT_MAX_LINES = 6
+_TASK_BRIEF_LINES = 2  # brief agent output rows under each task card
 _DOG_PAW = "ᕱ"
 
 
@@ -274,13 +284,16 @@ class CodeDoggyTUI:
         self._selected_agent_by_task: dict[str, int] = {}
         self._agent_refs: list[tuple[str, str]] = []
         self._selected_line = 0
+        self._task_line_count = 1  # clamp cursor y — PT crashes if y >= line_count
+        self._pinned_task_for_line: int | None = None  # re-pin only on task change
         self._modal_open = False
         self._modal_kind: str = "agent"  # agent | auth
         self._modal_ref: tuple[str, str] | None = None
         self._detail_messages: dict[tuple[str, str], list[Any]] = {}
         self._detail_filter: DetailFilter = "all"
         self._detail_cursor_line = 0
-        self._detail_line_count = 1
+        self._detail_line_count = 1  # clamp detail cursor y — same class as task crash
+        self._redraw_pending = False
         self._closing = False
         self._task_started_at: float | None = None
         self._quit_armed_until = 0.0
@@ -301,6 +314,11 @@ class CodeDoggyTUI:
         self._startup_brand = not bool(
             initial_prompt and str(initial_prompt).strip()
         )
+        # before_render throttle + splash cache (ESC/modal close snappiness)
+        self._last_sync_runtime_at = 0.0
+        self._doggy_empty_cache: tuple[tuple[Any, ...], StyleAndTextTuples] | None = None
+        # Keep the newest task card fully in view until the user scrolls away.
+        self._follow_latest_task = True
         # Live tool/activity lines from on_live_message (effect layer, not truth).
         self._activity = LiveActivityBoard()
         self._subagent_listener_bound = False
@@ -312,17 +330,23 @@ class CodeDoggyTUI:
             text=self._render_tasks,
             focusable=True,
             show_cursor=False,
-            get_cursor_position=lambda: Point(x=0, y=self._selected_line),
+            get_cursor_position=self._task_cursor_position,
         )
         self._task_window = Window(
             content=self._task_control,
-            wrap_lines=True,
-            scroll_offsets=ScrollOffsets(top=1, bottom=2),
+            wrap_lines=False,  # line y == content row; wrap broke scroll/cursor map
+            scroll_offsets=ScrollOffsets(top=1, bottom=3),
+            right_margins=[ScrollbarMargin(display_arrows=True)],
             style="class:root",
+            dont_extend_height=False,
         )
         self._input = TextArea(
-            height=1,
-            multiline=False,
+            # Grow with wrapped content so long prompts stay readable.
+            height=self._main_input_height,
+            multiline=True,
+            wrap_lines=True,
+            scrollbar=True,
+            dont_extend_height=True,
             prompt=self._render_prompt_prefix,
             style="class:input",
             accept_handler=self._accept_prompt,
@@ -336,11 +360,13 @@ class CodeDoggyTUI:
                 )
             ],
         )
+        # Height follows content; re-layout on every edit.
+        self._input.buffer.on_text_changed += lambda _buf: self._invalidate_safe()
         self._detail_control = FormattedTextControl(
             text=self._render_modal_body,
             focusable=True,
             show_cursor=False,
-            get_cursor_position=lambda: Point(x=0, y=self._detail_cursor_line),
+            get_cursor_position=self._detail_cursor_position,
         )
         self._detail_window = Window(
             content=self._detail_control,
@@ -350,8 +376,11 @@ class CodeDoggyTUI:
             style="class:agent-window",
         )
         self._detail_input = TextArea(
-            height=1,
-            multiline=False,
+            height=self._detail_input_height,
+            multiline=True,
+            wrap_lines=True,
+            scrollbar=True,
+            dont_extend_height=True,
             prompt=self._render_detail_prompt_prefix,
             style="class:detail.input",
             accept_handler=self._accept_detail_prompt,
@@ -409,6 +438,9 @@ class CodeDoggyTUI:
                 ),
             ],
         )
+        self._detail_input.buffer.on_text_changed += (
+            lambda _buf: self._invalidate_safe()
+        )
 
         header = Window(
             FormattedTextControl(self._render_header),
@@ -433,8 +465,9 @@ class CodeDoggyTUI:
         prompt_right = Window(
             FormattedTextControl(self._render_prompt_right),
             width=3,
-            height=1,
+            # Match multi-line input height (no fixed height=1).
             style="class:root",
+            dont_extend_width=True,
         )
         prompt_bottom = Window(
             FormattedTextControl(self._render_prompt_bottom),
@@ -597,11 +630,16 @@ class CodeDoggyTUI:
             full_screen=True,
             mouse_support=True,
             color_depth=ColorDepth.TRUE_COLOR,
+            # 10Hz while busy; idle refresh still runs but _sync_runtime self-throttles.
             refresh_interval=0.10,
-            before_render=lambda _: self._sync_runtime(),
+            before_render=lambda _: self._before_render(),
             input=input,
             output=output,
         )
+        # Esc vs CSI (arrows) ambiguity: prompt_toolkit defaults ttimeoutlen=0.5s,
+        # so Esc feels half a second slower than clicking × (mouse skips this wait).
+        # 50ms is enough to disambiguate real escape sequences on modern terminals.
+        self.app.ttimeoutlen = 0.05
 
     def run(self) -> None:
         def pre_run() -> None:
@@ -696,7 +734,6 @@ class CodeDoggyTUI:
             if metadata.get("tui_task_id"):
                 return
             task = self.ledger.create(str(getattr(request, "text", "") or ""))
-            self._selected_task = max(0, len(self.ledger.snapshots()) - 1)
             task_id = task.id
             main_id = f"{task_id}:main"
             messages: list[Any] = []
@@ -709,7 +746,7 @@ class CodeDoggyTUI:
             def on_live_message(message: Any) -> None:
                 if not callback_state["active"] or self._closing:
                     return
-                messages.append(message)
+                # Ledger/activity are lock-safe; message list + paint are UI-only.
                 line = self._activity.observe(task_id, main_id, message)
                 if line:
                     self.ledger.update_live_agent(
@@ -725,11 +762,14 @@ class CodeDoggyTUI:
                     and not self._closing
                 ):
                     prior_live(message)
-                if callback_state["active"] and not self._closing:
-                    try:
-                        self.app.invalidate()
-                    except Exception:  # noqa: BLE001
-                        pass
+
+                def apply() -> None:
+                    if not callback_state["active"] or self._closing:
+                        return
+                    messages.append(message)
+                    self._request_redraw()
+
+                self._call_in_ui_thread(apply)
 
             def on_delta(piece: str) -> bool:
                 if not callback_state["active"] or self._closing:
@@ -751,34 +791,42 @@ class CodeDoggyTUI:
                     return False
                 prior_result = prior_delta(piece) if callable(prior_delta) else True
                 if should_emit and callback_state["active"] and not self._closing:
-                    try:
-                        self.app.invalidate()
-                    except Exception:  # noqa: BLE001
-                        pass
+                    self._request_redraw()
                 return (
                     prior_result is not False
                     and callback_state["active"]
                     and not self._closing
                 )
 
-            with self._view_lock:
-                previous_active = self._active_task_id
-                previous_started = self._task_started_at
-                self._external_turn_views[key] = {
-                    "task_id": task_id,
-                    "messages": messages,
-                    "streamed": streamed,
-                    "callback_state": callback_state,
-                    "previous_active": previous_active,
-                    "previous_started": previous_started,
+            def apply_start() -> None:
+                if self._closing:
+                    return
+                with self._view_lock:
+                    previous_active = self._active_task_id
+                    previous_started = self._task_started_at
+                    self._external_turn_views[key] = {
+                        "task_id": task_id,
+                        "messages": messages,
+                        "streamed": streamed,
+                        "callback_state": callback_state,
+                        "previous_active": previous_active,
+                        "previous_started": previous_started,
+                    }
+                    self._active_task_id = task_id
+                    self._task_started_at = time.monotonic()
+                self._selected_task = max(0, len(self.ledger.snapshots()) - 1)
+                self._follow_latest_task = True
+                self._detail_messages[(task_id, main_id)] = messages
+                self._activity.clear_task(task_id)
+                self._subagent_baselines[task_id] = {
+                    item.subagent_id for item in self._subagents()
                 }
-                self._active_task_id = task_id
-                self._task_started_at = time.monotonic()
-            self._detail_messages[(task_id, main_id)] = messages
-            self._activity.clear_task(task_id)
-            self._subagent_baselines[task_id] = {
-                item.subagent_id for item in self._subagents()
-            }
+                self._dismiss_startup_brand()
+                self._set_feedback("后台任务已进入 MAIN", "info")
+                self._invalidate_safe()
+
+            # Stream callbacks must be installed before the turn body runs.
+            # View bookkeeping (selection / detail map / invalidate) is UI-only.
             metadata.update(
                 {
                     "tui_task_id": task_id,
@@ -787,9 +835,7 @@ class CodeDoggyTUI:
                     "on_live_message": on_live_message,
                 }
             )
-            self._dismiss_startup_brand()
-            self._set_feedback("后台任务已进入 MAIN", "info")
-            self.app.invalidate()
+            self._call_in_ui_thread(apply_start)
             return
 
         if event != "end":
@@ -802,11 +848,14 @@ class CodeDoggyTUI:
         task_id = str(state["task_id"])
         main_id = f"{task_id}:main"
         messages = list(state["messages"])
+        streamed = list(state["streamed"])
+        previous_active = state["previous_active"]
+        previous_started = state["previous_started"]
         output = agent_summary_text_from_messages(messages)
         if not output:
             output = str(
                 getattr(result, "final_text", None)
-                or "".join(state["streamed"])
+                or "".join(streamed)
                 or getattr(result, "error", None)
                 or ""
             ).strip()
@@ -831,16 +880,22 @@ class CodeDoggyTUI:
             task_id,
             "completed" if status == "completed" else status,
         )
-        self._sync_runtime()
-        with self._view_lock:
-            if self._active_task_id == task_id:
-                self._active_task_id = state["previous_active"]
-                self._task_started_at = state["previous_started"]
-        self._set_feedback(
-            "后台任务已完成" if status == "completed" else "后台任务未完成",
-            "success" if status == "completed" else "warning",
-        )
-        self.app.invalidate()
+
+        def apply_end() -> None:
+            if self._closing:
+                return
+            self._sync_runtime()
+            with self._view_lock:
+                if self._active_task_id == task_id:
+                    self._active_task_id = previous_active
+                    self._task_started_at = previous_started
+            self._set_feedback(
+                "后台任务已完成" if status == "completed" else "后台任务未完成",
+                "success" if status == "completed" else "warning",
+            )
+            self._invalidate_safe()
+
+        self._call_in_ui_thread(apply_end)
 
     def _bind_subagent_listener(self) -> None:
         if self._subagent_listener_bound:
@@ -886,6 +941,29 @@ class CodeDoggyTUI:
             return
         # Unit tests and pre-run callbacks have no application loop yet.
         callback()
+
+    def _request_redraw(self) -> None:
+        """Coalesce cross-thread invalidates onto the UI loop (one per turn)."""
+        if self._closing:
+            return
+
+        def schedule() -> None:
+            if self._closing or self._redraw_pending:
+                return
+            self._redraw_pending = True
+
+            def flush() -> None:
+                self._redraw_pending = False
+                if not self._closing:
+                    self._invalidate_safe()
+
+            loop = getattr(self.app, "loop", None)
+            if loop is not None and not loop.is_closed():
+                loop.call_soon(flush)
+            else:
+                flush()
+
+        self._call_in_ui_thread(schedule)
 
     def _apply_subagent_live(self, snap: Any, message: Any = None) -> None:
         """Same-tier push path for child agents (mirrors MAIN on_live_message)."""
@@ -961,6 +1039,47 @@ class CodeDoggyTUI:
             and self._modal_kind == "auth"
             and self._auth_wizard.step == WizardStep.PASTE
         )
+        # Main prompt or detail interject (not auth token paste).
+        prompt_paste = Condition(
+            lambda: (
+                get_app().layout.has_focus(self._input)
+                or (
+                    self._modal_open
+                    and self._modal_kind == "agent"
+                    and get_app().layout.has_focus(self._detail_input)
+                )
+            )
+        )
+        main_input_focused = Condition(
+            lambda: (not self._modal_open) and get_app().layout.has_focus(self._input)
+        )
+        detail_input_focused = Condition(
+            lambda: self._modal_open and get_app().layout.has_focus(self._detail_input)
+        )
+
+        @keys.add("c-v", filter=prompt_paste, eager=True)
+        @keys.add("s-insert", filter=prompt_paste, eager=True)
+        def _paste_image_or_text(event: Any) -> None:
+            """Clipboard image → save file → insert path; else OS/text paste."""
+            self._paste_into_buffer(event)
+
+        # Multiline TextArea defaults to Enter=newline; product wants Enter=send.
+        # Hard newline: Esc then Enter (prompt_toolkit multiline convention).
+        @keys.add("enter", filter=main_input_focused, eager=True)
+        def _submit_main_input(event: Any) -> None:
+            self._input.buffer.validate_and_handle()
+
+        @keys.add("escape", "enter", filter=main_input_focused, eager=True)
+        def _newline_main_input(event: Any) -> None:
+            event.current_buffer.newline(copy_margin=False)
+
+        @keys.add("enter", filter=detail_input_focused, eager=True)
+        def _submit_detail_input(event: Any) -> None:
+            self._detail_input.buffer.validate_and_handle()
+
+        @keys.add("escape", "enter", filter=detail_input_focused, eager=True)
+        def _newline_detail_input(event: Any) -> None:
+            event.current_buffer.newline(copy_margin=False)
 
         @keys.add("tab", filter=~modal)
         def _next_task_or_focus(event: Any) -> None:
@@ -968,9 +1087,11 @@ class CodeDoggyTUI:
                 self._render_tasks()
                 if self._task_refs:
                     event.app.layout.focus(self._task_window)
+                    event.app.invalidate()
             else:
                 self._move_task(1)
                 event.app.layout.focus(self._task_window)
+                event.app.invalidate()
 
         @keys.add("s-tab", filter=~modal)
         def _previous_task_or_focus(event: Any) -> None:
@@ -978,9 +1099,11 @@ class CodeDoggyTUI:
                 self._render_tasks()
                 if self._task_refs:
                     event.app.layout.focus(self._task_window)
+                    event.app.invalidate()
             else:
                 self._move_task(-1)
                 event.app.layout.focus(self._task_window)
+                event.app.invalidate()
 
         @keys.add("tab", filter=agent_modal)
         @keys.add("s-tab", filter=agent_modal)
@@ -1072,6 +1195,16 @@ class CodeDoggyTUI:
         @keys.add("space", filter=tasks_focused)
         def _focus_prompt(event: Any) -> None:
             event.app.layout.focus(self._input)
+            # Drop yellow selection chrome until Tab returns to the task list.
+            event.app.invalidate()
+
+        @keys.add("pageup", filter=tasks_focused)
+        def _tasks_page_up(_: Any) -> None:
+            self._scroll_tasks(-max(4, _terminal_height() // 2))
+
+        @keys.add("pagedown", filter=tasks_focused)
+        def _tasks_page_down(_: Any) -> None:
+            self._scroll_tasks(max(4, _terminal_height() // 2))
 
         @keys.add("c-l", filter=~modal)
         def _open_auth(_: Any) -> None:
@@ -1107,6 +1240,45 @@ class CodeDoggyTUI:
             self._request_quit()
 
         return keys
+
+    def _paste_into_buffer(self, event: Any) -> None:
+        """If OS clipboard holds an image, dump it and insert the path.
+
+        Otherwise paste OS / prompt_toolkit text. Intercepting Ctrl+V means we
+        must read the *system* clipboard ourselves — PT's pad is often empty.
+        """
+        buffer = event.current_buffer
+        cwd = getattr(self.session, "cwd", None) or Path.cwd()
+        try:
+            saved = save_clipboard_image(cwd)
+        except Exception:  # noqa: BLE001
+            saved = None
+        if saved is not None:
+            token = insert_path_token(saved)
+            pos = buffer.cursor_position
+            before = buffer.text[:pos]
+            lead = " " if before and not before[-1].isspace() else ""
+            buffer.insert_text(f"{lead}{token} ")
+            self._set_feedback(f"已粘贴图片 → {saved.name}", "success", duration=2.5)
+            event.app.invalidate()
+            return
+
+        text: str | None = None
+        try:
+            data = event.app.clipboard.get_data()
+            raw = getattr(data, "text", None) if data is not None else None
+            if isinstance(raw, str) and raw:
+                text = raw
+        except Exception:  # noqa: BLE001
+            text = None
+        if not text:
+            try:
+                text = get_system_clipboard_text()
+            except Exception:  # noqa: BLE001
+                text = None
+        if text:
+            buffer.insert_text(text)
+        event.app.invalidate()
 
     def _accept_prompt(self, buffer: Any) -> bool:
         prompt = buffer.text.strip()
@@ -1166,6 +1338,7 @@ class CodeDoggyTUI:
         self._bind_subagent_listener()
         task = self.ledger.create(prompt)
         self._selected_task = max(0, len(self.ledger.snapshots()) - 1)
+        self._follow_latest_task = True
         self._active_task_id = task.id
         self._detail_messages[(task.id, f"{task.id}:main")] = []
         self._activity.clear_task(task.id)
@@ -1211,7 +1384,6 @@ class CodeDoggyTUI:
         def on_live_message(message: Any) -> None:
             if not callback_state["active"] or self._closing:
                 return
-            turn_messages.append(message)
             activity = self._activity.observe(task_id, main_agent_id, message)
             if activity:
                 # Prefer tool/activity line on the boss list while running.
@@ -1228,11 +1400,15 @@ class CodeDoggyTUI:
                 and not self._closing
             ):
                 old_live_message(message)
-            if callback_state["active"] and not self._closing:
-                try:
-                    self.app.invalidate()
-                except Exception:  # noqa: BLE001
-                    pass
+
+            def apply() -> None:
+                if not callback_state["active"] or self._closing:
+                    return
+                # UI-thread only: shared list is also read by modal paint.
+                turn_messages.append(message)
+                self._request_redraw()
+
+            self._call_in_ui_thread(apply)
 
         def on_delta(piece: str) -> bool:
             if not callback_state["active"] or self._closing:
@@ -1252,10 +1428,7 @@ class CodeDoggyTUI:
                     output=preview,
                 )
             if should_emit and callback_state["active"] and not self._closing:
-                try:
-                    self.app.invalidate()
-                except Exception:  # noqa: BLE001
-                    pass
+                self._request_redraw()
             return callback_state["active"] and not self._closing
 
         if legacy_runner_events:
@@ -1289,7 +1462,6 @@ class CodeDoggyTUI:
                 result.final_text or result.error or "任务已结束。"
             )
             self.ledger.set_report(task_id, "MAIN", report)
-            self._sync_runtime()
 
             task = next(
                 (item for item in self.ledger.snapshots() if item.id == task_id),
@@ -1304,17 +1476,27 @@ class CodeDoggyTUI:
             ]
             if open_children:
                 final_status = "failed"
-                self._set_feedback("MAIN 未完成并行收口", "warning", duration=2.2)
+                feedback = ("MAIN 未完成并行收口", "warning", 2.2)
             elif failed_children:
                 final_status = "failed"
-                self._set_feedback("子 Agent 未全部成功", "warning", duration=2.2)
+                feedback = ("子 Agent 未全部成功", "warning", 2.2)
             elif status == "completed":
                 final_status = "completed"
-                self._set_feedback("MAIN 已汇总，任务完成", "success")
+                feedback = ("MAIN 已汇总，任务完成", "success", None)
             else:
                 final_status = status
-                self._set_feedback("任务未能完成", "warning", duration=2.2)
+                feedback = ("任务未能完成", "warning", 2.2)
             self.ledger.finish_task(task_id, final_status)
+
+            def apply_success() -> None:
+                if feedback[2] is None:
+                    self._set_feedback(feedback[0], feedback[1])
+                else:
+                    self._set_feedback(
+                        feedback[0], feedback[1], duration=float(feedback[2])
+                    )
+
+            self._call_in_ui_thread(apply_success)
         except Exception as exc:  # noqa: BLE001
             callback_state["active"] = False
             message = f"{type(exc).__name__}: {exc}"
@@ -1327,17 +1509,37 @@ class CodeDoggyTUI:
             )
             self.ledger.set_report(task_id, "MAIN", message)
             self.ledger.finish_task(task_id, "failed")
-            self._set_feedback("任务执行失败", "warning", duration=2.2)
+
+            def apply_fail() -> None:
+                self._set_feedback("任务执行失败", "warning", duration=2.2)
+
+            self._call_in_ui_thread(apply_fail)
         finally:
             callback_state["active"] = False
             if legacy_runner_events:
                 runner.on_live_message = old_live_message
-            self._sync_runtime()
-            if self._active_task_id == task_id:
-                self._task_started_at = None
-            self.app.invalidate()
+
+            def apply_finish() -> None:
+                self._sync_runtime()
+                if self._active_task_id == task_id:
+                    self._task_started_at = None
+                self._invalidate_safe()
+
+            self._call_in_ui_thread(apply_finish)
+
+    def _before_render(self) -> None:
+        """prompt_toolkit before_render hook — keep off the hot path when idle."""
+        self._sync_runtime()
 
     def _sync_runtime(self) -> None:
+        now = time.monotonic()
+        running = self._is_running()
+        # Agent detail needs live transcript; auth wizard / idle do not.
+        hot = running or (self._modal_open and self._modal_kind == "agent")
+        if not hot and (now - self._last_sync_runtime_at) < 0.35:
+            return
+        self._last_sync_runtime_at = now
+
         snapshots = self._subagents()
         active = self._active_task_id
         if active is not None:
@@ -1398,9 +1600,9 @@ class CodeDoggyTUI:
                 self.ledger.set_task_phase(task.id, "dispatching")
 
         if self._modal_open:
-            self._detail_cursor_line = min(
-                self._detail_cursor_line,
-                max(0, self._detail_line_count - 1),
+            self._detail_cursor_line = max(
+                0,
+                min(int(self._detail_cursor_line), max(0, int(self._detail_line_count) - 1)),
             )
 
     def _subagents(self) -> list[Any]:
@@ -1595,7 +1797,73 @@ class CodeDoggyTUI:
         return fragments
 
     def _render_prompt_right(self) -> StyleAndTextTuples:
-        return [("class:prompt.corner.cyan", "│  ")]
+        # One │ per visual input row so the frame grows with wrap height.
+        rows = 1
+        try:
+            rows = max(
+                1,
+                min(
+                    _INPUT_MAX_LINES,
+                    self._estimate_buffer_display_lines(self._input.buffer.text),
+                ),
+            )
+        except Exception:  # noqa: BLE001
+            rows = 1
+        fragments: StyleAndTextTuples = []
+        for i in range(rows):
+            fragments.append(("class:prompt.corner.cyan", "│  "))
+            if i + 1 < rows:
+                fragments.append(("", "\n"))
+        return fragments
+
+    def _invalidate_safe(self) -> None:
+        """Invalidate when already on the UI path; swallow closed-app races."""
+        try:
+            self.app.invalidate()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _main_input_height(self) -> Dimension:
+        try:
+            preferred = self._estimate_buffer_display_lines(
+                self._input.buffer.text, max_lines=_INPUT_MAX_LINES
+            )
+        except Exception:  # noqa: BLE001
+            preferred = 1
+        return Dimension(min=1, max=_INPUT_MAX_LINES, preferred=preferred)
+
+    def _detail_input_height(self) -> Dimension:
+        try:
+            preferred = self._estimate_buffer_display_lines(
+                self._detail_input.buffer.text,
+                prefix_cols=10,
+                max_lines=_DETAIL_INPUT_MAX_LINES,
+            )
+        except Exception:  # noqa: BLE001
+            preferred = 1
+        return Dimension(min=1, max=_DETAIL_INPUT_MAX_LINES, preferred=preferred)
+
+    def _estimate_buffer_display_lines(
+        self,
+        text: str | None,
+        *,
+        prefix_cols: int = 8,
+        max_lines: int | None = None,
+    ) -> int:
+        """Count soft-wrapped display rows for dynamic TextArea height."""
+        cap = max_lines if max_lines is not None else _INPUT_MAX_LINES
+        raw = text or ""
+        # Input sits left of a 3-col right rail; leave a little slack.
+        avail = max(8, _terminal_width() - prefix_cols - 6)
+        total = 0
+        parts = raw.split("\n") if raw else [""]
+        for part in parts:
+            w = get_cwidth(part)
+            if w <= 0:
+                total += 1
+            else:
+                total += max(1, (w + avail - 1) // avail)
+        return max(1, min(cap, total))
 
     def _render_prompt_bottom(self) -> StyleAndTextTuples:
         width = max(16, _terminal_width())
@@ -1708,10 +1976,8 @@ class CodeDoggyTUI:
             fragments.append(("class:shortcut.label", f":{label}", handler))
         return fragments
 
-    def _shortcut_mouse(self, action: str) -> Callable[[MouseEvent], None]:
-        def handler(event: MouseEvent) -> None:
-            if event.event_type is not MouseEventType.MOUSE_UP:
-                return
+    def _shortcut_mouse(self, action: str) -> Callable[[MouseEvent], object]:
+        def _on_up(event: MouseEvent) -> None:
             if action == "quit":
                 self._request_quit()
             elif action == "cancel":
@@ -1738,11 +2004,14 @@ class CodeDoggyTUI:
                 self.app.layout.focus(self._input)
             self.app.invalidate()
 
-        return handler
+        # Footer chrome must not steal wheel from the focused pane.
+        return self._only_mouse_up(_on_up, scroll_target="none")
 
-    def _stop_mouse(self, event: MouseEvent) -> None:
-        if event.event_type is MouseEventType.MOUSE_UP:
-            self._cancel_current()
+    def _stop_mouse(self, event: MouseEvent) -> object:
+        if event.event_type is not MouseEventType.MOUSE_UP:
+            return NotImplemented
+        self._cancel_current()
+        return None
 
     def _render_header(self) -> StyleAndTextTuples:
         width = max(1, _terminal_width())
@@ -1887,40 +2156,74 @@ class CodeDoggyTUI:
         tasks = self.ledger.snapshots()
         fragments: StyleAndTextTuples = []
         refs: list[tuple[str, str]] = []
-        selected_line = 0
         line = 0
         width = max(1, _terminal_width() - 2)
 
+        # Modal float covers this pane — skip expensive splash/task paint while open
+        # so ESC close is not stuck behind a full truecolor doggy recompute.
+        if self._modal_open:
+            if self._showing_startup_brand() or not tasks:
+                self._task_refs = []
+                self._agent_refs = []
+                empty: StyleAndTextTuples = [("", "\n")]
+                self._set_task_line_count(empty)
+                return empty
+            # Agent detail on top: still keep task_refs in sync for selection keys,
+            # but avoid re-walking every agent line under the float each frame.
+            self._task_refs = [task.id for task in tasks]
+            self._agent_refs = []  # no underlay chip handlers while modal owns input
+            if tasks:
+                if self._follow_latest_task:
+                    self._selected_task = len(tasks) - 1
+                self._selected_task %= len(tasks)
+            empty = [("", "\n")]
+            self._set_task_line_count(empty)
+            return empty
+
         # Launch splash only — first task dismisses it for the whole session.
         if self._showing_startup_brand():
-            return _render_doggy_empty(width)
+            fr = self._render_doggy_empty_cached(width)
+            self._set_task_line_count(fr)
+            return fr
 
         if not tasks:
             self._task_refs = []
             self._agent_refs = []
             self._selected_task = 0
-            self._selected_line = 0
-            return _render_doggy_idle_panel(width)
+            fr = _render_doggy_idle_panel(width)
+            self._set_task_line_count(fr)
+            return fr
 
         self._task_refs = [task.id for task in tasks]
+        # Pin selection to the newest task while following.
+        if self._follow_latest_task:
+            self._selected_task = len(tasks) - 1
         self._selected_task %= len(tasks)
+        # Yellow = task list focus + cursor row. Card borders stay always so
+        # Space→input only recolors chrome (no layout jump / reflow).
+        list_focused = self._task_list_has_focus()
+        # Keep a constant card geometry whenever width allows.
+        has_frame = width >= 20
+        selected_line_start = 0
+        selected_line_end = 0
 
         for task_index, task in enumerate(tasks):
-            selected = task_index == self._selected_task
-            # On very narrow terminals the selection frame steals the cells
-            # needed for both the agent label and useful live output.
-            framed = selected and width >= 20
-            # Non-selected tasks still get a soft rounded rail when wide.
-            soft_frame = (not framed) and width >= 36
-            inner_width = max(1, width - 2) if (framed or soft_frame) else width
+            selected = list_focused and task_index == self._selected_task
+            # Always track cursor anchor for the selected index (even when the
+            # list is unfocused) so auto-follow can keep the latest card in view.
+            is_cursor_task = task_index == self._selected_task
+            # Yellow border only when this card is the focused cursor.
+            framed = selected and has_frame
+            inner_width = max(1, width - 2) if has_frame else width
             border_style = (
                 "class:task.selection.border"
                 if framed
                 else "class:task.spine"
             )
-            if selected:
-                selected_line = line
-            if framed or soft_frame:
+            card_start = line
+            if is_cursor_task:
+                selected_line_start = card_start
+            if has_frame:
                 if framed:
                     plate = _rounded_title(f"{_DOG_FACE} selected", inner_width + 2)
                     fragments.append((border_style, plate + "\n"))
@@ -1932,13 +2235,13 @@ class CodeDoggyTUI:
 
             def append_task_line(parts: StyleAndTextTuples) -> None:
                 nonlocal line
-                if framed or soft_frame:
+                if has_frame:
                     fragments.append((border_style, "│"))
                 used = sum(get_cwidth(part[1]) for part in parts)
                 fragments.extend(parts)
                 if used < inner_width:
                     fragments.append(("", " " * (inner_width - used)))
-                if framed or soft_frame:
+                if has_frame:
                     fragments.append((border_style, "│"))
                 fragments.append(("", "\n"))
                 line += 1
@@ -1951,9 +2254,10 @@ class CodeDoggyTUI:
                 if width < 34
                 else _task_stage_text(task)
             )
-            # Dog-ear markers: selected / active / idle
+            # Left gutter mark only (1 cell + space). Never put ∪･ω･∪ in the
+            # title row — it ate 5 columns and squeezed user text.
             if selected:
-                marker = _DOG_FACE if inner_width >= 28 else _DOG_EAR
+                marker = _DOG_EAR
             elif active:
                 marker = _DOG_EAR
             else:
@@ -1967,23 +2271,52 @@ class CodeDoggyTUI:
                     else "class:task.marker.idle"
                 )
             )
-            minimum_gap = 1 if width < 34 else 2
-            fixed_width = get_cwidth(prefix) + 1 + 2 + minimum_gap + 2
-            title_budget = max(1, inner_width - get_cwidth(status) - fixed_width)
-            title = _truncate_display(task.title, title_budget)
-            left = f"{prefix}{marker}  {title}"
-            gap = max(
-                minimum_gap,
-                inner_width - get_cwidth(left) - get_cwidth(status),
-            )
-            append_task_line(
-                [
-                    (spine_style, prefix),
-                    (marker_style, marker),
-                    ("class:task.title", f"  {title}"),
-                    (_task_status_style(task), " " * gap + status),
-                ]
-            )
+            # Fixed-width left gutter so selected/idle recolor does not reflow.
+            gutter = f"{marker} "
+            gutter_w = get_cwidth(gutter)
+            # Wrap full task text across lines (scroll list to read all) —
+            # never leave the user with a half-eaten single truncated row.
+            text_cols = max(1, inner_width - get_cwidth(prefix) - gutter_w)
+            title_lines = _wrap_display_lines(task.title, text_cols)
+            if not title_lines:
+                title_lines = [""]
+            # First line: gutter + title (+ status if it fits after wrap).
+            first = title_lines[0]
+            status_w = get_cwidth(status)
+            if status_w + 1 < text_cols and get_cwidth(first) + 1 + status_w <= text_cols:
+                gap = max(1, text_cols - get_cwidth(first) - status_w)
+                append_task_line(
+                    [
+                        (spine_style, prefix),
+                        (marker_style, gutter),
+                        ("class:task.title", first),
+                        (_task_status_style(task), " " * gap + status),
+                    ]
+                )
+            else:
+                append_task_line(
+                    [
+                        (spine_style, prefix),
+                        (marker_style, gutter),
+                        ("class:task.title", first),
+                    ]
+                )
+                # Status on its own row when title is long.
+                append_task_line(
+                    [
+                        (spine_style, prefix),
+                        ("", " " * gutter_w),
+                        (_task_status_style(task), _truncate_display(status, text_cols)),
+                    ]
+                )
+            for cont in title_lines[1:]:
+                append_task_line(
+                    [
+                        (spine_style, prefix),
+                        ("", " " * gutter_w),
+                        ("class:task.title", cont),
+                    ]
+                )
             append_task_line([(spine_style, prefix)])
 
             box_lines = self._render_agent_box_lines(
@@ -1992,6 +2325,7 @@ class CodeDoggyTUI:
                 refs,
                 prefix,
                 spine_style,
+                list_focused=list_focused,
             )
             for box_line in box_lines:
                 append_task_line(box_line)
@@ -2019,20 +2353,32 @@ class CodeDoggyTUI:
                 label = _truncate_display(reporter, label_width)
                 padded_label = label + " " * max(0, label_width - get_cwidth(label))
                 report_width = max(1, available - label_width)
+                # First line longer, second a bit shorter — easier to scan.
+                brief_lines = _brief_two_lines(report, report_width)
                 append_task_line(
                     [
                         (spine_style, prefix),
                         (_reporter_style(agent_status), padded_label),
-                        (
-                            "class:report",
-                            _truncate_display(report, report_width),
-                        ),
+                        ("class:report", brief_lines[0]),
                     ]
                 )
+                blank_label = " " * label_width
+                if len(brief_lines) > 1 and brief_lines[1]:
+                    append_task_line(
+                        [
+                            (spine_style, prefix),
+                            ("", blank_label),
+                            ("class:report", brief_lines[1]),
+                        ]
+                    )
 
-            if framed or soft_frame:
+            if has_frame:
                 fragments.append((border_style, "╰" + "─" * inner_width + "╯\n"))
                 line += 1
+            if is_cursor_task:
+                # Cursor on the *last* row of the card so the full card can sit
+                # above the scroll bottom margin (not clipped mid-card).
+                selected_line_end = max(selected_line_start, line - 1)
             if task_index != len(tasks) - 1:
                 sep = f"  ╭{'┈' * max(1, width - 8)}╯ {_DOG_EAR}"
                 fragments.append(
@@ -2041,8 +2387,79 @@ class CodeDoggyTUI:
                 line += 1
 
         self._agent_refs = refs
-        self._selected_line = selected_line
+        # Re-pin selection only when follow is on or the selected task changed.
+        # Every-paint pin fights free scroll (wheel moves y, paint snaps it back).
+        pin_task = int(self._selected_task)
+        if self._follow_latest_task:
+            self._selected_line = selected_line_end
+            self._pinned_task_for_line = pin_task
+        elif self._pinned_task_for_line != pin_task:
+            self._selected_line = selected_line_start
+            self._pinned_task_for_line = pin_task
+        self._set_task_line_count(fragments)
         return fragments
+
+    def _task_list_has_focus(self) -> bool:
+        """True only when the task pane owns keyboard focus (not the prompt)."""
+        if self._modal_open:
+            return False
+        try:
+            return bool(get_app().layout.has_focus(self._task_window))
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _task_cursor_position(self) -> Point:
+        """Cursor y must always be in-range for FormattedTextControl lines."""
+        max_y = max(0, int(self._task_line_count) - 1)
+        y = max(0, min(int(self._selected_line), max_y))
+        return Point(x=0, y=y)
+
+    def _count_fragment_lines(self, fragments: StyleAndTextTuples) -> int:
+        """Match prompt_toolkit split_lines / UIContent.line_count.
+
+        PT always yields ``text.count("\\n") + 1`` lines (a trailing empty row
+        after a final newline). Undercounting made clamps fail-safe but broke
+        End/scroll-into-view and invited overcount "fixes" that re-crash.
+        """
+        if not fragments:
+            return 1
+        n = 0
+        for item in fragments:
+            text = item[1] if len(item) > 1 else ""
+            n += str(text).count("\n")
+        return max(1, n + 1)
+
+    @staticmethod
+    def _ensure_fragments(
+        fragments: StyleAndTextTuples | None,
+    ) -> StyleAndTextTuples:
+        """Never hand focusable FormattedTextControl an empty fragment list."""
+        if fragments:
+            return fragments
+        return [("", "\n")]
+
+    def _set_task_line_count(self, fragments: StyleAndTextTuples) -> None:
+        """Derive line count from rendered fragments and clamp selection."""
+        n = self._count_fragment_lines(fragments)
+        self._task_line_count = n
+        self._selected_line = max(0, min(int(self._selected_line), n - 1))
+
+    def _detail_cursor_position(self) -> Point:
+        max_y = max(0, int(self._detail_line_count) - 1)
+        y = max(0, min(int(self._detail_cursor_line), max_y))
+        return Point(x=0, y=y)
+
+    def _set_detail_line_count(
+        self,
+        fragments: StyleAndTextTuples,
+        *,
+        preferred_cursor: int | None = None,
+    ) -> None:
+        n = self._count_fragment_lines(fragments)
+        self._detail_line_count = n
+        if preferred_cursor is not None:
+            self._detail_cursor_line = int(preferred_cursor)
+        self._detail_cursor_line = max(0, min(int(self._detail_cursor_line), n - 1))
 
     def _render_agent_box_lines(
         self,
@@ -2051,6 +2468,8 @@ class CodeDoggyTUI:
         refs: list[tuple[str, str]],
         prefix: str,
         spine_style: str,
+        *,
+        list_focused: bool = True,
     ) -> list[StyleAndTextTuples]:
         content_width = max(1, width - get_cwidth(prefix) - 2)
         selected_task = (
@@ -2094,7 +2513,11 @@ class CodeDoggyTUI:
         for group in groups:
             fragments: StyleAndTextTuples = [(spine_style, prefix), ("", "  ")]
             for chip_index, (index, agent_index, inner, _box_width, active) in enumerate(group):
-                selected = task.id == selected_task and agent_index == selected_agent
+                selected = (
+                    list_focused
+                    and task.id == selected_task
+                    and agent_index == selected_agent
+                )
                 if selected:
                     border = "class:agent.border.selected"
                     label_style = "class:agent.label.selected"
@@ -2119,8 +2542,8 @@ class CodeDoggyTUI:
 
 
     def _render_modal_title(self) -> StyleAndTextTuples:
+        width = max(12, _terminal_width() - 9)
         if self._modal_kind == "auth":
-            width = max(12, _terminal_width() - 9)
             left = f"  ╭ {_DOG_EAR} {self._auth_wizard.title} "
             right = "AUTH ╮"
             if self._auth_wizard.busy:
@@ -2133,13 +2556,22 @@ class CodeDoggyTUI:
                 ("class:detail.active", right),
             ]
         if not self._modal_ref:
-            return []
+            return [
+                (
+                    "class:agent-window.header",
+                    _truncate_display(f"  ╭ {_DOG_EAR} Agent ╮", width),
+                )
+            ]
         task_id, agent_id = self._modal_ref
         agent = self.ledger.get_agent(task_id, agent_id)
         task = next((item for item in self.ledger.snapshots() if item.id == task_id), None)
         if agent is None or task is None:
-            return []
-        width = max(12, _terminal_width() - 9)
+            return [
+                (
+                    "class:agent-window.header",
+                    _truncate_display(f"  ╭ {_DOG_EAR} 记录不可用 ╮", width),
+                )
+            ]
         left = f"  ╭ {_DOG_EAR} {agent.label} · {task.title} "
         right = STATUS_TEXT.get(agent.status, agent.status)
         if agent.status in {"pending", "running"}:
@@ -2190,7 +2622,6 @@ class CodeDoggyTUI:
             return self._render_auth_body()
         snapshot = self._current_detail_snapshot()
         if snapshot is None:
-            self._detail_line_count = 3
             w = max(12, _terminal_width() - 8)
             empty = [
                 _rounded_title(f"{_DOG_FACE} empty", w),
@@ -2202,6 +2633,8 @@ class CodeDoggyTUI:
                 text = _truncate_display(raw, w)
                 style = "class:brand" if i == 0 else "class:detail.meta"
                 frags.append((style, text + "\n"))
+            frags = self._with_detail_scroll(self._ensure_fragments(frags))
+            self._set_detail_line_count(frags, preferred_cursor=0)
             return frags
         width = max(12, _terminal_width() - 8)
         fragments = render_detail_body(
@@ -2210,15 +2643,28 @@ class CodeDoggyTUI:
             active_filter=self._detail_filter,
             path_mouse=self._image_path_mouse,
         )
-        self._detail_line_count = max(
-            1,
-            sum(fragment[1].count("\n") for fragment in fragments),
-        )
-        self._detail_cursor_line = min(
-            self._detail_cursor_line,
-            self._detail_line_count - 1,
-        )
+        fragments = self._with_detail_scroll(self._ensure_fragments(fragments))
+        self._set_detail_line_count(fragments)
         return fragments
+
+    def _with_detail_scroll(
+        self, fragments: StyleAndTextTuples
+    ) -> StyleAndTextTuples:
+        """Attach wheel→_scroll_detail on plain body text (not just links).
+
+        Unhandled prose used Window-only scroll; ScrollOffsets then snapped
+        the viewport back to a stale _detail_cursor_line on every invalidate.
+        """
+        handler = self._only_mouse_up(lambda _e: None, scroll_target="detail")
+        out: StyleAndTextTuples = []
+        for item in fragments:
+            if len(item) >= 3 and item[2] is not None:
+                out.append(item)
+            else:
+                style = item[0] if item else ""
+                text = item[1] if len(item) > 1 else ""
+                out.append((style, text, handler))
+        return out if out else [("", "\n", handler)]
 
     def _render_auth_body(self) -> StyleAndTextTuples:
         width = max(20, _terminal_width() - 10)
@@ -2243,7 +2689,12 @@ class CodeDoggyTUI:
             fragments.append(
                 ("class:agent.border", "╰" + "─" * max(1, wait_w - 2) + "╯\n")
             )
+        # First visual line of each menu item (for scroll-into-view).
+        item_line_starts: list[int] = []
         for index, item in enumerate(wiz.items):
+            # Next line index == total newlines so far when every fragment ends with \n.
+            start_y = sum(str(it[1]).count("\n") for it in fragments)
+            item_line_starts.append(start_y)
             selected = index == wiz.cursor
             marker = f"╭{_DOG_EAR} " if selected else "│  "
             style = {
@@ -2269,8 +2720,11 @@ class CodeDoggyTUI:
                 hint = _truncate_display(f"    {item.hint}", width)
                 fragments.append(("class:auth.hint", hint + "\n", handler))
             fragments.append(("", "\n", handler))
-        self._detail_line_count = max(1, len(wiz.items) * 3 + 2)
-        self._detail_cursor_line = wiz.cursor
+        preferred = 0
+        if 0 <= wiz.cursor < len(item_line_starts):
+            preferred = item_line_starts[wiz.cursor]
+        fragments = self._with_detail_scroll(self._ensure_fragments(fragments))
+        self._set_detail_line_count(fragments, preferred_cursor=preferred)
         return fragments
 
     def _current_detail_snapshot(self) -> AgentDetailSnapshot | None:
@@ -2338,12 +2792,11 @@ class CodeDoggyTUI:
 
     def _detail_filter_mouse(
         self, detail_filter: DetailFilter
-    ) -> Callable[[MouseEvent], None]:
-        def handler(event: MouseEvent) -> None:
-            if event.event_type is MouseEventType.MOUSE_UP:
-                self._set_detail_filter(detail_filter)
-
-        return handler
+    ) -> Callable[[MouseEvent], object]:
+        return self._only_mouse_up(
+            lambda _e: self._set_detail_filter(detail_filter),
+            scroll_target="detail",
+        )
 
     def _set_detail_filter(self, detail_filter: DetailFilter) -> None:
         self._detail_filter = detail_filter
@@ -2352,9 +2805,85 @@ class CodeDoggyTUI:
         self.app.invalidate()
 
     def _move_detail_cursor(self, delta: int) -> None:
+        max_y = max(0, int(self._detail_line_count) - 1)
         self._detail_cursor_line = min(
-            max(0, self._detail_cursor_line + delta),
-            max(0, self._detail_line_count - 1),
+            max(0, int(self._detail_cursor_line) + delta),
+            max_y,
+        )
+        self.app.invalidate()
+
+    def _scroll_tasks(self, delta_lines: int) -> None:
+        """Manual scroll: move content + stop auto-follow of the latest task."""
+        self._follow_latest_task = False
+        win = self._task_window
+        info = getattr(win, "render_info", None)
+        if info is not None:
+            max_scroll = max(0, int(info.content_height) - int(info.window_height))
+            win.vertical_scroll = max(
+                0, min(max_scroll, int(win.vertical_scroll) + int(delta_lines))
+            )
+        else:
+            win.vertical_scroll = max(0, int(win.vertical_scroll) + int(delta_lines))
+        # Keep cursor y near the new viewport so the next paint does not snap back.
+        max_y = max(0, int(self._task_line_count) - 1)
+        self._selected_line = max(
+            0, min(max_y, int(self._selected_line) + int(delta_lines))
+        )
+        self.app.invalidate()
+
+    def _only_mouse_up(
+        self,
+        action: Callable[[MouseEvent], None],
+        *,
+        scroll_target: str = "auto",
+    ) -> Callable[[MouseEvent], object]:
+        """Fragment mouse handlers must not swallow wheel incorrectly.
+
+        Returning None for non-UP events marks the event handled. Wheel over
+        task chips scrolls the task list; wheel over modal/detail must let the
+        Window scroll (or scroll the detail pane), never the underlay tasks.
+        """
+
+        def handler(event: MouseEvent) -> object:
+            if event.event_type is not MouseEventType.MOUSE_UP:
+                if event.event_type in {
+                    MouseEventType.SCROLL_UP,
+                    MouseEventType.SCROLL_DOWN,
+                }:
+                    step = -3 if event.event_type is MouseEventType.SCROLL_UP else 3
+                    target = scroll_target
+                    if target == "none":
+                        return NotImplemented
+                    if target == "auto":
+                        target = "detail" if self._modal_open else "tasks"
+                    if target == "tasks" and not self._modal_open:
+                        self._scroll_tasks(step)
+                        return None
+                    if target == "detail" and self._modal_open:
+                        self._scroll_detail(step)
+                        return None
+                    # Let Window handle default scroll when unsure.
+                    return NotImplemented
+                return NotImplemented
+            action(event)
+            return None
+
+        return handler
+
+    def _scroll_detail(self, delta_lines: int) -> None:
+        """Scroll agent/auth detail pane without touching task list state."""
+        win = self._detail_window
+        info = getattr(win, "render_info", None)
+        if info is not None:
+            max_scroll = max(0, int(info.content_height) - int(info.window_height))
+            win.vertical_scroll = max(
+                0, min(max_scroll, int(win.vertical_scroll) + int(delta_lines))
+            )
+        else:
+            win.vertical_scroll = max(0, int(win.vertical_scroll) + int(delta_lines))
+        max_y = max(0, int(self._detail_line_count) - 1)
+        self._detail_cursor_line = max(
+            0, min(max_y, int(self._detail_cursor_line) + int(delta_lines))
         )
         self.app.invalidate()
 
@@ -2378,6 +2907,8 @@ class CodeDoggyTUI:
         if not tasks:
             return
         self._selected_task = (self._selected_task + delta) % len(tasks)
+        # Browsing older tasks pauses follow; landing on the last resumes it.
+        self._follow_latest_task = self._selected_task == len(tasks) - 1
         self.app.invalidate()
 
     def _move_task_agent(self, delta: int) -> None:
@@ -2395,6 +2926,11 @@ class CodeDoggyTUI:
         agent = task.agents[self._selected_agent_index(task)]
         self._open_agent(task.id, agent.id)
 
+    def _reset_detail_cursor_state(self) -> None:
+        """Drop stale detail height before the next body paint measures it."""
+        self._detail_cursor_line = 0
+        self._detail_line_count = 1
+
     def _open_agent(self, task_id: str, agent_id: str) -> None:
         agent = self.ledger.get_agent(task_id, agent_id)
         if agent is None:
@@ -2402,7 +2938,7 @@ class CodeDoggyTUI:
         self._modal_kind = "agent"
         self._modal_ref = (task_id, agent_id)
         self._detail_filter = "all"
-        self._detail_cursor_line = 0
+        self._reset_detail_cursor_state()
         self._detail_input.text = ""
         self._modal_open = True
         self.app.layout.focus(self._detail_window)
@@ -2411,6 +2947,7 @@ class CodeDoggyTUI:
     def _open_auth_wizard(self) -> None:
         self._modal_kind = "auth"
         self._modal_ref = None
+        self._reset_detail_cursor_state()
         self._auth_wizard.open(
             active_provider=session_surface.provider_id(self.session),
             active_model=session_surface.model_id(self.session),
@@ -2422,26 +2959,52 @@ class CodeDoggyTUI:
 
     def _close_modal(self) -> None:
         was_auth = self._modal_kind == "auth"
+        had_tasks = bool(self.ledger.snapshots())
         self._modal_open = False
         self._modal_kind = "agent"
         self._modal_ref = None
+        self._reset_detail_cursor_state()
         self._detail_input.text = ""
-        self.app.layout.focus(self._task_window)
+        # Focus the prompt caret immediately — focusing the task window on empty
+        # ledgers forced a heavy underlay paint before the user saw the close.
+        try:
+            if was_auth or not had_tasks:
+                self.app.layout.focus(self._input)
+            else:
+                self.app.layout.focus(self._task_window)
+        except Exception:  # noqa: BLE001
+            try:
+                self.app.layout.focus(self._input)
+            except Exception:  # noqa: BLE001
+                pass
         self.app.invalidate()
         if was_auth and self._pending_prompt and self._ensure_auth_ready():
             prompt = self._pending_prompt
             self._pending_prompt = None
             self._start_task(prompt)
 
-    def _agent_mouse(self, index: int) -> Callable[[MouseEvent], None]:
-        def handler(event: MouseEvent) -> None:
-            if event.event_type is not MouseEventType.MOUSE_UP:
-                return
+    def _render_doggy_empty_cached(self, width: int) -> StyleAndTextTuples:
+        """Cache splash by animation frame + terminal size (skip recompute)."""
+        clock = time.monotonic()
+        frame = int(clock * 5) % max(1, _DOGGY_COUPLE_FRAMES)
+        key = (frame, width, _terminal_height())
+        cached = self._doggy_empty_cache
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        fragments = _render_doggy_empty(width, now=clock)
+        self._doggy_empty_cache = (key, fragments)
+        return fragments
+
+    def _agent_mouse(self, index: int) -> Callable[[MouseEvent], object]:
+        def _on_up(_event: MouseEvent) -> None:
             if not 0 <= index < len(self._agent_refs):
                 return
             task_id, agent_id = self._agent_refs[index]
             if task_id in self._task_refs:
                 self._selected_task = self._task_refs.index(task_id)
+                self._follow_latest_task = (
+                    self._selected_task == len(self._task_refs) - 1
+                )
             task = self._selected_task_view()
             if task is not None:
                 for agent_index, agent in enumerate(task.agents):
@@ -2450,28 +3013,33 @@ class CodeDoggyTUI:
                         break
             self._open_agent(task_id, agent_id)
 
-        return handler
+        return self._only_mouse_up(_on_up, scroll_target="tasks")
 
-    def _auth_item_mouse(self, index: int) -> Callable[[MouseEvent], None]:
-        def handler(event: MouseEvent) -> None:
-            if event.event_type is not MouseEventType.MOUSE_UP:
-                return
+    def _auth_item_mouse(self, index: int) -> Callable[[MouseEvent], object]:
+        def _on_up(_event: MouseEvent) -> None:
             if self._modal_kind != "auth":
                 return
             if self._auth_wizard.busy and self._auth_wizard.step is not WizardStep.WAITING:
                 return
-            self._auth_wizard.set_cursor(index)
+            # Disabled rows must not activate the previously selected item.
+            if not self._auth_wizard.set_cursor(index):
+                return
             self._dispatch_wizard_action(self._auth_wizard.activate())
 
-        return handler
+        return self._only_mouse_up(_on_up, scroll_target="detail")
 
-    def _hud_open_mouse(self, event: MouseEvent) -> None:
-        if event.event_type is MouseEventType.MOUSE_UP and not self._modal_open:
+    def _hud_open_mouse(self, event: MouseEvent) -> object:
+        if event.event_type is not MouseEventType.MOUSE_UP:
+            return NotImplemented
+        if not self._modal_open:
             self._open_auth_wizard()
+        return None
 
-    def _close_mouse(self, event: MouseEvent) -> None:
-        if event.event_type is MouseEventType.MOUSE_UP:
-            self._close_modal()
+    def _close_mouse(self, event: MouseEvent) -> object:
+        if event.event_type is not MouseEventType.MOUSE_UP:
+            return NotImplemented
+        self._close_modal()
+        return None
 
     def _current_provider_id(self) -> str:
         return session_surface.provider_id(self.session)
@@ -2591,12 +3159,10 @@ class CodeDoggyTUI:
             source="panel",
         )
 
-    def _image_path_mouse(self, path: str) -> Callable[[MouseEvent], None]:
+    def _image_path_mouse(self, path: str) -> Callable[[MouseEvent], object]:
         """Click-to-open for image_gen/image_edit paths (OS default viewer)."""
 
-        def handler(event: MouseEvent) -> None:
-            if event.event_type is not MouseEventType.MOUSE_UP:
-                return
+        def _on_up(_event: MouseEvent) -> None:
             from codedoggy.tui.open_path import open_local_path
 
             cwd = getattr(self.session, "cwd", None)
@@ -2611,7 +3177,7 @@ class CodeDoggyTUI:
             except Exception:  # noqa: BLE001
                 pass
 
-        return handler
+        return self._only_mouse_up(_on_up, scroll_target="detail")
 
 
 def _render_doggy_idle_panel(width: int) -> StyleAndTextTuples:
@@ -3088,47 +3654,53 @@ def _render_doggy_empty(
     now: float | None = None,
 ) -> StyleAndTextTuples:
     """Render the locked 52x60 neon couple portrait and sparse night field."""
-    clock = time.monotonic() if now is None else now
-    art_tick = int(clock * 5)
-    frame = art_tick % _DOGGY_COUPLE_FRAMES
-    rows = _animate_doggy_couple(_DOGGY_COUPLE_ART, frame)
-    terminal_height = _terminal_height()
+    try:
+        clock = time.monotonic() if now is None else now
+        art_tick = int(clock * 5)
+        frame = art_tick % _DOGGY_COUPLE_FRAMES
+        rows = _animate_doggy_couple(_DOGGY_COUPLE_ART, frame)
+        terminal_height = _terminal_height()
 
-    task_height = max(1, terminal_height - 8)
-    # Keep the portrait on its native pixel grid. Fractional nearest-neighbour
-    # scaling changes which eye/mask rows survive as the terminal is resized.
-    stage_width = max(
-        1,
-        min(width, _DOGGY_DESIGN_WIDTH),
-    )
+        task_height = max(1, terminal_height - 8)
+        # Keep the portrait on its native pixel grid. Fractional nearest-neighbour
+        # scaling changes which eye/mask rows survive as the terminal is resized.
+        stage_width = max(
+            1,
+            min(width, _DOGGY_DESIGN_WIDTH),
+        )
 
-    target_width = max(1, min(len(rows[0]), stage_width - 4))
-    if target_width < len(rows[0]):
-        crop_left = max(0, (len(rows[0]) - target_width) // 2)
-        rows = tuple(row[crop_left : crop_left + target_width] for row in rows)
+        target_width = max(1, min(len(rows[0]), stage_width - 4))
+        if target_width < len(rows[0]):
+            crop_left = max(0, (len(rows[0]) - target_width) // 2)
+            rows = tuple(row[crop_left : crop_left + target_width] for row in rows)
 
-    rows = _compose_doggy_night(rows, stage_width, clock)
-    art_width = len(rows[0])
-    outer = max(0, (width - art_width) // 2)
-    palette = dict(_DOGGY_ART_PALETTE)
+        rows = _compose_doggy_night(rows, stage_width, clock)
+        if len(rows) % 2:
+            rows = rows + (rows[-1] if rows else "." * max(1, stage_width),)
+        art_width = len(rows[0])
+        outer = max(0, (width - art_width) // 2)
+        palette = dict(_DOGGY_ART_PALETTE)
 
-    art_height = len(rows) // 2
-    top_margin = _DOGGY_DESIGN_TOP_MARGIN
-    bottom_margin = _DOGGY_DESIGN_BOTTOM_MARGIN
-    scaled_frame_height = top_margin + art_height + bottom_margin
-    vertical_slack = max(0, task_height - scaled_frame_height)
-    top_padding = top_margin + vertical_slack // 2
+        art_height = len(rows) // 2
+        top_margin = _DOGGY_DESIGN_TOP_MARGIN
+        bottom_margin = _DOGGY_DESIGN_BOTTOM_MARGIN
+        scaled_frame_height = top_margin + art_height + bottom_margin
+        vertical_slack = max(0, task_height - scaled_frame_height)
+        top_padding = top_margin + vertical_slack // 2
 
-    fragments: StyleAndTextTuples = [("", "\n" * top_padding)]
-    for top, bottom in zip(rows[::2], rows[1::2], strict=True):
-        fragments.append(("", " " * outer))
-        pairs = zip(top, bottom, strict=True)
-        for pair, cells in groupby(pairs):
-            count = sum(1 for _ in cells)
-            style, glyph = _half_block(pair[0], pair[1], palette)
-            fragments.append((style, glyph * count))
-        fragments.append(("", "\n"))
-    return fragments
+        fragments: StyleAndTextTuples = [("", "\n" * top_padding)]
+        for top, bottom in zip(rows[::2], rows[1::2]):
+            fragments.append(("", " " * outer))
+            pairs = zip(top, bottom)
+            for pair, cells in groupby(pairs):
+                count = sum(1 for _ in cells)
+                style, glyph = _half_block(pair[0], pair[1], palette)
+                fragments.append((style, glyph * count))
+            fragments.append(("", "\n"))
+        return fragments if fragments else [("", "\n")]
+    except Exception:  # noqa: BLE001
+        # Splash must never take down the whole TUI paint path.
+        return _render_doggy_idle_panel(max(1, width))
 
 
 def _half_block(
@@ -3136,16 +3708,18 @@ def _half_block(
     bottom: str,
     palette: dict[str, str],
 ) -> tuple[str, str]:
-    background = palette["."]
+    background = palette.get(".", "#000000")
+    top_color = palette.get(top, background)
+    bottom_color = palette.get(bottom, background)
     if top == bottom == ".":
         return f"bg:{background}", " "
     if top == bottom:
-        return f"fg:{palette[top]} bg:{background}", "█"
+        return f"fg:{top_color} bg:{background}", "█"
     if top == ".":
-        return f"fg:{palette[bottom]} bg:{background}", "▄"
+        return f"fg:{bottom_color} bg:{background}", "▄"
     if bottom == ".":
-        return f"fg:{palette[top]} bg:{background}", "▀"
-    return f"fg:{palette[top]} bg:{palette[bottom]}", "▀"
+        return f"fg:{top_color} bg:{background}", "▀"
+    return f"fg:{top_color} bg:{bottom_color}", "▀"
 
 
 def _task_activity_text(task: TaskView) -> str:
@@ -3175,3 +3749,68 @@ def _truncate_display(text: str, width: int) -> str:
         out.append(char)
         used += char_width
     return "".join(out).rstrip() + "…"
+
+
+def _wrap_display_lines(text: str, width: int, *, max_lines: int = 40) -> list[str]:
+    """Wrap text to display-cell width (no ellipsis drop of trailing content)."""
+    width = max(1, int(width))
+    raw = (text or "").replace("\r\n", "\n").replace("\r", "\n")
+    if not raw.strip():
+        return [""]
+    lines: list[str] = []
+    for para in raw.split("\n"):
+        if not para:
+            lines.append("")
+            if len(lines) >= max_lines:
+                break
+            continue
+        buf: list[str] = []
+        used = 0
+        for char in para:
+            cw = get_cwidth(char)
+            if buf and used + cw > width:
+                lines.append("".join(buf))
+                if len(lines) >= max_lines:
+                    return lines
+                buf = [char]
+                used = cw
+            else:
+                buf.append(char)
+                used += cw
+        if buf:
+            lines.append("".join(buf))
+            if len(lines) >= max_lines:
+                break
+    return lines or [""]
+
+
+def _brief_two_lines(text: str, full_width: int) -> list[str]:
+    """Task brief: longer first line, slightly shorter second (ragged right)."""
+    full_width = max(8, int(full_width))
+    # ~88% / ~72% of available report columns — first longer, second a bit shorter.
+    w1 = max(6, min(full_width, int(full_width * 0.88)))
+    w2 = max(5, min(full_width - 1, int(full_width * 0.72)))
+    raw = " ".join((text or "").replace("\r", "\n").split())
+    if not raw:
+        return [""]
+    if get_cwidth(raw) <= w1:
+        return [raw]
+    # Fill line 1 to w1, line 2 to w2 (ellipsis if more remains).
+    line1_chars: list[str] = []
+    used = 0
+    rest = raw
+    for i, ch in enumerate(raw):
+        cw = get_cwidth(ch)
+        if used + cw > w1:
+            rest = raw[i:]
+            break
+        line1_chars.append(ch)
+        used += cw
+    else:
+        return ["".join(line1_chars)]
+    line1 = "".join(line1_chars).rstrip()
+    rest = rest.lstrip()
+    if not rest:
+        return [line1]
+    line2 = _truncate_display(rest, w2)
+    return [line1, line2]

@@ -531,6 +531,22 @@ def _bind_compactor_model_window(compactor: Any, sampler: Any) -> None:
     if config is None:
         return
 
+    # Re-derive from provider+model so a stale 32k on the client never sticks.
+    try:
+        from codedoggy.model.context_limits import ensure_model_context_window
+        from codedoggy.model.types import ModelConfig
+
+        if isinstance(config, ModelConfig):
+            config = ensure_model_context_window(config)
+            client = getattr(sampler, "client", None)
+            if client is not None and getattr(client, "config", None) is not None:
+                try:
+                    client.config = config  # type: ignore[attr-defined]
+                except Exception:  # noqa: BLE001
+                    pass
+    except Exception:  # noqa: BLE001
+        logger.debug("ensure_model_context_window failed", exc_info=True)
+
     cw = getattr(config, "context_window", None)
     mt = getattr(config, "max_tokens", None)
     if cw is None:

@@ -159,16 +159,21 @@ def build_session(
     except Exception:  # noqa: BLE001
         summary_client = None
 
+    # Budget follows the active main model (provider+model), not a blind 32k.
+    main_cfg = prof.main if prof is not None else None
     compactor = ContextCompactor.from_env(
         summary_client=summary_client,
         memory_store=memory,
         session_store=session_store,
         memory_manager=memory_manager,
+        provider=getattr(main_cfg, "provider", None) if main_cfg else None,
+        model=getattr(main_cfg, "model", None) if main_cfg else None,
+        base_url=getattr(main_cfg, "base_url", None) if main_cfg else None,
+        context_window=getattr(main_cfg, "context_window", None) if main_cfg else None,
     )
 
-    # Grok: bind model context_window into the budget
-    cw = getattr(prof.main, "context_window", None) if prof else None
-    mt = getattr(prof.main, "max_tokens", None) if prof else None
+    cw = getattr(main_cfg, "context_window", None) if main_cfg else None
+    mt = getattr(main_cfg, "max_tokens", None) if main_cfg else None
     if hasattr(compactor, "bind_model_window"):
         try:
             compactor.bind_model_window(

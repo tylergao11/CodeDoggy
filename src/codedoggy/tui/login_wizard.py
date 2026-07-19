@@ -295,9 +295,12 @@ class AuthWizard:
                 break
             self.cursor = (self.cursor + delta) % n
 
-    def set_cursor(self, index: int) -> None:
+    def set_cursor(self, index: int) -> bool:
+        """Move cursor to an enabled item. Returns True if the index was accepted."""
         if 0 <= index < len(self.items) and self.items[index].enabled:
             self.cursor = index
+            return True
+        return False
 
     def activate(self) -> WizardAction:
         if not self.items:

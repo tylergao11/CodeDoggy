@@ -1,7 +1,7 @@
 [project]
 name = "codedoggy"
 version = "0.1.0"
-description = "CodeDoggy — parallel coding agents with MAIN orchestration and reporting"
+description = "Doggy — coding agent harness (package: codedoggy)"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
@@ -21,7 +21,8 @@ dependencies = [
 dev = ["pytest>=8.0"]
 
 [project.scripts]
-codedoggy = "codedoggy.cli:main"
+# Install once → type `doggy`
+doggy = "codedoggy.cli:main"
 
 [build-system]
 requires = ["hatchling"]

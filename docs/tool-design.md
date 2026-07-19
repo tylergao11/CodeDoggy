@@ -12,12 +12,11 @@ in each common tool and why.
 4. **Defaults are finite** — omitted args never mean “unbounded dump.”
 5. **Descriptions state hard constraints** (timeouts, missing unix utils, FG-only).
 6. **Claim matches implement** — do not advertise capabilities we do not have.
-7. **No invented degrade / “兜底” paths.** Mature systems (and Grok source) do not
-   silently fall back to a second mechanism we invented. If Grok does A then B,
-   that is the protocol (e.g. hard-kill always does Job kill **and** child
-   `start_kill`) — not “Job failed so try taskkill.” Missing backend → hard
+7. **No invented degrade / “兜底” paths.** Do not silently fall back to a second
+   mechanism we invented. Hard-kill always does Job kill **and** child
+   `start_kill` — not “Job failed so try taskkill.” Missing backend → hard
    unavailable / error, never a fake substitute (no graph-as-LSP, no taskkill
-   as Job substitute). Incomplete ports are labeled **C/A/X**, not papered over.
+   as Job substitute).
 
 ## Per-tool details
 
@@ -83,7 +82,7 @@ in each common tool and why.
 | Shell detect | pwsh → powershell → git bash → cmd | Matches host, not assumed bash |
 | UTF-8 env | `PYTHONUTF8`, `PYTHONIOENCODING` | Child tools don’t mojibake |
 | Default timeout | 120s, max 300s; `0`→default | Finite by default |
-| Timeout kill | Windows: TerminateJobObject + child kill (Grok; no taskkill); POSIX: killpg SIGTERM→SIGKILL | Descendants die with the shell |
+| Timeout kill | Windows: TerminateJobObject + child kill (no taskkill); POSIX: killpg SIGTERM→SIGKILL | Descendants die with the shell |
 | Output card | first line `exit: N` or `exit: killed (timeout)` | Always parseable |
 | Output cap | 20_000 chars | Shell is noisy; hard stop |
 | `description` required | yes | Forces intentional shell use |
@@ -95,16 +94,16 @@ in each common tool and why.
 
 | Detail | Behavior | Why |
 |--------|----------|-----|
-| `is_background` | returns XML task-id envelope | Grok BackgroundTaskStarted |
+| `is_background` | returns XML task-id envelope | Background task started card |
 | `get_task_output` | snapshot or wait (cap 10m) | Unified bash + subagent lookup |
-| `kill_task` | process tree + subagent cancel | Same surface as Grok |
+| `kill_task` | process tree + subagent cancel | Unified bash + subagent kill |
 | Output file | session `.codedoggy/tasks/<sid>/` | Full log via read_file |
 
 ### Web
 
 | Detail | Behavior | Why |
 |--------|----------|-----|
-| SSRF | block private/metadata IPs; loopback OK | Grok ssrf.rs |
+| SSRF | block private/metadata IPs; loopback OK | Safe default for agent web fetch |
 | web_search | DDG Instant Answer or `CODEDOGGY_WEB_SEARCH_URL` | No hard vendor lock |
 
 ## What not to put in tools

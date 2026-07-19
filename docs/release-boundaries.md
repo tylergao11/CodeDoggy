@@ -1,14 +1,13 @@
 # Release / audit boundaries
 
-Honest cut line for what CodeDoggy **ships**, what is **glue** (not a full Grok port), and what is **deferred**.  
-Do not claim features outside this file. Port rules: [`docs/grok-source-map.md`](grok-source-map.md). Hermes seam: [`docs/hermes-groke-seam.md`](hermes-groke-seam.md).
+CodeDoggy **已交付 / 胶水层 / 延期** 的诚实分界。不要在文档外宣称未实现能力。
 
 | Label | Meaning |
 |-------|---------|
-| **DONE** | Implemented + covered by attack/regression tests listed below |
-| **GLUE** | CodeDoggy-only subset that satisfies a *contract*; not a full Grok/Hermes/Codex stack |
-| **DEFERRED** | Not implemented (or host-only stub); do not market as product-complete |
-| **REMOVED** | Was present; deliberately out of product path |
+| **DONE** | 已实现，且有下列攻击/回归测试覆盖 |
+| **GLUE** | 满足产品契约的精简实现，不是完整外部栈复刻 |
+| **DEFERRED** | 未实现或 host stub；勿当产品完成项宣传 |
+| **REMOVED** | 曾存在，已刻意移出产品路径 |
 
 ---
 
@@ -46,87 +45,39 @@ Do not claim features outside this file. Port rules: [`docs/grok-source-map.md`]
 | **Coordinator** | Executes what MAIN spawned (`spawn_many` / `wait_all`); not a policy engine | `tests/test_parallel_tasks.py` |
 | **`general-purpose` agent** | Available type MAIN may name | `tests/test_parallel_tasks.py` |
 
-Related suites: `tests/test_orchestration.py`, `tests/test_hermes_seam.py`, `tests/test_grok_fidelity.py`, `tests/test_spawn_subagent.py`.
+Related suites: `tests/test_orchestration.py`, `tests/test_spawn_subagent.py`, `tests/test_image_gen.py`.
 
 ---
 
-## 2. GLUE — contract satisfied, not full upstream stack
+## 2. GLUE — intentional thin implementations
 
-| Area | What ships | What it is *not* |
-|------|------------|------------------|
-| **Worktree isolation** | Minimal `git worktree` create / reattach / remove / merge (`orchestration/worktree.py`) | Full `xai-fast-worktree` + pool + shell session RPC |
-| **MCP surface** | Wire tools `search_tool` / `use_tool`; host injects catalog + `mcp_dispatch` | Built-in MCP transport, BM25 registry, or production MCP client pack |
-| **SessionActor spine** | `RuntimeKernel` + turn loop + prompt queue / interjection (spirit map in `SCHEME.md`) | Full Grok `SessionActor` (ACP session, all host channels, complete actor state machine) |
-| **Stream deltas** | Optional `stream_sample` / `on_sample_delta` for host UI | Mid-stream interjection interrupt (explicitly deleted invention) |
-| **Resume transcript** | Serialize `Message` dicts for prior live | Full ConversationItem / sampling-type store from Grok |
-| **Shell process kill** | Win32 TerminateJobObject + child kill (no taskkill); POSIX killpg | Full Grok terminal actor + Linux cgroup |
-| **Subagent pool** | Thread-pool runs children MAIN spawned; `parallel_tasks` is opt-in | Auto task-split; full Grok multi-agent kernel / channel RPC |
-| **Batch tool dispatch** | Phase-1 prepare all + phase-2 path-lock parallel execute (Grok `tool_calls` / `tool_dispatch` spirit); writeback in emission order | Full tokio FuturesUnordered + interruptible wait tools |
+| Area | What ships | Honest limit |
+|------|------------|--------------|
+| **Session spine** | `RuntimeKernel` + turn loop + prompt queue / interjection | 非完整宿主 session actor |
+| **Resume transcript** | Serialize `Message` dicts for prior live | 非完整 ConversationItem 存储 |
+| **Shell process kill** | Win32 TerminateJobObject + child kill；POSIX killpg | 非完整终端 actor + cgroup |
+| **Subagent pool** | Thread-pool runs children MAIN spawned | 无自动 task-split |
+| **Batch tool dispatch** | Phase-1 prepare + phase-2 path-lock parallel；writeback 按 emit 序 | 非 Tokio 全量 interruptible wait |
+| **Media tools** | image/video/web_search 跟 ActiveConnection | 端点不支持则 `not_supported`，不跨 provider 偷密钥 |
 
 ---
 
-## 3. REMOVED — do not claim as product
+## 3. DEFERRED
 
-| Area | Status | Notes |
-|------|--------|-------|
-| **Write-time soft quality reviewer (former product)** | **Deleted** | Package and hooks removed; no P0 footnotes, no soft restore. |
-| **Full TX write-time reviewer** | Never shipped | Do not reintroduce. |
+| Area | Notes |
+|------|-------|
+| **Interactive sandbox / approval UX** | Workspace policy/gate 存在；默认高权限是产品选择，非完整沙箱审批 UI |
+| **Full LSP product** | 需 host `lsp_backend`；`code_nav` 不顶替 LSP |
+| **Binary CLI installer** | Python 包 + `uv tool install`；无官方 install.ps1 二进制分发 |
 
----
-
-## 4. DEFERRED — do not claim
-
-| Area | Status today | Notes |
-|------|--------------|-------|
-| **Codex / Grok sandbox + interactive permission** | Deferred | Workspace **policy/gate** exists; product still runs high privilege by choice (`docs/tool-checklist.md`). Not a Codex-style sandbox or approval UX. |
-| **Full SessionActor** | Deferred | Kernel + loop is the host-facing subset only. |
-| **MCP transport** | Deferred | Host-owned; tools fail soft / error without injection. No in-tree MCP wire protocol. |
-| **LSP runtime** | Deferred / host | `lsp` tool needs `lsp_backend`; `code_nav` is graph, **not** LSP. |
-| **Scheduler timer actor / notifications** | Deferred | Interval/types/tools **S**; no tokio-style timer bus. |
-| **ShellState full FD dump** | Deferred | cwd + env probe only. |
-
-Do **not** invent additional roadmap rows here. Port depth for tools: [`docs/grok-source-fidelity.md`](docs/grok-source-fidelity.md).
+Do **not** invent additional roadmap rows here without implementation.
 
 ---
 
-## 5. Release checklist — attack suites must be green
-
-Before calling a build release-ready for audit boundaries, these **must** pass:
+## 4. Verification (smoke)
 
 ```bash
-# Core P0 / P1 attack suites
 pytest tests/test_p0_attack.py tests/test_p1_attack.py -q
-
-# Kernel / gate regressions
-pytest tests/test_p1_attack.py -q
-
-# Parallel MAIN product path + Grok batch dispatch
-pytest tests/test_parallel_tasks.py tests/test_bootstrap.py tests/test_batch_parallel.py -q
-
-# Major P1 attack expansions
-pytest tests/test_p1_graph.py tests/test_p1_graph_internal.py \
-       tests/test_p1_session_queue.py tests/test_p1_use_tool.py \
-       tests/test_p1_provider_tools.py tests/test_p1_tool_extra.py -q
-
-# Seam / port map locks (recommended same gate)
-pytest tests/test_hermes_seam.py tests/test_grok_fidelity.py -q
-```
-
-One-shot product gate:
-
-```bash
-pytest \
-  tests/test_p0_attack.py \
-  tests/test_p1_attack.py \
-  tests/test_parallel_tasks.py \
-  tests/test_bootstrap.py \
-  tests/test_p1_graph.py \
-  tests/test_p1_graph_internal.py \
-  tests/test_p1_session_queue.py \
-  tests/test_p1_use_tool.py \
-  tests/test_p1_provider_tools.py \
-  tests/test_p1_tool_extra.py \
-  tests/test_hermes_seam.py \
-  tests/test_grok_fidelity.py \
-  -q
+pytest tests/test_orchestration.py tests/test_parallel_tasks.py -q
+pytest tests/test_image_gen.py tests/test_connection.py -q
 ```

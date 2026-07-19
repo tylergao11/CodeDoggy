@@ -36,7 +36,7 @@ Managed set (`_MANAGED_TOOL_EXTRA_KEYS`):
 | `memory_store` | `memory` | bound | `memory_get`, `memory` (Doggy write) |
 | `session_store` | `session_store` | bound | `session_search` |
 | `policy` | `policy` | bound | gate, `use_tool` path checks, `code_nav` reindex |
-| `memory_manager` | `memory_manager` | bound | Hermes provider tools |
+| `memory_manager` | `memory_manager` | bound | memory provider tools |
 | `graph` | `graph` | bound | `code_nav` only — **not** LSP |
 | `audit` | `audit` | bound | audit hooks / P0 |
 | `session_mode_state` | `session_mode_state` | bound | plan/goal gates |
@@ -47,12 +47,12 @@ Managed set (`_MANAGED_TOOL_EXTRA_KEYS`):
 | `scheduler` | `scheduler` | always after `__post_init__` (default `Scheduler`) | `scheduler_*` |
 | `todo_state` | `todo_state` | bound / lazy-filled by tool | `todo_write` |
 
-`build_session` binds memory/policy/graph/subagent/audit and calls `refresh_tool_extra` after Hermes bind.
+`build_session` binds memory/policy/graph/subagent and calls `refresh_tool_extra` after memory bind.
 
 Runner defensive fill (if kernel missing a key): `memory_manager`, `memory_store`, `session_store`, `policy`, `graph`, plus optional `prefetch_user_block`.
 
 **Lazy without kernel:** `ensure_task_manager` / `ensure_scheduler` create local instances into the bag.
-Shell kill uses real Win32 Job Objects when assigned (`util/job_object.py`); scheduler tick is a light host poller, not a Grok Tokio actor.
+Shell kill uses real Win32 Job Objects when assigned (`util/job_object.py`); scheduler tick is a light host poller.
 
 ---
 
@@ -66,10 +66,10 @@ Host or session UI injects these. Refresh **preserves** them.
 | `memory_backend` | `.search(query, max_results=…, min_score=…)` → ranked hits | `memory_search` only |
 | `mcp_dispatch` | `McpDispatch`：`callable(tool_name, tool_input)` | `use_tool` (**transport 仍 host**) |
 | `mcp_tools` | `list[dict]` catalog (`name`, `description`, `parameters`/`input_schema`, …) | `search_tool`, schema prep；无 index 时自动建 BM25 |
-| `mcp_tool_index` | Grok `ToolIndex` / `ToolSearchIndex`（`.search_snapshot` / `.list_server_summaries`；可选 `.get`） | `search_tool`；`ensure_mcp_tool_index` 从 catalog 生成 `ToolIndex(Bm25…)` |
+| `mcp_tool_index` | ToolIndex / search index（`.search_snapshot` / `.list_server_summaries`；可选 `.get`） | `search_tool`；`ensure_mcp_tool_index` 从 catalog 生成 BM25 index |
 | `mcp_servers` / `mcp_initialized` | server 列表 + 是否 ready | BM25 `is_ready` / system-reminder |
-| `skills_registry` / `skill_paths` | `list[SkillInfo\|dict]` 或额外目录 | `skill` tool；否则扫 `.codedoggy/skills` / `.grok/skills` |
-| `native_tool_correction` | Grok `UseToolParams` bool（默认 true） | `use_tool` 原生工具纠错 |
+| `skills_registry` / `skill_paths` | `list[SkillInfo\|dict]` 或额外目录 | `skill` tool；否则扫 `.codedoggy/skills` |
+| `native_tool_correction` | bool（默认 true） | `use_tool` 原生工具纠错 |
 | `ask_user_fn` | `fn(list[question_dict])` → answers | `ask_user_question` |
 | `plan_mode_consent_fn` | `fn() -> bool` | `enter_plan_mode` (decline → soft string) |
 | `plan_mode_exit_fn` | host outcome hook | `exit_plan_mode` |
@@ -77,15 +77,14 @@ Host or session UI injects these. Refresh **preserves** them.
 | `goal_ack_fn` | harness ack for `update_goal` | optional; else local ack |
 | `shell_state` | cwd + env overlays across `run_terminal_command` | shell tools |
 | `stream_sample` / `on_sample_delta` | streaming UI hooks | turn loop |
-| `prefetch_user_block` | Hermes fence text | runner → loop |
+| `prefetch_user_block` | memory fence text | runner → loop |
 | `writes_paused` | pause mutating tools | registry gate |
 
 ### MCP mutation envelope
 
 If `mcp_dispatch` returns only a plain string, workspace side effects are not
 recorded on the tool context. For write tools host **should** return structured
-shapes (`mutations` / `mutation` / `mutated_paths` / `mutated_path`). See
-`docs/grok-tool-surface.md`.
+shapes (`mutations` / `mutation` / `mutated_paths` / `mutated_path`).
 
 ---
 
@@ -93,13 +92,13 @@ shapes (`mutations` / `mutation` / `mutated_paths` / `mutated_path`). See
 
 | Tool | Required extra | When missing |
 |------|----------------|--------------|
-| `lsp` | `lsp_backend` with `dispatch`/`run` | `ToolError` code `process_manager`: *“LSP tool is unavailable. Configure ~/.grok/lsp.json or \<cwd\>/.grok/lsp.json …”* |
-| `memory_search` | `memory_backend.search` | Product `build_session` injects simple store backend when memory on. Soft Grok string only if backend missing. |
-| `memory_get` | `memory_store` (`MemoryStore`) | Same soft experimental-memory string (not ToolError) |
+| `lsp` | `lsp_backend` with `dispatch`/`run` | `ToolError` code `process_manager` (LSP unavailable) |
+| `memory_search` | `memory_backend.search` | Product `build_session` injects simple store backend when memory on. Soft string if backend missing. |
+| `memory_get` | `memory_store` (`MemoryStore`) | Soft experimental-memory string (not ToolError) |
 | `memory` (Doggy) | `memory_store` | `ToolError` `memory_not_configured` |
 | `session_search` | `session_store` | `ToolError` `session_store_not_configured` |
 | `code_nav` | `graph` | `ToolError` `not_available` (graph — **not** LSP) |
-| `search_tool` | `mcp_tool_index` or `mcp_tools` | Soft Grok note: *“No integration tools are configured. MCP servers are not connected.”* |
+| `search_tool` | `mcp_tool_index` or `mcp_tools` | Soft note when MCP not connected |
 | `use_tool` | `mcp_dispatch` | `ToolError` `mcp_dispatch_missing` |
 | `ask_user_question` | `ask_user_fn` | `MIGRATION_FALLBACK=True` → QuestionsSent soft text + `pending_user_questions` stash; no real UI wait |
 | `spawn_subagent` / `parallel_tasks` | `subagent_coordinator` + `subagent_run_fn` | `ToolError` `missing_resource` |
@@ -121,12 +120,12 @@ Do **not** add or reintroduce:
 | Invention | Why forbidden |
 |-----------|----------------|
 | **graph-as-LSP** | `code_nav` is graph; `lsp` needs real `lsp_backend`. No fallback between them. |
-| **BM25 registry as Grok MCP index** | No in-tree `mcp_registry` BM25. Host owns `mcp_tool_index` / simple `mcp_tools` filter. |
-| **Invented degrade / taskkill-as-Job** | Forbidden. Kill path is Grok protocol only: TerminateJobObject then child kill. Missing full actor → label **C**, do not invent a second mechanism. |
+| **BM25 registry as fake MCP index** | No in-tree `mcp_registry` BM25. Host owns `mcp_tool_index` / simple `mcp_tools` filter. |
+| **Invented degrade / taskkill-as-Job** | Forbidden. Kill path: TerminateJobObject then child kill. Do not invent a second mechanism. |
 | Token-scored `MemoryStore` as `memory_search` | Search is only `memory_backend`; store is for get/write. |
-| Mid-stream interjection interrupt as product | Deleted invention; interjections drain at safe points only. |
+| Mid-stream interjection interrupt as product | Interjections drain at safe points only. |
 
-See also: `docs/grok-source-fidelity.md` “已删除的脑补”, `docs/release-boundaries.md` DEFERRED.
+See also: `docs/release-boundaries.md` DEFERRED.
 
 ---
 
