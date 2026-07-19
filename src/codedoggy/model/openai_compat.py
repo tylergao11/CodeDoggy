@@ -1,8 +1,7 @@
-"""OpenAI-compatible chat/completions client (stdlib HTTP, no SDK).
+"""OpenAI-compatible chat/completions transport (stdlib HTTP, no SDK).
 
-Hermes talks to Ollama/local endpoints the same way: ``base_url`` + optional
-key on the OpenAI wire format. Grok's sampler is richer (streaming, auth
-schemes); we keep the same *config* axes without the full stack.
+Reads a :class:`ProviderProfile` for message prep and request kwargs quirks
+(Hermes transport + profile split, slimmed for CodeDoggy).
 """
 
 from __future__ import annotations
@@ -14,6 +13,9 @@ import urllib.error
 import urllib.request
 from typing import Any
 
+from codedoggy.model.profile import ProviderProfile
+from codedoggy.model.profile_registry import get_profile
+from codedoggy.model.reasoning import extract_reasoning_from_message
 from codedoggy.model.types import ChatMessage, CompletionResult, ModelConfig
 
 logger = logging.getLogger(__name__)
@@ -46,6 +48,10 @@ def _as_dict_messages(
                 d["tool_call_id"] = m.tool_call_id
             if m.tool_calls:
                 d["tool_calls"] = m.tool_calls
+            if m.reasoning_content is not None:
+                d["reasoning_content"] = m.reasoning_content
+            if m.provider_data:
+                d["provider_data"] = dict(m.provider_data)
             out.append(d)
         else:
             out.append(dict(m))
@@ -53,14 +59,24 @@ def _as_dict_messages(
 
 
 class OpenAICompatClient:
-    """POST ``{base_url}/chat/completions``."""
+    """POST ``{base_url}/chat/completions`` with optional provider profile."""
 
-    def __init__(self, config: ModelConfig) -> None:
+    def __init__(
+        self,
+        config: ModelConfig,
+        *,
+        profile: ProviderProfile | None = None,
+    ) -> None:
         self._config = config
+        self._profile = profile or get_profile(config.provider)
 
     @property
     def config(self) -> ModelConfig:
         return self._config
+
+    @property
+    def profile(self) -> ProviderProfile | None:
+        return self._profile
 
     def complete(
         self,
@@ -72,28 +88,14 @@ class OpenAICompatClient:
     ) -> CompletionResult:
         cfg = self._config
         url = f"{cfg.normalized_base_url()}/chat/completions"
-        body: dict[str, Any] = {
-            "model": cfg.model,
-            "messages": _as_dict_messages(messages),
-            "stream": False,
-        }
-        temp = temperature if temperature is not None else cfg.temperature
-        if temp is not None:
-            body["temperature"] = temp
-        mt = max_tokens if max_tokens is not None else cfg.max_tokens
-        if mt is not None:
-            body["max_tokens"] = mt
-        if tools:
-            body["tools"] = tools
-
-        headers = {
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-            **cfg.extra_headers,
-        }
-        if cfg.api_key:
-            headers["Authorization"] = f"Bearer {cfg.api_key}"
-
+        body = self._build_body(
+            messages,
+            stream=False,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            tools=tools,
+        )
+        headers = self._headers(accept="application/json")
         data = json.dumps(body).encode("utf-8")
         req = urllib.request.Request(url, data=data, headers=headers, method="POST")
         try:
@@ -113,41 +115,7 @@ class OpenAICompatClient:
         except json.JSONDecodeError as e:
             raise ModelError(f"Invalid JSON from model endpoint: {e}") from e
 
-        choices = payload.get("choices") or []
-        if not choices:
-            raise ModelError(f"No choices in model response: {payload!r}"[:400])
-        msg = choices[0].get("message") or {}
-        content = msg.get("content")
-        if isinstance(content, list):
-            # Some multimodal endpoints return content parts.
-            content = "".join(
-                p.get("text", "") for p in content if isinstance(p, dict)
-            )
-        tool_calls = msg.get("tool_calls") or []
-        if not isinstance(tool_calls, list):
-            tool_calls = []
-        text = content if isinstance(content, str) else (str(content) if content else None)
-        text = scrub_model_content(text)
-        # Some endpoints put visible answer in alternate fields after thinking.
-        if not text:
-            for key in ("reasoning_content", "reasoning"):
-                alt = msg.get(key)
-                if isinstance(alt, str) and alt.strip() and not tool_calls:
-                    # Prefer not to surface pure chain-of-thought as final answer.
-                    break
-            for key in ("refusal",):
-                alt = msg.get(key)
-                if isinstance(alt, str) and alt.strip():
-                    text = alt.strip()
-                    break
-        return CompletionResult(
-            content=text,
-            model=str(payload.get("model") or cfg.model),
-            finish_reason=choices[0].get("finish_reason"),
-            tool_calls=tool_calls,
-            raw=payload,
-            usage=dict(payload.get("usage") or {}),
-        )
+        return self._completion_from_payload(payload)
 
     def complete_stream(
         self,
@@ -166,29 +134,16 @@ class OpenAICompatClient:
         """
         cfg = self._config
         url = f"{cfg.normalized_base_url()}/chat/completions"
-        body: dict[str, Any] = {
-            "model": cfg.model,
-            "messages": _as_dict_messages(messages),
-            "stream": True,
-            "stream_options": {"include_usage": True},
-        }
-        temp = temperature if temperature is not None else cfg.temperature
-        if temp is not None:
-            body["temperature"] = temp
-        mt = max_tokens if max_tokens is not None else cfg.max_tokens
-        if mt is not None:
-            body["max_tokens"] = mt
-        if tools:
-            body["tools"] = tools
+        body = self._build_body(
+            messages,
+            stream=True,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            tools=tools,
+        )
+        body["stream_options"] = {"include_usage": True}
 
-        headers = {
-            "Content-Type": "application/json",
-            "Accept": "text/event-stream",
-            **cfg.extra_headers,
-        }
-        if cfg.api_key:
-            headers["Authorization"] = f"Bearer {cfg.api_key}"
-
+        headers = self._headers(accept="text/event-stream")
         data = json.dumps(body).encode("utf-8")
         req = urllib.request.Request(url, data=data, headers=headers, method="POST")
         try:
@@ -199,7 +154,6 @@ class OpenAICompatClient:
                     on_delta=on_delta,
                 )
         except urllib.error.HTTPError as e:
-            # Some local servers reject stream or stream_options — fall back.
             if e.code in {400, 404, 422}:
                 logger.debug("stream rejected (%s); falling back to complete", e.code)
                 return self.complete(
@@ -216,6 +170,111 @@ class OpenAICompatClient:
         except urllib.error.URLError as e:
             raise ModelError(f"Failed to reach {url}: {e.reason}") from e
 
+    def _headers(self, *, accept: str) -> dict[str, str]:
+        cfg = self._config
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": accept,
+            **(self._profile.default_headers if self._profile else {}),
+            **cfg.extra_headers,
+        }
+        if cfg.api_key:
+            headers["Authorization"] = f"Bearer {cfg.api_key}"
+        return headers
+
+    def _build_body(
+        self,
+        messages: list[ChatMessage] | list[dict[str, Any]],
+        *,
+        stream: bool,
+        temperature: float | None,
+        max_tokens: int | None,
+        tools: list[dict[str, Any]] | None,
+    ) -> dict[str, Any]:
+        cfg = self._config
+        wire_msgs = _as_dict_messages(messages)
+        if self._profile is not None:
+            wire_msgs = self._profile.prepare_messages(wire_msgs, model=cfg.model)
+
+        body: dict[str, Any] = {
+            "model": cfg.model,
+            "messages": wire_msgs,
+            "stream": stream,
+        }
+        temp = temperature if temperature is not None else cfg.temperature
+        if temp is not None:
+            body["temperature"] = temp
+        mt = max_tokens if max_tokens is not None else cfg.max_tokens
+        if mt is not None:
+            body["max_tokens"] = mt
+        if tools:
+            body["tools"] = tools
+
+        # Profile + config.extra reasoning knobs
+        reasoning_config = None
+        if isinstance(cfg.extra, dict):
+            rc = cfg.extra.get("reasoning")
+            if isinstance(rc, dict):
+                reasoning_config = rc
+
+        if self._profile is not None:
+            extra_body, top_level = self._profile.build_api_kwargs_extras(
+                model=cfg.model,
+                reasoning_config=reasoning_config,
+            )
+            if extra_body:
+                # OpenAI-compat: vendor-specific keys usually sit top-level or
+                # under a nested bag; DeepSeek expects ``thinking`` top-level
+                # when using raw HTTP (same as extra_body merge in SDK).
+                body.update(extra_body)
+            if top_level:
+                body.update(top_level)
+
+        # Opaque extra passthrough (num_ctx, etc.) — never override core keys
+        if isinstance(cfg.extra, dict):
+            for k, v in cfg.extra.items():
+                if k in {"reasoning", "messages", "model", "stream", "tools"}:
+                    continue
+                if k not in body:
+                    body[k] = v
+
+        return body
+
+    def _completion_from_payload(self, payload: dict[str, Any]) -> CompletionResult:
+        cfg = self._config
+        choices = payload.get("choices") or []
+        if not choices:
+            raise ModelError(f"No choices in model response: {payload!r}"[:400])
+        msg = choices[0].get("message") or {}
+        content = msg.get("content")
+        if isinstance(content, list):
+            content = "".join(
+                p.get("text", "") for p in content if isinstance(p, dict)
+            )
+        tool_calls = msg.get("tool_calls") or []
+        if not isinstance(tool_calls, list):
+            tool_calls = []
+        text = content if isinstance(content, str) else (str(content) if content else None)
+        text = scrub_model_content(text)
+        reasoning = extract_reasoning_from_message(msg)
+        if not text:
+            for key in ("refusal",):
+                alt = msg.get(key)
+                if isinstance(alt, str) and alt.strip():
+                    text = alt.strip()
+                    break
+        usage = normalize_openai_usage(payload.get("usage") or {})
+        return CompletionResult(
+            content=text,
+            model=str(payload.get("model") or cfg.model),
+            finish_reason=choices[0].get("finish_reason"),
+            tool_calls=tool_calls,
+            raw=payload,
+            usage=usage,
+            reasoning_content=reasoning,
+            provider_data=None,
+        )
+
 
 def _consume_sse_completion(
     resp: Any,
@@ -225,6 +284,7 @@ def _consume_sse_completion(
 ) -> CompletionResult:
     """Parse OpenAI-compatible SSE chat.completion.chunk stream."""
     content_parts: list[str] = []
+    reasoning_parts: list[str] = []
     tool_acc: dict[int, dict[str, Any]] = {}
     finish_reason: str | None = None
     usage: dict[str, Any] = {}
@@ -269,6 +329,11 @@ def _consume_sse_completion(
                     on_delta(piece)
                 except Exception:  # noqa: BLE001
                     logger.debug("on_delta failed", exc_info=True)
+        for rkey in ("reasoning_content", "reasoning"):
+            rp = delta.get(rkey)
+            if isinstance(rp, str) and rp:
+                reasoning_parts.append(rp)
+                break
         for tc in delta.get("tool_calls") or []:
             if not isinstance(tc, dict):
                 continue
@@ -288,6 +353,7 @@ def _consume_sse_completion(
                 )
 
     text = scrub_model_content("".join(content_parts) or None)
+    reasoning = "".join(reasoning_parts).strip() or None
     tool_calls = [tool_acc[i] for i in sorted(tool_acc)]
     return CompletionResult(
         content=text,
@@ -296,7 +362,33 @@ def _consume_sse_completion(
         tool_calls=tool_calls,
         raw={"stream": True, "chunks": len(raw_chunks), "usage": usage},
         usage=usage,
+        reasoning_content=reasoning,
     )
+
+
+def normalize_openai_usage(usage: Any) -> dict[str, Any]:
+    """Normalize OpenAI / DeepSeek usage including cache hit fields.
+
+    DeepSeek reports ``prompt_cache_hit_tokens`` / ``prompt_cache_miss_tokens``.
+    OpenAI may report ``prompt_tokens_details.cached_tokens``.
+    """
+    if not isinstance(usage, dict):
+        return {}
+    out = dict(usage)
+    # DeepSeek disk cache
+    hit = usage.get("prompt_cache_hit_tokens")
+    miss = usage.get("prompt_cache_miss_tokens")
+    if hit is not None:
+        out["cache_read_input_tokens"] = hit
+        out["cached_tokens"] = hit
+    if miss is not None:
+        out["cache_miss_input_tokens"] = miss
+    # OpenAI nested details
+    details = usage.get("prompt_tokens_details")
+    if isinstance(details, dict) and details.get("cached_tokens") is not None:
+        out.setdefault("cached_tokens", details.get("cached_tokens"))
+        out.setdefault("cache_read_input_tokens", details.get("cached_tokens"))
+    return out
 
 
 def scrub_model_content(text: str | None) -> str | None:

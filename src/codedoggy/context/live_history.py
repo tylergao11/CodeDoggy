@@ -43,6 +43,58 @@ def seed_messages(
     return out
 
 
+def model_sample_messages(
+    messages: list[Message],
+    *,
+    user_message_prefix: str,
+) -> list[Message]:
+    """Build Grok's model-facing MAIN view without mutating live history.
+
+    The archive/live transcript intentionally retains the user's clean text.
+    For the sampler only, insert Grok's session prefix after SYSTEM rows and
+    wrap ordinary user requests in ``<user_query>``.  Synthetic user
+    items (compaction handoffs, reminders, rewinds) keep their own framing;
+    interjections already contain a canonical ``<user_query>`` block.
+    """
+    from codedoggy.prompt.user_message import user_query
+
+    out = [copy_message(m) for m in messages]
+    for msg in out:
+        if msg.role is not Role.USER:
+            continue
+        content = msg.content or ""
+        if not isinstance(content, str):
+            content = str(content)
+        if _is_synthetic_user_content(content):
+            continue
+        msg.content = user_query(content)
+
+    prefix = (user_message_prefix or "").strip()
+    if prefix:
+        insert_at = 0
+        while insert_at < len(out) and out[insert_at].role is Role.SYSTEM:
+            insert_at += 1
+        out.insert(insert_at, Message(role=Role.USER, content=prefix))
+    return out
+
+
+def _is_synthetic_user_content(content: str) -> bool:
+    stripped = (content or "").lstrip()
+    if not stripped:
+        return True
+    if "<user_query>" in stripped:
+        return True
+    return stripped.startswith(
+        (
+            "<user_info>",
+            "<system-reminder>",
+            "[end-of-turn notes]",
+            "[CONTEXT COMPACTION",
+            "[CHECKPOINT REWIND",
+        )
+    )
+
+
 def copy_message(m: Message) -> Message:
     """Shallow copy so later prune/fold cannot mutate archived siblings."""
     return Message(

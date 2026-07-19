@@ -1,13 +1,18 @@
 """Index cache — manager/cache.rs spirit as portable JSON + query_version.
 
-Rust cache file is ``.goto_index.bin`` (SGIX). Here: ``.goto_index.json`` with
-the same semantic fields (defs/refs/aliases/file_meta/query_version).
+Grok keeps codebase indexes outside the workspace under
+``~/.grok/indexes/{encoded_cwd}``.  CodeDoggy mirrors that ownership under
+``CODEDOGGY_HOME`` (or ``~/.codedoggy``) so a read-only graph query never
+creates a file in the repository being inspected.
 """
 
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 from pathlib import Path
+from urllib.parse import quote
 
 from codedoggy.graph.index import ScopeGraphIndex
 from codedoggy.graph.types import FileMeta, QueryVersion
@@ -18,10 +23,31 @@ CACHE_FORMAT_VERSION = 2  # bump when wire format changes
 
 
 def get_cache_path(root_path: Path | str) -> Path:
-    return Path(root_path).resolve() / CACHE_FILE_NAME
+    """Return the profile-owned cache path for a canonical workspace root.
+
+    Source analogue:
+    ``xai-grok-workspace/file_system/codebase_index.rs::get_index_cache_path``.
+    The public function signature is unchanged; only cache ownership moves
+    from the repository to the CodeDoggy profile.
+    """
+    root = Path(root_path).expanduser().resolve()
+    home_env = os.environ.get("CODEDOGGY_HOME", "").strip()
+    home = (
+        Path(home_env).expanduser().resolve()
+        if home_env
+        else (Path.home() / ".codedoggy").resolve()
+    )
+    encoded = quote(str(root), safe="")
+    return home / "indexes" / encoded / CACHE_FILE_NAME
 
 
 def save_index(path: Path | str, index: ScopeGraphIndex) -> None:
+    """Atomically replace a cache snapshot.
+
+    The temporary file lives beside the destination so ``os.replace`` stays
+    on one filesystem.  Readers therefore observe either the previous complete
+    JSON snapshot or the new complete snapshot, never a truncated write.
+    """
     path = Path(path)
     data = {
         "format_version": CACHE_FORMAT_VERSION,
@@ -35,7 +61,24 @@ def save_index(path: Path | str, index: ScopeGraphIndex) -> None:
         },
         "files": list(index._files),
     }
-    path.write_text(json.dumps(data), encoding="utf-8")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps(data, ensure_ascii=False)
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent)
+    )
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
+            f.write(payload)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
 
 
 class CacheFormatError(ValueError):

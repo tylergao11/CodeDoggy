@@ -56,7 +56,9 @@ def model_profiles_from_env() -> ModelProfiles:
         temperature=aux_temp,
         max_tokens=aux_max,
         timeout_s=aux_timeout or 120.0,
+        context_window=main.context_window,
         extra_headers=dict(main.extra_headers),
+        extra=dict(main.extra),
     )
     return ModelProfiles(main=main, aux=aux)
 

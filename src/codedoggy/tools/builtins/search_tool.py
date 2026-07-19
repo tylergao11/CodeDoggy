@@ -6,6 +6,11 @@ Source: implementations/search_tool/mod.rs
   - search_snapshot → group by server → status ready/partial
 Pure: grok_build/search_tool_logic.py
 Index: tools/mcp/tool_index.py (Grok shell Bm25ToolSearchIndex)
+
+The standard Session runtime provides ``extra['mcp_tool_index']`` and the live
+``extra['mcp_tools']`` catalog. Embedding hosts can still inject compatible
+resources; absent either resource this preserves Grok's
+``NO_MCP_CONFIGURED`` response.
 """
 
 from __future__ import annotations

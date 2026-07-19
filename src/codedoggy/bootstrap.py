@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
+from typing import Any, Mapping, Sequence
 
 from codedoggy.memory.manager import MemoryManager
 from codedoggy.memory.session_store import SessionStore, default_session_db_path
@@ -16,17 +18,23 @@ from codedoggy.tools.policy import WorkspacePolicy
 from codedoggy.tools.registry import FinalizedToolset, ToolRegistryBuilder
 from codedoggy.turn.runner import AgentTurnRunner
 
+logger = logging.getLogger(__name__)
+
 
 def build_session(
     cwd: str | Path,
     *,
     goal: str | None = None,
-    max_turns: int | None = 32,
+    max_turns: int | None = None,
     system_prompt: str | None = None,
     enable_memory: bool = True,
     enable_session_store: bool = True,
     enable_policy: bool = True,
     enable_graph: bool = True,
+    enable_mcp: bool | None = None,
+    mcp_servers: Mapping[str, Mapping[str, Any]] | Sequence[Any] | None = None,
+    mcp_watch: bool = True,
+    mcp_auto_restart: bool = True,
     memory_dir: str | Path | None = None,
     session_db: str | Path | None = None,
     profiles: ModelProfiles | None = None,
@@ -42,9 +50,27 @@ def build_session(
     - **MAIN parallel bias**: system prompt + tools; MAIN decides when to fan out
       (harness does **not** auto-split or auto-parallelize work for MAIN)
     - **Graph**: ``CodebaseGraph`` (xai-codebase-graph API spirit)
+    - **MCP**: Grok ``McpState`` + dispatcher + stdio/HTTP transports
     """
     prof = profiles or model_profiles_from_env()
-    main = main_client or prof.main_client()
+    # Soft auth at bootstrap so TUI can open the login wizard when unauthenticated.
+    # Hard gate happens when starting a turn / reloading after login.
+    if main_client is not None:
+        main = main_client
+    else:
+        from codedoggy.model.registry import create_client
+
+        try:
+            main = create_client(prof.main, require_auth=False)
+        except Exception as exc:
+            from codedoggy.model.auth.base import LoginRequired
+
+            if isinstance(exc, LoginRequired):
+                raise LoginRequired(
+                    exc.provider,
+                    f"{exc} — open the TUI auth gate (Street HUD / Ctrl+L).",
+                ) from exc
+            raise
     cwd_path = Path(cwd).resolve()
 
     # Memory pillar FIRST so external provider tools can be injected into the
@@ -59,6 +85,21 @@ def build_session(
     if enable_session_store:
         db = Path(session_db) if session_db else default_session_db_path()
         session_store = SessionStore(db)
+        if session_id:
+            ownership = session_store.validate_session_cwd(
+                session_id,
+                cwd_path,
+                allow_missing=True,
+                allow_unbound=False,
+            )
+            if not ownership.allowed:
+                session_store.close()
+                raise ValueError(
+                    "refusing to hydrate session "
+                    f"{session_id!r} in workspace {ownership.requested_cwd!r}: "
+                    f"{ownership.reason}; stored workspace="
+                    f"{ownership.stored_cwd!r}"
+                )
 
     # Memory pillar orchestration (Hermes MemoryManager + optional external plugin)
     memory_manager: MemoryManager | None = None
@@ -101,7 +142,7 @@ def build_session(
 
         # Glue: attach workspace policy so reindex/cache writes honor allow_writes
         graph = CodebaseGraph(cwd_path, policy=policy if enable_policy else None)
-        # Lazy index on first code_nav use (ensure_indexed)
+        # Index construction remains lazy until code_nav first needs it.
 
     default_system = system_prompt
     if default_system is None:
@@ -226,6 +267,10 @@ def build_session(
         ),
     )
     session.bind_extensions(session.extensions.with_kernel(kernel))
+    if graph is not None:
+        # Acquire this Session's watcher lease only after the runtime spine is
+        # bound. Watching does not trigger a full repository build.
+        graph.start_watch()
 
     # Hermes seam: bind providers to this session (initialize_all) so external
     # tools (notes_append, …) see session_id on first turn. Must run after
@@ -283,6 +328,7 @@ def build_session(
             enable_ask_user_cli=_ask,
             enable_scheduler_tick=_tick,
             start_scheduler_thread=_tick,
+            submit_prompt=session.submit_prompt,
         )
     except Exception:  # noqa: BLE001
         pass
@@ -299,6 +345,47 @@ def build_session(
             n = kernel.hydrate_from_store()
             if n:
                 pass  # live_messages filled
+
+    # Grok MCP runtime: Session-owned clients, progressive initialization,
+    # dispatcher, config diff/reload, and bounded recovery. Start it last so a
+    # later bootstrap failure cannot orphan transport threads or child servers.
+    # Under pytest the implicit product default is disabled so a developer's
+    # global ~/.grok servers cannot leak into isolated unit tests.
+    try:
+        import os as _os
+
+        if enable_mcp is None:
+            raw_mcp = _os.environ.get("CODEDOGGY_MCP", "").strip().lower()
+            if mcp_servers is not None:
+                _enable_mcp = True
+            elif raw_mcp in {"1", "true", "yes", "on"}:
+                _enable_mcp = True
+            elif raw_mcp in {"0", "false", "no", "off"}:
+                _enable_mcp = False
+            else:
+                _enable_mcp = not bool(_os.environ.get("PYTEST_CURRENT_TEST"))
+        else:
+            _enable_mcp = bool(enable_mcp)
+
+        if _enable_mcp:
+            from codedoggy.mcp.runtime import McpRuntime
+
+            mcp_runtime = McpRuntime(
+                cwd_path,
+                session_id=str(session.id),
+                configs=mcp_servers,
+                watch=mcp_watch,
+                auto_restart=mcp_auto_restart,
+            )
+            mcp_runtime.start()
+            mcp_runtime.attach_kernel(kernel)
+    except Exception:  # noqa: BLE001
+        logger.exception("failed to start Grok-aligned MCP runtime")
+        if enable_mcp is True or mcp_servers is not None:
+            try:
+                session.close()
+            finally:
+                raise
     return session
 
 

@@ -1,8 +1,9 @@
 """Host-side adapters that fill tool_extra for product sessions.
 
 Tools stay pure: they only read ``ctx.extra``. This package wires optional
-capabilities without inventing Grok backends (no graph-as-LSP, no BM25 MCP
-registry, no fake Job Object).
+capabilities without inventing unrelated Grok backends (no graph-as-LSP and
+no fake Job Object). The source-aligned MCP runtime is Session-owned and wired
+by bootstrap rather than being a generic host adapter.
 
 Main agent owns bootstrap/kernel injection. Parallel work lands adapters here.
 """
@@ -47,6 +48,7 @@ def wire_default_host_extras(kernel: "RuntimeKernel", **opts: Any) -> dict[str, 
     enable_ask_user_cli = opts.get("enable_ask_user_cli", False)
     enable_scheduler_tick = opts.get("enable_scheduler_tick", False)
     start_scheduler_thread = opts.get("start_scheduler_thread", True)
+    submit_prompt = opts.get("submit_prompt")
 
     if kernel.tool_extra is None:
         kernel.tool_extra = {}
@@ -78,6 +80,7 @@ def wire_default_host_extras(kernel: "RuntimeKernel", **opts: Any) -> dict[str, 
             handle = start_scheduler_runtime(
                 kernel,
                 start_thread=bool(start_scheduler_thread),
+                submit_prompt=submit_prompt if callable(submit_prompt) else None,
             )
         except Exception:  # noqa: BLE001
             handle = None

@@ -11,16 +11,24 @@ import logging
 import threading
 from collections.abc import Callable
 from pathlib import Path
+from typing import Protocol
 
 from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
 
-from codedoggy.graph.index_manager import FileEvent, FileEventKind, IndexManager
+from codedoggy.graph.index_manager import FileEvent, FileEventKind
 from codedoggy.graph.languages import LanguageRegistry
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_DEBOUNCE_SECS = 0.35
+
+
+class EventSink(Protocol):
+    """Actor/manager surface consumed by the filesystem watcher."""
+
+    def send_events(self, events: list[FileEvent]) -> None: ...
+
 
 _SKIP_DIR_NAMES = frozenset(
     {
@@ -139,22 +147,33 @@ class WorkspaceWatcher:
     def __init__(
         self,
         root: Path | str,
-        manager: IndexManager,
+        manager: EventSink,
         *,
         registry: LanguageRegistry | None = None,
         debounce_secs: float = DEFAULT_DEBOUNCE_SECS,
         on_events_applied: Callable[[], None] | None = None,
     ) -> None:
         self.root = Path(root).resolve()
+        self._sink = manager
+        # Compatibility/debug pointer. Delivery always goes through _sink so a
+        # shared runtime can swap its internal IndexManager on rebuild.
         self.manager = manager
+        self._manager_lock = threading.Lock()
         self.registry = registry or LanguageRegistry()
         self._on_events_applied = on_events_applied
         self._debouncer = EventDebouncer(self._deliver, debounce_secs=debounce_secs)
         self._observer: Observer | None = None
 
-    def set_manager(self, manager: IndexManager) -> None:
+    def set_manager(self, manager: EventSink) -> None:
         """Point deliveries at a new IndexManager after reindex (no restart)."""
-        self.manager = manager
+        with self._manager_lock:
+            self._sink = manager
+            self.manager = manager
+
+    def set_display_manager(self, manager: object) -> None:
+        """Refresh the compatibility pointer without changing event routing."""
+        with self._manager_lock:
+            self.manager = manager
 
     def start(self) -> None:
         if self.is_running():
@@ -224,7 +243,9 @@ class WorkspaceWatcher:
             if keep:
                 filtered.append(FileEvent(keep, e.kind))
         if filtered:
-            self.manager.send_events(filtered)
+            with self._manager_lock:
+                sink = self._sink
+            sink.send_events(filtered)
             if self._on_events_applied is not None:
                 try:
                     self._on_events_applied()

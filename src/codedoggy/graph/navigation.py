@@ -8,11 +8,16 @@ APIs (1-indexed row/col):
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
+from typing import TypeVar
 
 from codedoggy.graph.index import ScopeGraphIndex
+from codedoggy.graph.index_manager import IndexManager
 from codedoggy.graph.languages import LanguageRegistry
 from codedoggy.graph.types import Location, NavigationError, NavigationResult
+
+_T = TypeVar("_T")
 
 
 class Navigator:
@@ -22,12 +27,24 @@ class Navigator:
         self,
         index: ScopeGraphIndex,
         *,
+        manager: IndexManager | None = None,
+        before_read: Callable[[], None] | None = None,
         registry: LanguageRegistry | None = None,
         root: Path | str | None = None,
     ) -> None:
         self.index = index
+        self._manager = manager
+        self._before_read = before_read
         self.registry = registry or LanguageRegistry()
         self.root = Path(root).resolve() if root is not None else None
+
+    def _read_index(self, reader: Callable[[ScopeGraphIndex], _T]) -> _T:
+        """Query the shared manager under its read lock when one is attached."""
+        if self._before_read is not None:
+            self._before_read()
+        if self._manager is not None:
+            return self._manager.read_index(reader)
+        return reader(self.index)
 
     def get_symbol_at_position(
         self, file_path: Path | str, row: int, col: int
@@ -72,8 +89,10 @@ class Navigator:
         symbol: str,
         context_file: Path | str | None = None,
     ) -> NavigationResult:
-        defs = self.index.find_definitions_smart(
-            symbol, context_file, self.registry
+        defs = self._read_index(
+            lambda index: index.find_definitions_smart(
+                symbol, context_file, self.registry
+            )
         )
         locations = [Location(path=p, line=line) for p, line in defs]
         return NavigationResult(symbol=symbol, locations=locations)
@@ -84,16 +103,24 @@ class Navigator:
         context_file: Path | str | None = None,
         include_definition: bool = True,
     ) -> NavigationResult:
-        refs = self.index.find_references_smart(
-            symbol, context_file, self.registry
-        )
+        def _query(
+            index: ScopeGraphIndex,
+        ) -> tuple[list[tuple[str, str, int]], list[tuple[str, int]]]:
+            refs = index.find_references_smart(
+                symbol, context_file, self.registry
+            )
+            defs = (
+                index.find_definitions_smart(symbol, context_file, self.registry)
+                if include_definition
+                else []
+            )
+            return refs, defs
+
+        refs, defs = self._read_index(_query)
         locations = [
             Location(path=p, line=line, symbol=sym) for sym, p, line in refs
         ]
         if include_definition:
-            defs = self.index.find_definitions_smart(
-                symbol, context_file, self.registry
-            )
             for p, line in defs:
                 if not any(l.path == p and l.line == line for l in locations):
                     locations.insert(0, Location(path=p, line=line))

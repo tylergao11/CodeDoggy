@@ -130,14 +130,20 @@ def on_turn_begin(
 def on_turn_end(
     memory_manager: Any | None,
     *,
+    outcome: str = "completed",
     user_text: str,
     assistant_text: str,
     session_id: str = "",
     cwd: str = "",
     messages: list[Any] | None = None,
 ) -> None:
-    """Hermes post-turn: sync_all then queue_prefetch_all (background)."""
+    """Sync only a genuinely completed user/assistant turn."""
     if memory_manager is None:
+        return
+    outcome_value = str(getattr(outcome, "value", outcome) or "").strip().lower()
+    if outcome_value != "completed":
+        return
+    if not (user_text or "").strip() or not (assistant_text or "").strip():
         return
     try:
         memory_manager.sync_all(

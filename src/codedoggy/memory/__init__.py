@@ -44,7 +44,11 @@ from codedoggy.memory.provider import (
     SessionFtsProvider,
 )
 from codedoggy.memory.redact import redact_secrets
-from codedoggy.memory.session_store import SessionStore, default_session_db_path
+from codedoggy.memory.session_store import (
+    SessionCwdValidation,
+    SessionStore,
+    default_session_db_path,
+)
 from codedoggy.memory.store import MemoryStore, load_on_disk_store
 from codedoggy.memory.tool_injection import inject_memory_provider_tools
 
@@ -57,6 +61,7 @@ __all__ = [
     "MemoryManager",
     "MemoryStore",
     "SessionFtsProvider",
+    "SessionCwdValidation",
     "SessionStore",
     "StreamingContextScrubber",
     "USER_CHAR_LIMIT",

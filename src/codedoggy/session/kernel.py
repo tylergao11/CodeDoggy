@@ -38,6 +38,7 @@ class RuntimeKernel:
     session_store: Any = None
     policy: Any = None
     graph: Any = None
+    mcp_runtime: Any = None
     # Grok orchestration handles
     session_mode_state: Any = None  # SessionModeState
     interjection_buffer: Any = None  # InterjectionBuffer
@@ -84,6 +85,7 @@ class RuntimeKernel:
             "policy",
             "memory_manager",
             "graph",
+            "mcp_runtime",
             "session_mode_state",
             "interjection_buffer",
             "subagent_coordinator",
@@ -100,9 +102,14 @@ class RuntimeKernel:
             "memory_backend",
             "ask_user_fn",
             "lsp_backend",
+            "mcp_inner_dispatch",
             "mcp_dispatch",
             "mcp_tools",
+            "mcp_servers",
+            "mcp_status",
             "mcp_tool_index",
+            "mcp_initialized",
+            "mcp_runtime",
             "scheduler_tick",
             "shell_state",
             "plan_file_path",
@@ -130,6 +137,10 @@ class RuntimeKernel:
             extra["memory_manager"] = self.memory_manager
         if self.graph is not None:
             extra["graph"] = self.graph
+        if self.mcp_runtime is not None:
+            populate = getattr(self.mcp_runtime, "populate_tool_extra", None)
+            if callable(populate):
+                populate(extra)
         if self.session_mode_state is not None:
             extra["session_mode_state"] = self.session_mode_state
         if self.interjection_buffer is not None:
@@ -154,7 +165,9 @@ class RuntimeKernel:
     def wire_host_adapters(self, **opts: Any) -> dict[str, Any]:
         """Attach optional product host adapters into tool_extra.
 
-        See ``codedoggy.host.wire_default_host_extras``. Does not invent MCP/LSP.
+        See ``codedoggy.host.wire_default_host_extras``. MCP is owned directly
+        by this kernel when ``mcp_runtime`` is bound; external hosts may still
+        inject compatible hooks when it is absent.
         """
         from codedoggy.host import wire_default_host_extras
 
@@ -213,7 +226,13 @@ class RuntimeKernel:
             self.refresh_tool_extra()
         buf.push(text, prompt_id=prompt_id)
 
-    def enqueue_prompt(self, text: str, *, prompt_id: str | None = None) -> int:
+    def enqueue_prompt(
+        self,
+        text: str,
+        *,
+        prompt_id: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> int:
         """Park a full prompt for after the current turn (not an interjection).
 
         Creates ``prompt_queue`` if missing. Does not start a turn.
@@ -227,7 +246,13 @@ class RuntimeKernel:
             self.prompt_queue = q
         from codedoggy.orchestration.prompt_queue import PromptQueueItem
 
-        q.push(PromptQueueItem(text=text, prompt_id=prompt_id))
+        q.push(
+            PromptQueueItem(
+                text=text,
+                prompt_id=prompt_id,
+                metadata=dict(metadata or {}),
+            )
+        )
         return len(q)
 
     def new_session(
@@ -361,10 +386,57 @@ class RuntimeKernel:
                 stop()
         except Exception:  # noqa: BLE001
             logger.debug("scheduler_runtime stop failed", exc_info=True)
-        # Drain prefire / context
+        # Children borrow parent-owned memory/graph/task handles. Cancel and
+        # join them before tearing any of those resources down.
+        coord = self.subagent_coordinator
+        if coord is not None:
+            shutdown = getattr(coord, "shutdown", None)
+            if callable(shutdown):
+                try:
+                    import inspect
+
+                    candidates = {
+                        "wait": True,
+                        "cancel_running": True,
+                        "timeout_s": None,
+                    }
+                    try:
+                        params = inspect.signature(shutdown).parameters
+                        has_varkw = any(
+                            p.kind is inspect.Parameter.VAR_KEYWORD
+                            for p in params.values()
+                        )
+                        kwargs = (
+                            candidates
+                            if has_varkw
+                            else {k: v for k, v in candidates.items() if k in params}
+                        )
+                    except (TypeError, ValueError):
+                        kwargs = {"wait": True}
+                    shutdown(**kwargs)
+                except Exception:  # noqa: BLE001
+                    logger.exception("subagent coordinator shutdown failed")
+        # Grok: the Session owns MCP clients/dispatcher/restart tasks. Children
+        # are joined first because they may still be borrowing the live tool
+        # index or dispatch hook.
+        mcp = self.mcp_runtime
+        if mcp is not None:
+            close_mcp = getattr(mcp, "close", None)
+            if callable(close_mcp):
+                try:
+                    close_mcp()
+                except Exception:  # noqa: BLE001
+                    logger.exception("MCP runtime shutdown failed")
+        # Drain prefire / context.  The runner normally references the same
+        # compactor as ``self.context``; call each identity once.
+        seen_contexts: set[int] = set()
         for obj in (self.context, getattr(self.turn_runner, "context_compactor", None)):
             if obj is None:
                 continue
+            oid = id(obj)
+            if oid in seen_contexts:
+                continue
+            seen_contexts.add(oid)
             on_end = getattr(obj, "on_session_end", None)
             if callable(on_end):
                 try:
@@ -397,18 +469,25 @@ class RuntimeKernel:
         # Persist graph if dirty
         graph = self.graph
         if graph is not None:
-            save = getattr(graph, "persist_if_dirty", None)
-            if callable(save):
+            close_graph = getattr(graph, "close", None)
+            if callable(close_graph):
                 try:
-                    save()
+                    close_graph()
                 except Exception:  # noqa: BLE001
-                    logger.debug("graph persist on close failed", exc_info=True)
-            stop = getattr(graph, "stop_watch", None)
-            if callable(stop):
-                try:
-                    stop()
-                except Exception:  # noqa: BLE001
-                    pass
+                    logger.debug("graph close failed", exc_info=True)
+            else:
+                save = getattr(graph, "persist_if_dirty", None)
+                if callable(save):
+                    try:
+                        save()
+                    except Exception:  # noqa: BLE001
+                        logger.debug("graph persist on close failed", exc_info=True)
+                stop = getattr(graph, "stop_watch", None)
+                if callable(stop):
+                    try:
+                        stop()
+                    except Exception:  # noqa: BLE001
+                        pass
         # Background shell tasks
         tm = self.task_manager
         if tm is not None:
@@ -418,15 +497,6 @@ class RuntimeKernel:
                     close_tm()
                 except Exception:  # noqa: BLE001
                     logger.exception("task_manager close failed")
-        # Subagent pool
-        coord = self.subagent_coordinator
-        if coord is not None:
-            shutdown = getattr(coord, "shutdown", None)
-            if callable(shutdown):
-                try:
-                    shutdown(wait=False)
-                except Exception:  # noqa: BLE001
-                    logger.debug("subagent coordinator shutdown failed", exc_info=True)
         # Session archive SQLite
         ss = self.session_store
         if ss is not None:

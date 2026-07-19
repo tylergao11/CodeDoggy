@@ -34,6 +34,11 @@ from codedoggy.graph.index import ScopeGraphIndex
 from codedoggy.graph.index_manager import FileEvent, FileEventKind, IndexManager
 from codedoggy.graph.languages import LanguageRegistry
 from codedoggy.graph.navigation import Navigator
+from codedoggy.graph.runtime import (
+    CodebaseIndexManager,
+    WorkspaceGraphRuntime,
+    get_codebase_index_manager,
+)
 from codedoggy.graph.types import (
     FileMeta,
     IndexStats,
@@ -56,6 +61,7 @@ __all__ = [
     "CacheFormatError",
     "MAX_INDEXABLE_FILE_SIZE",
     "CodebaseGraph",
+    "CodebaseIndexManager",
     "EventDebouncer",
     "FileEvent",
     "FileEventKind",
@@ -77,6 +83,8 @@ __all__ = [
     "SymbolAlias",
     "SymbolOccurrence",
     "WorkspaceWatcher",
+    "WorkspaceGraphRuntime",
+    "get_codebase_index_manager",
     "get_cache_path",
     "load_index",
     "location_to_dict",

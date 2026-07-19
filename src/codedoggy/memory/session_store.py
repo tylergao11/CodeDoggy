@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import sqlite3
 import threading
@@ -50,6 +51,17 @@ class SearchHit:
     goal: str | None = None
     timestamp: float = 0.0
     score: float = 0.0
+
+
+@dataclass(frozen=True, slots=True)
+class SessionCwdValidation:
+    """Result of checking whether a session may hydrate in a workspace."""
+
+    allowed: bool
+    reason: str
+    session_id: str
+    requested_cwd: str
+    stored_cwd: str | None = None
 
 
 class SessionStore:
@@ -178,6 +190,66 @@ class SessionStore:
                     "WHERE id = ?",
                     (now, goal, title, session_id),
                 )
+
+    def get_session_metadata(self, session_id: str) -> dict[str, Any] | None:
+        """Return session ownership metadata without hydrating its transcript."""
+        sid = str(session_id or "").strip()
+        if not sid:
+            return None
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT id, cwd, goal, title, created_at, updated_at, message_count "
+                "FROM sessions WHERE id = ?",
+                (sid,),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def validate_session_cwd(
+        self,
+        session_id: str,
+        cwd: str | Path,
+        *,
+        allow_missing: bool = False,
+        allow_unbound: bool = False,
+    ) -> SessionCwdValidation:
+        """Validate an explicit session id before transcript hydration.
+
+        Existing session cwd is immutable, so a mismatch is a hard boundary.
+        ``allow_missing`` supports callers that intentionally use an explicit
+        id to create a new session; ``allow_unbound`` is only for legacy rows.
+        """
+        sid = str(session_id or "").strip()
+        requested = _normalize_cwd(cwd)
+        if not sid:
+            return SessionCwdValidation(
+                False, "missing_session_id", sid, requested
+            )
+        metadata = self.get_session_metadata(sid)
+        if metadata is None:
+            return SessionCwdValidation(
+                bool(allow_missing),
+                "new_session" if allow_missing else "session_not_found",
+                sid,
+                requested,
+            )
+        stored_raw = metadata.get("cwd")
+        if not isinstance(stored_raw, str) or not stored_raw.strip():
+            return SessionCwdValidation(
+                bool(allow_unbound),
+                "legacy_unbound" if allow_unbound else "session_cwd_unbound",
+                sid,
+                requested,
+                None,
+            )
+        stored = _normalize_cwd(stored_raw)
+        matches = stored == requested
+        return SessionCwdValidation(
+            matches,
+            "ok" if matches else "cwd_mismatch",
+            sid,
+            requested,
+            stored,
+        )
 
     def append_message(
         self,
@@ -585,6 +657,12 @@ class SessionStore:
             except (json.JSONDecodeError, TypeError):
                 d["tool_calls"] = []
         return d
+
+
+def _normalize_cwd(cwd: str | Path) -> str:
+    """Canonical, case-normalized workspace identity for ownership checks."""
+    raw = Path(cwd).expanduser().resolve(strict=False)
+    return os.path.normcase(os.path.normpath(str(raw)))
 
 
 def default_session_db_path() -> Path:

@@ -18,7 +18,7 @@ import logging
 import threading
 import time
 import uuid
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor, wait as wait_futures
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -114,6 +114,49 @@ class _Entry:
     resume_count: int = 0
 
 
+@dataclass
+class _ChildToolResources:
+    """Child-local mutable state plus parent-owned Grok runtime handles."""
+
+    task_manager: Any
+    scheduler: Any
+    todo_state: Any
+    session_mode_state: Any = None
+    goal_log: list[dict[str, Any]] = field(default_factory=list)
+    goal_blocked_streak: int = 0
+    goal_active: bool = False
+    goal_completed: bool = False
+    goal_blocked: bool = False
+    goal_blocked_reason: str | None = None
+    goal_completion_message: str | None = None
+
+    def enter_plan_mode(self, plan_file: str | None = None) -> None:
+        if self.session_mode_state is None:
+            from codedoggy.orchestration.session_mode import SessionModeState
+
+            self.session_mode_state = SessionModeState()
+        self.session_mode_state.enter_plan(plan_file)
+
+    def exit_plan_mode(self, *, approved: bool = True) -> None:
+        if self.session_mode_state is not None:
+            self.session_mode_state.exit_plan(approved=approved)
+
+    def enter_goal_mode(self) -> None:
+        if self.session_mode_state is None:
+            from codedoggy.orchestration.session_mode import SessionModeState
+
+            self.session_mode_state = SessionModeState()
+        self.session_mode_state.enter_goal()
+        self.goal_active = True
+
+    def exit_goal_mode(self) -> None:
+        if self.session_mode_state is not None:
+            exit_goal = getattr(self.session_mode_state, "exit_goal", None)
+            if callable(exit_goal):
+                exit_goal(reason="exit")
+        self.goal_active = False
+
+
 class SubagentCoordinator:
     """Tracks child sessions (Grok SubagentCoordinator)."""
 
@@ -121,6 +164,7 @@ class SubagentCoordinator:
         self._lock = threading.Lock()
         self._entries: dict[str, _Entry] = {}
         self._pool = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="subagent")
+        self._closed = False
 
     def lookup(self, subagent_id: str) -> SubagentSnapshot | None:
         with self._lock:
@@ -286,6 +330,7 @@ class SubagentCoordinator:
                 )
             # Build resume request carrying prior state
             prior = list(e.live_messages or e.snapshot.live_messages or [])
+            child_runtime_state = getattr(e.request, "_child_runtime_state", None)
             req = SubagentRequest(
                 subagent_type=e.request.subagent_type,
                 prompt=prompt,
@@ -306,6 +351,8 @@ class SubagentCoordinator:
                 worktree_branch=e.worktree_branch or e.snapshot.worktree_branch,
                 system_prompt=e.system_prompt or e.snapshot.system_prompt,
             )
+            if child_runtime_state:
+                setattr(req, "_child_runtime_state", child_runtime_state)
             e.request = req
             e.resume_count += 1
             e.cancel = threading.Event()
@@ -446,8 +493,40 @@ class SubagentCoordinator:
                 out.append(snap)
         return out
 
-    def shutdown(self, wait: bool = False) -> None:
-        self._pool.shutdown(wait=wait, cancel_futures=True)
+    def shutdown(
+        self,
+        wait: bool = False,
+        *,
+        cancel_running: bool = True,
+        timeout_s: float | None = None,
+    ) -> bool:
+        """Close dispatch, signal running children, and optionally await them.
+
+        Returns whether every known child future reached a terminal state inside
+        the requested wait budget. The signature stays compatible with the
+        existing ``shutdown(wait=False)`` host call.
+        """
+        with self._lock:
+            self._closed = True
+            entries = list(self._entries.values())
+            if cancel_running:
+                for entry in entries:
+                    if entry.snapshot.is_running:
+                        entry.cancel.set()
+            futures = [entry.future for entry in entries if entry.future is not None]
+        self._pool.shutdown(wait=False, cancel_futures=True)
+        if not wait:
+            return all(future.done() for future in futures)
+        if not futures:
+            return True
+        _done, pending = wait_futures(
+            futures,
+            timeout=None if timeout_s is None else max(0.0, float(timeout_s)),
+        )
+        if not pending:
+            self._pool.shutdown(wait=True, cancel_futures=True)
+            return True
+        return False
 
     def _schedule(
         self,
@@ -584,7 +663,11 @@ def make_child_runner(
                 base_system_prompt=None,
             )
             system_prompt = None  # filled after worktree cwd known
-        child_tools = _strip_nested_spawn(agent.tools)
+        parent_memory_manager = _parent_resource(parent_session, "memory_manager")
+        child_tools = _strip_child_private_tools(
+            agent.tools,
+            memory_manager=parent_memory_manager,
+        )
 
         compactor = None
         if context_compactor_factory is not None:
@@ -599,13 +682,6 @@ def make_child_runner(
 
         def _cancelled() -> bool:
             return cancel.is_set()
-
-        mode_state = None
-        if definition.session_mode.value == "plan":
-            from codedoggy.orchestration.session_mode import SessionModeState
-
-            mode_state = SessionModeState()
-            mode_state.enter_plan()
 
         child_cwd = Path(parent_cwd).resolve()
         wt: WorktreeHandle | None = None
@@ -637,14 +713,90 @@ def make_child_runner(
                     resume_count=1 if is_resume else 0,
                 )
 
-
         child_hooks = None
+        visible_tools = _toolset_names(child_tools)
+        runtime_state = dict(getattr(request, "_child_runtime_state", None) or {})
+        prior_resources = runtime_state.get("resources")
+        if not isinstance(prior_resources, _ChildToolResources):
+            prior_resources = None
+
+        # Grok child sessions reuse the parent's terminal backend + scheduler
+        # handles. They must not create orphan actors that the parent cannot
+        # poll, query, notify, or close. Fallbacks exist only for standalone
+        # child-runner use (tests/embedders) and are closed below.
+        parent_task_manager = _parent_resource(parent_session, "task_manager")
+        owned_task_manager = None
+        if parent_task_manager is None:
+            from codedoggy.tools.task_manager import BackgroundTaskManager
+
+            parent_task_manager = BackgroundTaskManager()
+            owned_task_manager = parent_task_manager
+
+        parent_scheduler = _parent_resource(parent_session, "scheduler")
+        if parent_scheduler is None:
+            prior_scheduler = (
+                prior_resources.scheduler if prior_resources is not None else None
+            )
+            if prior_scheduler is not None:
+                parent_scheduler = prior_scheduler
+            else:
+                from codedoggy.tools.scheduler import Scheduler
+
+                parent_scheduler = Scheduler()
+
+        from codedoggy.tools.grok_build.todo_logic import TodoState
+
+        todo_state = (
+            prior_resources.todo_state if prior_resources is not None else None
+        )
+        if not isinstance(todo_state, TodoState):
+            todo_state = TodoState()
+
+        mode_state = (
+            prior_resources.session_mode_state
+            if prior_resources is not None
+            else None
+        )
+        if definition.session_mode.value == "plan" and mode_state is None:
+            from codedoggy.orchestration.session_mode import SessionModeState
+
+            mode_state = SessionModeState()
+            mode_state.enter_plan()
+
+        child_resources = _ChildToolResources(
+            task_manager=parent_task_manager,
+            scheduler=parent_scheduler,
+            todo_state=todo_state,
+            session_mode_state=mode_state,
+            goal_log=list(prior_resources.goal_log) if prior_resources else [],
+            goal_blocked_streak=(
+                prior_resources.goal_blocked_streak if prior_resources else 0
+            ),
+            goal_active=prior_resources.goal_active if prior_resources else False,
+            goal_completed=(
+                prior_resources.goal_completed if prior_resources else False
+            ),
+            goal_blocked=prior_resources.goal_blocked if prior_resources else False,
+            goal_blocked_reason=(
+                prior_resources.goal_blocked_reason if prior_resources else None
+            ),
+            goal_completion_message=(
+                prior_resources.goal_completion_message if prior_resources else None
+            ),
+        )
 
         tool_extra: dict[str, Any] = {
+            "kernel": child_resources,
             "is_subagent": True,
             "subagent_id": request.id,
             "subagent_type": request.subagent_type,
+            "parent_session_id": request.parent_session_id,
+            "platform": "subagent",
             "session_mode_state": mode_state,
+            "task_manager": parent_task_manager,
+            "scheduler": parent_scheduler,
+            "todo_state": todo_state,
+            "mutations": [],
             "isolation": isolation_mode.value,
             "resumed": is_resume,
         }
@@ -652,18 +804,48 @@ def make_child_runner(
             tool_extra["worktree_path"] = str(wt.path)
             tool_extra["worktree_branch"] = wt.branch
 
-        if parent_session is not None and wt is None:
-            ext = getattr(parent_session, "extensions", None)
-            pol = getattr(ext, "policy", None) if ext else None
-            if pol is not None:
-                tool_extra["policy"] = pol
+        policy = _parent_resource(parent_session, "policy") if wt is None else None
+        if policy is not None:
+            tool_extra["policy"] = policy
         if wt is not None:
             try:
                 from codedoggy.tools.policy import WorkspacePolicy
 
-                tool_extra["policy"] = WorkspacePolicy(cwd=child_cwd)
+                policy = WorkspacePolicy(cwd=child_cwd)
+                tool_extra["policy"] = policy
             except Exception:  # noqa: BLE001
                 logger.debug("child worktree policy bind failed", exc_info=True)
+
+        session_store = _parent_resource(parent_session, "session_store")
+        if session_store is not None:
+            # Hermes skip_memory still passes the parent session DB so the
+            # read-only session_search tool remains real and usable.
+            tool_extra["session_store"] = session_store
+
+        owned_graph = None
+        if "code_nav" in visible_tools:
+            parent_graph = _parent_resource(parent_session, "graph")
+            if wt is None and parent_graph is not None:
+                tool_extra["graph"] = parent_graph
+            else:
+                try:
+                    from codedoggy.graph.handle import CodebaseGraph
+
+                    owned_graph = CodebaseGraph(child_cwd, policy=policy)
+                    tool_extra["graph"] = owned_graph
+                except Exception:  # noqa: BLE001
+                    logger.debug("child graph bind failed", exc_info=True)
+
+        if "run_terminal_cmd" in visible_tools:
+            from codedoggy.tools.util.shell_state import ShellState, ensure_shell_state
+
+            shell_state = runtime_state.get("shell_state")
+            if isinstance(shell_state, ShellState):
+                tool_extra["shell_state"] = shell_state
+            else:
+                shell_state = ensure_shell_state(tool_extra, child_cwd)
+        else:
+            shell_state = None
 
         prior = _hydrate_prior_messages(request.prior_messages)
 
@@ -671,9 +853,9 @@ def make_child_runner(
             from codedoggy.prompt.grok_system import build_subagent_system_prompt
 
             system_prompt = build_subagent_system_prompt(
-                definition.system_prompt_body,
+                _child_role_instructions(definition.system_prompt_body),
                 cwd=child_cwd,
-                memory_enabled=True,
+                memory_enabled=False,
                 persona_instructions=request.persona,
             )
 
@@ -695,6 +877,31 @@ def make_child_runner(
                 prior_messages=prior,
             )
         finally:
+            # Keep passive child state for Grok-style in-process resume. Active
+            # handles remain parent-owned; standalone fallback handles close.
+            setattr(
+                request,
+                "_child_runtime_state",
+                {
+                    "resources": child_resources,
+                    "shell_state": shell_state,
+                },
+            )
+            if owned_graph is not None:
+                if not (wt is not None and should_cleanup_worktree() and not is_resume):
+                    try:
+                        owned_graph.persist_if_dirty()
+                    except Exception:  # noqa: BLE001
+                        logger.debug("child graph persist failed", exc_info=True)
+                try:
+                    owned_graph.stop_watch()
+                except Exception:  # noqa: BLE001
+                    logger.debug("child graph stop failed", exc_info=True)
+            if owned_task_manager is not None:
+                try:
+                    owned_task_manager.close()
+                except Exception:  # noqa: BLE001
+                    logger.debug("child task manager close failed", exc_info=True)
             if wt is not None and should_cleanup_worktree() and not is_resume:
                 # On resume we usually preserve; cleanup env still honored
                 try:
@@ -703,21 +910,28 @@ def make_child_runner(
                     logger.warning("worktree cleanup failed path=%s", wt.path, exc_info=True)
 
         summary = _summarize_child(loop.final_text, loop.messages, request)
-        status = "completed" if loop.completed else (
-            "cancelled" if loop.cancelled else ("failed" if loop.error else "completed")
-        )
-        if loop.max_turns_reached and not loop.completed:
+        if loop.cancelled:
+            status = "cancelled"
+            child_error = loop.error
+        elif loop.completed:
             status = "completed"
+            child_error = loop.error
+        else:
+            status = "failed"
+            if loop.max_turns_reached:
+                child_error = loop.error or "Maximum turn limit reached before completion."
+            elif loop.aborted:
+                child_error = loop.error or "Child turn aborted before completion."
+            else:
+                child_error = loop.error or "Child agent stopped without completion."
 
         # Hermes: parent memory provider observes delegation (child has no provider)
         if parent_session is not None and status == "completed":
             try:
                 from codedoggy.memory.hermes_seam import on_delegation
 
-                ext = getattr(parent_session, "extensions", None)
-                mm = getattr(ext, "memory_manager", None) if ext else None
                 on_delegation(
-                    mm,
+                    parent_memory_manager,
                     task=request.prompt or "",
                     result=summary or "",
                     child_session_id=request.id,
@@ -732,7 +946,7 @@ def make_child_runner(
             status=status,
             description=request.description or definition.description,
             output=summary,
-            error=loop.error,
+            error=child_error,
             tool_calls=len(loop.tools_called),
             turns=loop.rounds,
             duration_ms=int((time.time() - start) * 1000),
@@ -744,6 +958,7 @@ def make_child_runner(
             started_at=start,
             metadata={
                 "max_turns_reached": loop.max_turns_reached,
+                "exit_reason": loop.exit_reason,
                 "tools": list(loop.tools_called),
                 "isolation": isolation_mode.value,
                 "worktree_preserved": bool(
@@ -821,8 +1036,45 @@ def format_parallel_aggregate(snaps: list[SubagentSnapshot]) -> str:
     return "\n".join(lines).rstrip() + "\n"
 
 
-def _strip_nested_spawn(tools: FinalizedToolset) -> FinalizedToolset:
-    """Children must not spawn further subagents (Grok default)."""
+def _parent_resource(parent_session: Any, name: str) -> Any:
+    """Resolve one parent-owned resource without passing the parent kernel."""
+    if parent_session is None:
+        return None
+    ext = getattr(parent_session, "extensions", None) or getattr(
+        parent_session, "_ext", None
+    )
+    kernel = getattr(ext, "kernel", None) if ext is not None else None
+    for owner in (kernel, ext, parent_session):
+        if owner is None:
+            continue
+        value = getattr(owner, name, None)
+        if value is not None:
+            return value
+    return None
+
+
+def _toolset_names(tools: FinalizedToolset) -> set[str]:
+    names = set(tools.by_client_name)
+    for tool in tools.by_client_name.values():
+        short = getattr(tool, "short_id", None)
+        if short:
+            names.add(str(short))
+    return names
+
+
+def _child_role_instructions(body: str | None) -> str | None:
+    """Remove role text that advertises child-disabled curated memory tools."""
+    if not body:
+        return body
+    return body.replace("session_search / memory_search", "session_search")
+
+
+def _strip_child_private_tools(
+    tools: FinalizedToolset,
+    *,
+    memory_manager: Any = None,
+) -> FinalizedToolset:
+    """Apply Grok nesting and Hermes child-memory visibility boundaries."""
     from codedoggy.tools.kinds import ToolKind
 
     deny = {
@@ -830,7 +1082,18 @@ def _strip_nested_spawn(tools: FinalizedToolset) -> FinalizedToolset:
         "spawn_subagent",
         "spawn_agent",
         "parallel_tasks",
+        # Hermes children run with skip_memory=True. Session search remains
+        # available through the parent's read-only SessionStore handle.
+        "memory",
+        "memory_search",
+        "memory_get",
     }
+    get_memory_names = getattr(memory_manager, "get_all_tool_names", None)
+    if callable(get_memory_names):
+        try:
+            deny.update(str(name) for name in get_memory_names() or set())
+        except Exception:  # noqa: BLE001
+            logger.debug("memory provider tool-name lookup failed", exc_info=True)
     by = {}
     for name, ft in tools.by_client_name.items():
         short = getattr(ft, "short_id", None) or ""
@@ -842,6 +1105,11 @@ def _strip_nested_spawn(tools: FinalizedToolset) -> FinalizedToolset:
     if len(by) == len(tools.by_client_name):
         return tools
     return FinalizedToolset(by_client_name=by)
+
+
+def _strip_nested_spawn(tools: FinalizedToolset) -> FinalizedToolset:
+    """Backward-compatible helper for callers that only need nesting denial."""
+    return _strip_child_private_tools(tools)
 
 
 def _serialize_messages(messages: list) -> list[dict[str, Any]]:

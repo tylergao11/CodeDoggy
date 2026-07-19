@@ -64,12 +64,20 @@ class Session:
         self._phase = SessionPhase.IDLE
         self._turn_count = 0
         self._closed = False
+        self._closing = False
+        self._close_finalizing = False
         self._cancel_requested = False
         self._kernel: Any | None = getattr(self._ext, "kernel", None)
         # Serialise phase / close / live-history transitions (Actor-lite)
         self._lock = threading.RLock()
-        # Nested drain depth (one item per finally; cap against re-enqueue loops)
-        self._prompt_drain_depth = 0
+        # A full-prompt driver owns the queue until it is empty.  This mirrors
+        # Grok's pager/actor serialization and avoids recursive queue draining.
+        self._prompt_drain_active = False
+        # Close is a barrier: resources stay live until the active turn exits.
+        self._turn_done = threading.Event()
+        self._turn_done.set()
+        self._close_done = threading.Event()
+        self._turn_thread_id: int | None = None
 
     @classmethod
     def create(
@@ -141,7 +149,13 @@ class Session:
             return
         raise SessionError("interjection buffer not available (no orchestration kernel)")
 
-    def enqueue_prompt(self, text: str, *, prompt_id: str | None = None) -> int:
+    def enqueue_prompt(
+        self,
+        text: str,
+        *,
+        prompt_id: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> int:
         """Park a full prompt for the next turn after the current one.
 
         Host API (Actor-lite):
@@ -167,7 +181,7 @@ class Session:
                 )
             enq = getattr(kernel, "enqueue_prompt", None)
             if callable(enq):
-                return int(enq(text, prompt_id=prompt_id))
+                return int(enq(text, prompt_id=prompt_id, metadata=metadata))
             # Kernel without helper — push directly, create queue if needed
             from codedoggy.orchestration.prompt_queue import PromptQueue, PromptQueueItem
 
@@ -175,8 +189,44 @@ class Session:
             if q is None:
                 q = PromptQueue()
                 kernel.prompt_queue = q
-            q.push(PromptQueueItem(text=text, prompt_id=prompt_id))
+            q.push(
+                PromptQueueItem(
+                    text=text,
+                    prompt_id=prompt_id,
+                    metadata=dict(metadata or {}),
+                )
+            )
             return len(q)
+
+    def submit_prompt(
+        self,
+        text: str,
+        *,
+        prompt_id: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> int:
+        """Submit a *full* host prompt and drive it immediately when idle.
+
+        This is the Grok pager ingress used by synthetic prompts such as
+        scheduler fires.  It is intentionally distinct from :meth:`interject`:
+        a busy session parks the prompt for the next turn; an idle session
+        consumes it immediately through the same serialized queue.
+
+        Returns the queue length observed immediately after enqueue.
+        """
+        with self._lock:
+            self._ensure_open()
+            queued = self.enqueue_prompt(
+                text,
+                prompt_id=prompt_id,
+                metadata=metadata,
+            )
+            should_drive = (
+                self._phase is SessionPhase.IDLE and not self._prompt_drain_active
+            )
+        if should_drive:
+            self._drain_prompt_queue()
+        return queued
 
     def enter_plan_mode(self, plan_file: str | None = None) -> None:
         """Grok plan mode — only plan file edits allowed."""
@@ -293,7 +343,8 @@ class Session:
 
     @property
     def is_closed(self) -> bool:
-        return self._closed
+        # Closing sessions reject new work even while the active turn drains.
+        return self._closing or self._closed
 
     def bind_extensions(self, extensions: SessionExtensions) -> None:
         self._ensure_open()
@@ -304,9 +355,6 @@ class Session:
 
     def bind_turn_runner(self, runner: TurnRunner) -> None:
         self.bind_extensions(self._ext.with_turn_runner(runner))
-
-    # Safety cap: nested finally-chain drain (one item per level).
-    _PROMPT_DRAIN_DEPTH_CAP = 32
 
     def handle_prompt(
         self,
@@ -356,8 +404,20 @@ class Session:
                 prompt_id=prompt_id,
                 metadata=metadata or {},
             )
-            self._cancel_requested = False
-            self._phase = SessionPhase.TURN_RUNNING
+            self._begin_turn_locked()
+
+        return self._run_started_turn(request)
+
+    def _begin_turn_locked(self) -> None:
+        """Reserve the single turn slot while ``self._lock`` is held."""
+        self._cancel_requested = False
+        self._phase = SessionPhase.TURN_RUNNING
+        self._turn_thread_id = threading.get_ident()
+        self._turn_done.clear()
+
+    def _run_started_turn(self, request: TurnRequest) -> TurnResult:
+        """Execute a request whose turn slot was already reserved."""
+        prompt_id = request.prompt_id
 
         logger.info(
             "session.turn.start id=%s prompt_id=%s",
@@ -381,15 +441,22 @@ class Session:
             return TurnResult(status=TurnStatus.ERROR, error=str(e))
         finally:
             with self._lock:
-                if not self._closed:
+                closing = self._closing
+                if not closing and not self._closed:
                     self._phase = SessionPhase.IDLE
+                self._turn_thread_id = None
+                self._turn_done.set()
             logger.info(
                 "session.turn.end id=%s turns=%s",
                 self._id,
                 self._turn_count,
             )
-            # Consume PromptQueue (full prompts parked while busy) — one per finally
-            self._drain_prompt_queue()
+            if closing:
+                # Handles close() called by the turn thread itself.  A concurrent
+                # closer may race here; _finalize_close elects one owner.
+                self._finalize_close()
+            elif not self._prompt_drain_active:
+                self._drain_prompt_queue()
 
     def _push_prompt_queue(
         self,
@@ -420,52 +487,59 @@ class Session:
             logger.debug("prompt_queue push failed", exc_info=True)
 
     def _drain_prompt_queue(self) -> None:
-        """Run one parked full prompt after IDLE (chain via nested finally).
-
-        Processes **one** item per call so drain cannot nest forever in a
-        single while-loop; each drained ``handle_prompt`` finishes → IDLE →
-        finally drains the next. Depth is capped against pathological re-enqueue.
-        """
+        """Drive parked full prompts serially while the session remains idle."""
         with self._lock:
-            if self._closed or self._phase is not SessionPhase.IDLE:
+            if (
+                self._closed
+                or self._closing
+                or self._phase is not SessionPhase.IDLE
+                or self._prompt_drain_active
+            ):
                 return
-            if self._prompt_drain_depth >= self._PROMPT_DRAIN_DEPTH_CAP:
-                logger.warning(
-                    "session.prompt_queue drain depth cap=%s id=%s",
-                    self._PROMPT_DRAIN_DEPTH_CAP,
-                    self._id,
-                )
-                return
-            kernel = self._kernel or getattr(self._ext, "kernel", None)
-            q = getattr(kernel, "prompt_queue", None) if kernel is not None else None
-            if q is None or len(q) == 0:
-                return
-            pop = getattr(q, "pop", None)
-            if not callable(pop):
-                return
-            item = pop()
-            # Skip empty items under lock; still at most one non-empty start
-            while item is not None and not str(
-                getattr(item, "text", None) or item
-            ).strip():
-                item = pop()
-            if item is None:
-                return
-            self._prompt_drain_depth += 1
+            self._prompt_drain_active = True
 
-        text = getattr(item, "text", None) or str(item)
-        pid = getattr(item, "prompt_id", None)
         try:
-            self.handle_prompt(str(text), prompt_id=pid)
+            while True:
+                with self._lock:
+                    if (
+                        self._closed
+                        or self._closing
+                        or self._phase is not SessionPhase.IDLE
+                    ):
+                        return
+                    kernel = self._kernel or getattr(self._ext, "kernel", None)
+                    q = (
+                        getattr(kernel, "prompt_queue", None)
+                        if kernel is not None
+                        else None
+                    )
+                    pop = getattr(q, "pop", None) if q is not None else None
+                    if not callable(pop):
+                        return
+                    item = pop()
+                    while item is not None and not str(
+                        getattr(item, "text", None) or item
+                    ).strip():
+                        item = pop()
+                    if item is None:
+                        return
+                    request = TurnRequest(
+                        text=str(getattr(item, "text", None) or item),
+                        prompt_id=getattr(item, "prompt_id", None),
+                        metadata=dict(getattr(item, "metadata", None) or {}),
+                    )
+                    self._begin_turn_locked()
+                self._run_started_turn(request)
         except Exception:  # noqa: BLE001
             logger.exception("drained prompt_queue item failed")
         finally:
             with self._lock:
-                self._prompt_drain_depth = max(0, self._prompt_drain_depth - 1)
+                self._prompt_drain_active = False
 
     def cancel(self) -> None:
         """Request cancellation of the active turn."""
-        self._cancel_requested = True
+        with self._lock:
+            self._cancel_requested = True
         logger.info("session.cancel_requested id=%s", self._id)
 
     def is_cancel_requested(self) -> bool:
@@ -478,10 +552,61 @@ class Session:
         session store, context end hooks). Falls back to extension handles
         when no kernel is bound.
         """
-        if self._closed:
+        caller = threading.get_ident()
+        with self._lock:
+            if self._closed:
+                return
+            if self._closing:
+                same_turn = self._turn_thread_id == caller
+                wait_existing = not same_turn
+                stop_ingress = False
+            else:
+                self._closing = True
+                self._cancel_requested = True
+                same_turn = self._turn_thread_id == caller
+                wait_existing = False
+                stop_ingress = True
+            turn_running = self._phase is SessionPhase.TURN_RUNNING
+
+        if stop_ingress:
+            # Quiesce synthetic host ingress before waiting for the active turn;
+            # otherwise a scheduler tick could advance a one-shot task after the
+            # Session has stopped accepting prompts.
+            kernel = self._kernel or getattr(self._ext, "kernel", None)
+            extra = getattr(kernel, "tool_extra", None) if kernel is not None else None
+            handle = (extra or {}).get("scheduler_runtime")
+            stop = getattr(handle, "stop", None)
+            if callable(stop):
+                try:
+                    stop()
+                except Exception:  # noqa: BLE001
+                    logger.debug("scheduler ingress stop failed", exc_info=True)
+
+        if wait_existing:
+            self._close_done.wait()
             return
-        self._closed = True
-        self._phase = SessionPhase.CLOSED
+        if turn_running:
+            if same_turn:
+                # The active turn's finally block owns final teardown.
+                return
+            self._turn_done.wait()
+        self._finalize_close()
+
+    def _finalize_close(self) -> None:
+        """Elect one teardown owner after no foreground turn is executing."""
+        with self._lock:
+            if self._closed:
+                return
+            if self._close_finalizing:
+                wait_existing = True
+            else:
+                self._close_finalizing = True
+                self._phase = SessionPhase.CLOSED
+                wait_existing = False
+        if wait_existing:
+            self._close_done.wait()
+            return
+
         kernel = self._kernel or getattr(self._ext, "kernel", None)
         try:
             if kernel is not None and callable(getattr(kernel, "close", None)):
@@ -527,10 +652,17 @@ class Session:
                     close_ss()
         except Exception:  # noqa: BLE001
             logger.exception("session.end context cleanup failed")
+        finally:
+            with self._lock:
+                self._closed = True
+                self._closing = True
+                self._close_finalizing = False
+                self._phase = SessionPhase.CLOSED
+                self._close_done.set()
         logger.info("session.closed id=%s turns=%s", self._id, self._turn_count)
 
     def _ensure_open(self) -> None:
-        if self._closed:
+        if self._closed or self._closing:
             raise SessionClosedError(f"session {self._id} is closed")
 
     def __repr__(self) -> str:

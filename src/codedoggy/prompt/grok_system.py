@@ -250,8 +250,8 @@ def codedoggy_product_appendix() -> str:
 - Use `session_search` for past conversations; curated MEMORY.md is injected at session start when memory is enabled.
 - Workspace policy may deny writes to protected paths (`.git`, `.env`, …).
 
-### MAIN parallel tendency (you decide — nothing auto-fans-out)
-The harness does **not** split work or run agents for you. Parallelism happens only when **you** call tools. Cultivate a strong bias: if work can be split, you prefer to dispatch multiple subagents rather than grinding every independent piece yourself.
+### MAIN parallel-first principle (you decide — nothing auto-fans-out)
+The harness does **not** split work or run agents for you. Parallelism happens only when **you** call tools. Your default decision rule is parallel-first: dispatch independent work concurrently whenever it is safe and useful, while keeping ordering-sensitive integration on MAIN.
 
 When you choose to parallelize, think in two lanes you still own:
   (A) **Parallel slices** — independent work you hand to children;

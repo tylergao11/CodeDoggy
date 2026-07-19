@@ -86,10 +86,18 @@ class ChatSampler:
         raw = dict(result.raw or {})
         if result.usage:
             raw.setdefault("usage", result.usage)
+        reasoning = getattr(result, "reasoning_content", None)
+        if isinstance(reasoning, str) and reasoning.strip():
+            raw.setdefault("reasoning_content", reasoning)
+        pdata = getattr(result, "provider_data", None)
+        if isinstance(pdata, dict) and pdata:
+            raw.setdefault("provider_data", pdata)
         return SampleResult(
             content=result.content,
             tool_calls=calls,
             raw=raw,
+            reasoning_content=reasoning if isinstance(reasoning, str) else None,
+            provider_data=dict(pdata) if isinstance(pdata, dict) else None,
         )
 
 
@@ -117,12 +125,16 @@ def _to_chat(m: Message) -> ChatMessage:
             for tc in m.tool_calls
         ]
     role = m.role.value if isinstance(m.role, Role) else str(m.role)
+    reasoning = getattr(m, "reasoning_content", None)
+    pdata = getattr(m, "provider_data", None)
     return ChatMessage(
         role=role,
         content=m.content,
         name=m.name,
         tool_call_id=m.tool_call_id,
         tool_calls=tool_calls,
+        reasoning_content=reasoning if isinstance(reasoning, str) else None,
+        provider_data=dict(pdata) if isinstance(pdata, dict) else None,
     )
 
 

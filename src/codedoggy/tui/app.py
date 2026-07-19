@@ -35,6 +35,7 @@ from prompt_toolkit.styles import Style
 from prompt_toolkit.utils import get_cwidth
 from prompt_toolkit.widgets import TextArea
 
+from codedoggy.model.auth import auth_status, is_imperial
 from codedoggy.session.types import TurnStatus
 from codedoggy.tui.agent_detail import (
     DETAIL_FILTERS,
@@ -45,6 +46,7 @@ from codedoggy.tui.agent_detail import (
     render_detail_body,
     snapshot_from_messages,
 )
+from codedoggy.tui.login_wizard import AuthWizard, WizardStep, hud_snapshot, run_browser_login
 from codedoggy.tui.model import AgentView, TaskLedger, TaskView
 from codedoggy.turn.types import Message, Role
 
@@ -128,6 +130,21 @@ CODEDOGGY_DARK = Style.from_dict(
         "modal.border.scan": "bg:#0b0b0d #d9ffff bold",
         "detail.input": "bg:#071014 #f5f5f7",
         "detail.input.prompt": "bg:#071014 #ff9a3c bold",
+        "auth.item": "bg:#0b0b0d #dce9e9",
+        "auth.item.selected": "bg:#12262c #f5f5f7 bold",
+        "auth.item.accent": "bg:#0b0b0d #16dfe8",
+        "auth.item.ok": "bg:#0b0b0d #ff9a3c bold",
+        "auth.item.danger": "bg:#0b0b0d #ff2d9a bold",
+        "auth.item.muted": "bg:#0b0b0d #6f8791",
+        "auth.cursor": "bg:#0b0b0d #ff2d9a bold",
+        "auth.hint": "bg:#0b0b0d #6f8791",
+        "auth.note": "bg:#0b0b0d #16dfe8",
+        "hud.title": "fg:#ff2d9a bg:#071014 bold",
+        "hud.ok": "fg:#ff9a3c bg:#071014 bold",
+        "hud.warn": "fg:#ff2d9a bg:#071014 bold",
+        "hud.cyan": "fg:#16dfe8 bg:#071014 bold",
+        "hud.dim": "fg:#0b6670 bg:#071014",
+        "hud.bg": "bg:#071014",
         **DETAIL_STYLE_RULES,
     }
 )
@@ -153,6 +170,7 @@ class CodeDoggyTUI:
         self._selected_agent = 0
         self._selected_line = 0
         self._modal_open = False
+        self._modal_kind: str = "agent"  # agent | auth
         self._modal_ref: tuple[str, str] | None = None
         self._detail_messages: dict[tuple[str, str], list[Any]] = {}
         self._detail_filter: DetailFilter = "all"
@@ -166,6 +184,9 @@ class CodeDoggyTUI:
         self._feedback_until = 0.0
         self._subagent_task: dict[str, str] = {}
         self._subagent_baselines: dict[str, set[str]] = {}
+        self._auth_wizard = AuthWizard()
+        self._auth_login_worker: threading.Thread | None = None
+        self._pending_prompt: str | None = None
 
         self._task_control = FormattedTextControl(
             text=self._render_tasks,
@@ -221,10 +242,27 @@ class CodeDoggyTUI:
                         style="class:input.placeholder",
                     ),
                     Condition(
-                        lambda: not getattr(self, "_detail_input", None)
-                        or not self._detail_input.text
+                        lambda: self._modal_kind == "agent"
+                        and (
+                            not getattr(self, "_detail_input", None)
+                            or not self._detail_input.text
+                        )
                     ),
-                )
+                ),
+                ConditionalProcessor(
+                    AfterInput(
+                        "粘贴 Token / API Key…",
+                        style="class:input.placeholder",
+                    ),
+                    Condition(
+                        lambda: self._modal_kind == "auth"
+                        and self._auth_wizard.step == WizardStep.PASTE
+                        and (
+                            not getattr(self, "_detail_input", None)
+                            or not self._detail_input.text
+                        )
+                    ),
+                ),
             ],
         )
 
@@ -311,7 +349,16 @@ class CodeDoggyTUI:
                 ),
                 Window(height=1, char="─", style="class:separator"),
                 self._detail_window,
-                self._detail_input,
+                ConditionalContainer(
+                    self._detail_input,
+                    filter=Condition(
+                        lambda: self._modal_kind == "agent"
+                        or (
+                            self._modal_kind == "auth"
+                            and self._auth_wizard.step == WizardStep.PASTE
+                        )
+                    ),
+                ),
                 Window(
                     FormattedTextControl(self._render_modal_hint),
                     height=1,
@@ -358,9 +405,25 @@ class CodeDoggyTUI:
             ),
             filter=Condition(lambda: self._modal_open),
         )
+        street_hud = ConditionalContainer(
+            Window(
+                FormattedTextControl(self._render_street_hud),
+                width=44,
+                height=5,
+                style="class:root",
+            ),
+            filter=Condition(
+                lambda: (
+                    not self._modal_open
+                    and _terminal_width() >= 48
+                    and _terminal_height() >= 16
+                )
+            ),
+        )
         root = FloatContainer(
             content=body,
             floats=[
+                # Modal first so existing tests and z-order treat it as primary float.
                 Float(
                     top=1,
                     bottom=1,
@@ -369,7 +432,16 @@ class CodeDoggyTUI:
                     content=modal_content,
                     transparent=False,
                     z_index=10,
-                )
+                ),
+                Float(
+                    bottom=7,
+                    left=2,
+                    width=44,
+                    height=5,
+                    content=street_hud,
+                    transparent=False,
+                    z_index=5,
+                ),
             ],
         )
         self._keys = self._build_key_bindings()
@@ -402,12 +474,26 @@ class CodeDoggyTUI:
     def _build_key_bindings(self) -> KeyBindings:
         keys = KeyBindings()
         modal = Condition(lambda: self._modal_open)
+        auth_modal = Condition(lambda: self._modal_open and self._modal_kind == "auth")
+        agent_modal = Condition(lambda: self._modal_open and self._modal_kind == "agent")
         tasks_focused = Condition(
             lambda: not self._modal_open and get_app().layout.has_focus(self._task_window)
         )
         detail_focused = Condition(
             lambda: self._modal_open
+            and self._modal_kind == "agent"
             and get_app().layout.has_focus(self._detail_window)
+        )
+        auth_list_focused = Condition(
+            lambda: self._modal_open
+            and self._modal_kind == "auth"
+            and self._auth_wizard.step != WizardStep.PASTE
+            and get_app().layout.has_focus(self._detail_window)
+        )
+        auth_paste = Condition(
+            lambda: self._modal_open
+            and self._modal_kind == "auth"
+            and self._auth_wizard.step == WizardStep.PASTE
         )
 
         @keys.add("tab", filter=~modal)
@@ -420,8 +506,8 @@ class CodeDoggyTUI:
             self._move_agent(-1)
             event.app.layout.focus(self._task_window)
 
-        @keys.add("tab", filter=modal)
-        @keys.add("s-tab", filter=modal)
+        @keys.add("tab", filter=agent_modal)
+        @keys.add("s-tab", filter=agent_modal)
         def _toggle_detail_focus(event: Any) -> None:
             if event.app.layout.has_focus(self._detail_input):
                 event.app.layout.focus(self._detail_window)
@@ -454,13 +540,36 @@ class CodeDoggyTUI:
             self._detail_cursor_line = max(0, self._detail_line_count - 1)
             self.app.invalidate()
 
+        @keys.add("up", filter=auth_list_focused)
+        @keys.add("k", filter=auth_list_focused)
+        def _auth_up(_: Any) -> None:
+            self._auth_wizard.move(-1)
+            self.app.invalidate()
+
+        @keys.add("down", filter=auth_list_focused)
+        @keys.add("j", filter=auth_list_focused)
+        def _auth_down(_: Any) -> None:
+            self._auth_wizard.move(1)
+            self.app.invalidate()
+
+        @keys.add("enter", filter=auth_list_focused)
+        def _auth_enter(_: Any) -> None:
+            self._dispatch_wizard_action(self._auth_wizard.activate())
+
+        for digit, idx in zip("123456789", range(9), strict=False):
+
+            @keys.add(digit, filter=auth_list_focused)
+            def _auth_digit(_: Any, index: int = idx) -> None:
+                self._auth_wizard.set_cursor(index)
+                self._dispatch_wizard_action(self._auth_wizard.activate())
+
         for key, detail_filter in zip(
             ("f1", "f2", "f3", "f4", "f5"),
             DETAIL_FILTERS,
             strict=True,
         ):
 
-            @keys.add(key, filter=modal)
+            @keys.add(key, filter=agent_modal)
             def _set_filter(_: Any, value: DetailFilter = detail_filter) -> None:
                 self._set_detail_filter(value)
 
@@ -472,8 +581,16 @@ class CodeDoggyTUI:
         def _focus_prompt(event: Any) -> None:
             event.app.layout.focus(self._input)
 
+        @keys.add("c-l", filter=~modal)
+        def _open_auth(_: Any) -> None:
+            self._open_auth_wizard()
+
         @keys.add("escape")
         def _escape(event: Any) -> None:
+            if self._modal_open and self._modal_kind == "auth":
+                action = self._auth_wizard.go_back()
+                self._dispatch_wizard_action(action)
+                return
             if self._modal_open:
                 self._close_modal()
             else:
@@ -509,10 +626,22 @@ class CodeDoggyTUI:
             self._set_feedback("补充指令已送达 MAIN", "info")
             self.app.invalidate()
             return True
+        if not self._ensure_auth_ready():
+            self._pending_prompt = prompt
+            self._open_auth_wizard()
+            self._set_feedback("先完成登录，再开工", "warning")
+            return True
         self._start_task(prompt)
         return True
 
     def _accept_detail_prompt(self, buffer: Any) -> bool:
+        if self._modal_kind == "auth" and self._auth_wizard.step == WizardStep.PASTE:
+            text = buffer.text.strip()
+            buffer.text = ""
+            self._auth_wizard.paste_buffer = text
+            self._dispatch_wizard_action(self._auth_wizard.submit_paste_text(text))
+            return True
+
         prompt = buffer.text.strip()
         buffer.text = ""
         if not prompt or self._modal_ref is None:
@@ -906,7 +1035,14 @@ class CodeDoggyTUI:
                 ("class:shortcut.label", ":再按一次退出", self._shortcut_mouse("quit")),
             ]
 
-        if self._modal_open:
+        if self._modal_open and self._modal_kind == "auth":
+            items = [
+                ("↑↓", "选择", "noop", False),
+                ("Enter", "确认", "noop", False),
+                ("Esc", "返回", "close", False),
+                ("Ctrl+Q", "退出", "quit", True),
+            ]
+        elif self._modal_open:
             items = [
                 ("PgUp/PgDn", "滚动", "noop", False),
                 ("Esc", "关闭", "close", False),
@@ -920,6 +1056,7 @@ class CodeDoggyTUI:
             if input_focused:
                 items = [
                     ("Enter", "补充" if self._is_running() else "开工", "prompt", False),
+                    ("Ctrl+L", "登录", "login", False),
                     ("Tab", "Agent", "next", False),
                 ]
                 if self._is_running():
@@ -927,8 +1064,8 @@ class CodeDoggyTUI:
                 items.append(("Ctrl+Q", "退出", "quit", True))
             else:
                 items = [
+                    ("Ctrl+L", "登录", "login", False),
                     ("Tab", "下一个", "next", False),
-                    ("Shift+Tab", "上一个", "previous", False),
                     ("Enter", "打开", "open", False),
                     ("Space", "输入", "input", False),
                     ("Ctrl+Q", "退出", "quit", True),
@@ -977,6 +1114,8 @@ class CodeDoggyTUI:
                 self._cancel_current()
             elif action == "close":
                 self._close_modal()
+            elif action == "login":
+                self._open_auth_wizard()
             elif action == "next":
                 self._move_agent(1)
                 self.app.layout.focus(self._task_window)
@@ -1021,6 +1160,64 @@ class CodeDoggyTUI:
             return fragments
         gap = width - get_cwidth(left) - get_cwidth(right) - 1
         fragments.append(("class:meta", " " * gap + right + " "))
+        return fragments
+
+    def _render_street_hud(self) -> StyleAndTextTuples:
+        """Auth gate surface (login entry). Click / Ctrl+L opens wizard."""
+        width = 44
+        snap = hud_snapshot(self._current_provider_id())
+        frame = int(time.monotonic() * 4)
+        pulse = frame % 2
+        open_handler = self._hud_open_mouse
+
+        def line(style: str, text: str) -> StyleAndTextTuples:
+            padded = text + " " * max(0, width - get_cwidth(text))
+            return [(style, padded[:width] if len(padded) > width else padded, open_handler)]
+
+        title_style = "class:hud.title"
+        ok_style = "class:hud.ok"
+        warn_style = "class:hud.warn"
+        cyan = "class:hud.cyan"
+        dim = "class:hud.dim"
+        bg = "class:hud.bg"
+
+        cur = str(snap.get("provider") or "—")
+        cur_ok = bool(snap.get("current_ok"))
+        status_word = "AUTH ON" if snap.get("any_logged_in") else ("AUTH OFF" if pulse else "LOGIN ›")
+        status_style = ok_style if snap.get("any_logged_in") else warn_style
+
+        fragments: StyleAndTextTuples = []
+        # row 0 border title
+        top = "╭" + "─ STREET AUTH " + "─" * max(1, width - 16) + "╮"
+        fragments.extend(line(title_style, top[:width]))
+        fragments.append((bg, "\n", open_handler))
+
+        # row 1 status
+        mid1 = f"│ {status_word:<10}  NOW {cur[:12]:<12}"
+        mid1 = mid1[: width - 1] + "│"
+        fragments.append((status_style, mid1[:14], open_handler))
+        fragments.append((cyan if cur_ok else dim, mid1[14:], open_handler))
+        fragments.append((bg, "\n", open_handler))
+
+        # row 2 tri-state
+        bits = []
+        for row in snap.get("rows") or []:
+            mark = "✓" if row.get("logged_in") else "○"
+            bits.append(f"{mark}{str(row.get('id') or '')[:5]}")
+        mid2 = "│ " + "  ".join(bits)
+        mid2 = (mid2 + " " * width)[: width - 1] + "│"
+        fragments.extend(line(cyan, mid2))
+        fragments.append((bg, "\n", open_handler))
+
+        # row 3 action
+        action = "│ Enter/Click · Ctrl+L 打开登录向导"
+        action = (action + " " * width)[: width - 1] + "│"
+        fragments.extend(line(dim, action))
+        fragments.append((bg, "\n", open_handler))
+
+        # row 4 bottom
+        bot = "╰" + "─" * (width - 2) + "╯"
+        fragments.extend(line(title_style, bot[:width]))
         return fragments
 
     def _render_header_rule(self) -> StyleAndTextTuples:
@@ -1232,6 +1429,19 @@ class CodeDoggyTUI:
         return fragments, line, selected_line
 
     def _render_modal_title(self) -> StyleAndTextTuples:
+        if self._modal_kind == "auth":
+            width = max(12, _terminal_width() - 9)
+            left = f"  {self._auth_wizard.title}"
+            right = "AUTH"
+            if self._auth_wizard.busy:
+                spinner = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"[int(time.monotonic() * 8) % 10]
+                right = f"{spinner} WAIT"
+            gap = max(1, width - get_cwidth(left) - get_cwidth(right))
+            return [
+                ("class:agent-window.header", left),
+                ("", " " * gap),
+                ("class:detail.active", right),
+            ]
         if not self._modal_ref:
             return []
         task_id, agent_id = self._modal_ref
@@ -1257,6 +1467,9 @@ class CodeDoggyTUI:
         return [("class:agent-window.header", _truncate_display(left, width))]
 
     def _render_modal_filters(self) -> StyleAndTextTuples:
+        if self._modal_kind == "auth":
+            text = f"  {self._auth_wizard.subtitle}"
+            return [("class:auth.note", _truncate_display(text, max(12, _terminal_width() - 8)))]
         width = max(12, _terminal_width() - 8)
         fragments: StyleAndTextTuples = [("", "  ")]
         used = 2
@@ -1281,6 +1494,8 @@ class CodeDoggyTUI:
         return fragments
 
     def _render_modal_body(self) -> StyleAndTextTuples:
+        if self._modal_kind == "auth":
+            return self._render_auth_body()
         snapshot = self._current_detail_snapshot()
         if snapshot is None:
             self._detail_line_count = 1
@@ -1299,6 +1514,44 @@ class CodeDoggyTUI:
             self._detail_cursor_line,
             self._detail_line_count - 1,
         )
+        return fragments
+
+    def _render_auth_body(self) -> StyleAndTextTuples:
+        width = max(20, _terminal_width() - 10)
+        fragments: StyleAndTextTuples = []
+        wiz = self._auth_wizard
+        if wiz.body_note:
+            note = _truncate_display(f"  {wiz.body_note}", width)
+            fragments.append(("class:auth.note", note + "\n"))
+            fragments.append(("class:auth.hint", "\n"))
+        if wiz.step == WizardStep.WAITING:
+            spin = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"[int(time.monotonic() * 8) % 10]
+            fragments.append(
+                ("class:auth.item.accent", f"  {spin}  等待浏览器授权完成…\n")
+            )
+            fragments.append(
+                ("class:auth.hint", "  完成后会自动回到结果页 · Esc 取消等待\n")
+            )
+        for index, item in enumerate(wiz.items):
+            selected = index == wiz.cursor
+            marker = "▸ " if selected else "  "
+            style = {
+                "accent": "class:auth.item.accent",
+                "ok": "class:auth.item.ok",
+                "danger": "class:auth.item.danger",
+                "muted": "class:auth.item.muted",
+            }.get(item.style, "class:auth.item")
+            if selected:
+                style = "class:auth.item.selected"
+            label = _truncate_display(f"{marker}{item.label}", width)
+            handler = self._auth_item_mouse(index)
+            fragments.append((style, label + "\n", handler))
+            if item.hint:
+                hint = _truncate_display(f"    {item.hint}", width)
+                fragments.append(("class:auth.hint", hint + "\n", handler))
+            fragments.append(("", "\n", handler))
+        self._detail_line_count = max(1, len(wiz.items) * 3 + 2)
+        self._detail_cursor_line = wiz.cursor
         return fragments
 
     def _current_detail_snapshot(self) -> AgentDetailSnapshot | None:
@@ -1331,6 +1584,9 @@ class CodeDoggyTUI:
         )
 
     def _render_detail_prompt_prefix(self) -> StyleAndTextTuples:
+        if self._modal_kind == "auth":
+            text = "  › 凭证  "
+            return [("class:detail.input.prompt", text)]
         label = "MAIN"
         if self._modal_ref:
             task_id, agent_id = self._modal_ref
@@ -1349,7 +1605,10 @@ class CodeDoggyTUI:
         return [("class:detail.input.prompt", text)]
 
     def _render_modal_hint(self) -> StyleAndTextTuples:
-        text = "  ↑↓/PgUp/PgDn 滚动 · F1-F5 筛选 · Tab 补充指令 · Esc 返回"
+        if self._modal_kind == "auth":
+            text = "  ↑↓ 选择 · Enter 确认 · 点击可选 · Esc 返回 · Ctrl+L 打开本页"
+        else:
+            text = "  ↑↓/PgUp/PgDn 滚动 · F1-F5 筛选 · Tab 补充指令 · Esc 返回"
         return [
             (
                 "class:agent-window.hint",
@@ -1397,6 +1656,7 @@ class CodeDoggyTUI:
         agent = self.ledger.get_agent(task_id, agent_id)
         if agent is None:
             return
+        self._modal_kind = "agent"
         self._modal_ref = (task_id, agent_id)
         self._detail_filter = "all"
         self._detail_cursor_line = 0
@@ -1405,12 +1665,27 @@ class CodeDoggyTUI:
         self.app.layout.focus(self._detail_window)
         self.app.invalidate()
 
+    def _open_auth_wizard(self) -> None:
+        self._modal_kind = "auth"
+        self._modal_ref = None
+        self._auth_wizard.open()
+        self._detail_input.text = ""
+        self._modal_open = True
+        self.app.layout.focus(self._detail_window)
+        self.app.invalidate()
+
     def _close_modal(self) -> None:
+        was_auth = self._modal_kind == "auth"
         self._modal_open = False
+        self._modal_kind = "agent"
         self._modal_ref = None
         self._detail_input.text = ""
         self.app.layout.focus(self._task_window)
         self.app.invalidate()
+        if was_auth and self._pending_prompt and self._ensure_auth_ready():
+            prompt = self._pending_prompt
+            self._pending_prompt = None
+            self._start_task(prompt)
 
     def _agent_mouse(self, index: int) -> Callable[[MouseEvent], None]:
         def handler(event: MouseEvent) -> None:
@@ -1421,9 +1696,135 @@ class CodeDoggyTUI:
 
         return handler
 
+    def _auth_item_mouse(self, index: int) -> Callable[[MouseEvent], None]:
+        def handler(event: MouseEvent) -> None:
+            if event.event_type is not MouseEventType.MOUSE_UP:
+                return
+            if self._modal_kind != "auth" or self._auth_wizard.busy:
+                return
+            self._auth_wizard.set_cursor(index)
+            self._dispatch_wizard_action(self._auth_wizard.activate())
+
+        return handler
+
+    def _hud_open_mouse(self, event: MouseEvent) -> None:
+        if event.event_type is MouseEventType.MOUSE_UP and not self._modal_open:
+            self._open_auth_wizard()
+
     def _close_mouse(self, event: MouseEvent) -> None:
         if event.event_type is MouseEventType.MOUSE_UP:
             self._close_modal()
+
+    def _current_provider_id(self) -> str:
+        try:
+            runner = getattr(self.session.extensions, "turn_runner", None)
+            sampler = getattr(runner, "sampler", None)
+            client = getattr(sampler, "client", None)
+            config = getattr(client, "config", None)
+            return str(getattr(config, "provider", "") or "")
+        except Exception:  # noqa: BLE001
+            return ""
+
+    def _ensure_auth_ready(self) -> bool:
+        """True when current provider can issue requests."""
+        pid = self._current_provider_id() or "ollama"
+        if not is_imperial(pid):
+            # API-key providers: allow if key present or non-imperial local
+            st = auth_status(pid)
+            if pid == "ollama":
+                return True
+            return bool(st.logged_in)
+        st = auth_status(pid)
+        return bool(st.logged_in)
+
+    def _dispatch_wizard_action(self, action: Any) -> None:
+        kind = getattr(action, "kind", "none")
+        message = str(getattr(action, "message", "") or "")
+        fb = str(getattr(action, "feedback_kind", "info") or "info")
+        if message:
+            self._set_feedback(message, fb)
+
+        if kind == "close":
+            self._close_modal()
+            return
+        if kind == "focus_input":
+            self.app.layout.focus(self._detail_input)
+            self.app.invalidate()
+            return
+        if kind == "blur_input":
+            self.app.layout.focus(self._detail_window)
+            self.app.invalidate()
+            return
+        if kind == "reload_client":
+            try:
+                self._reload_model_client(getattr(action, "provider", None))
+                self._set_feedback(message or "模型客户端已重载", "success")
+            except Exception as exc:  # noqa: BLE001
+                self._set_feedback(f"重载失败: {exc}", "warning")
+            self.app.invalidate()
+            return
+        if kind == "start_login":
+            provider = str(getattr(action, "provider", None) or "grok")
+            self._start_browser_login(provider)
+            self.app.invalidate()
+            return
+        self.app.invalidate()
+
+    def _start_browser_login(self, provider: str) -> None:
+        if self._auth_login_worker is not None and self._auth_login_worker.is_alive():
+            self._set_feedback("已有登录在进行", "warning")
+            return
+
+        def worker() -> None:
+            try:
+                status = run_browser_login(provider)
+            except Exception as exc:  # noqa: BLE001
+                from codedoggy.model.auth.base import AuthStatus, AUTH_OAUTH
+
+                status = AuthStatus(
+                    provider=provider,
+                    kind=AUTH_OAUTH,
+                    logged_in=False,
+                    detail=str(exc),
+                )
+            if self._closing:
+                return
+
+            def finish() -> None:
+                action = self._auth_wizard.on_login_finished(status)
+                self._dispatch_wizard_action(action)
+
+            try:
+                self.app.call_from_executor(finish)
+            except Exception:  # noqa: BLE001
+                finish()
+
+        self._auth_login_worker = threading.Thread(
+            target=worker, name="auth-login", daemon=True
+        )
+        self._auth_login_worker.start()
+
+    def _reload_model_client(self, provider: str | None = None) -> None:
+        from codedoggy.model.chat_sampler import ChatSampler
+        from codedoggy.model.provider_switch import rewrite_system_model_identity
+        from codedoggy.model.registry import create_client, model_config_from_env
+
+        cfg = model_config_from_env(provider=provider or None)
+        client = create_client(cfg, require_auth=True)
+        runner = getattr(self.session.extensions, "turn_runner", None)
+        if runner is None:
+            return
+        old = getattr(runner, "sampler", None)
+        stream = bool(getattr(old, "stream", False))
+        on_delta = getattr(old, "on_delta", None)
+        runner.sampler = ChatSampler(client, stream=stream, on_delta=on_delta)
+        # Hermes: rewrite runtime system identity after provider switch so the
+        # agent does not misreport model while keeping static prefix otherwise.
+        sp = getattr(runner, "system_prompt", None)
+        if isinstance(sp, str) and sp:
+            runner.system_prompt = rewrite_system_model_identity(
+                sp, model=cfg.model, provider=cfg.provider
+            )
 
 
 def run_tui(session: Any, *, initial_prompt: str | None = None) -> None:
@@ -1853,30 +2254,82 @@ def _compose_doggy_scene(
     return tuple("".join(row) for row in canvas)
 
 
+_DOGGY_DESIGN_WIDTH = 120
+_DOGGY_DESIGN_TASK_HEIGHT = 28
+_DOGGY_DESIGN_TOP_MARGIN = 2
+_DOGGY_DESIGN_BOTTOM_MARGIN = 2
+_DOGGY_DESIGN_RUNWAY_HEIGHT = 8
+_DOGGY_MAX_SCALE = 1.6
+
+
 def _render_doggy_empty(
     width: int,
     *,
     now: float | None = None,
 ) -> StyleAndTextTuples:
-    """Render the idle Frenchie cockpit as opaque true-colour terminal pixels."""
+    """Render one uniformly scaled Frenchie scene from the small-screen master."""
     clock = time.monotonic() if now is None else now
     art_tick = int(clock * 4)
     frame = art_tick % len(_DOGGY_SMOKE_FRAMES)
     rows = _animate_doggy_city(_DOGGY_CITY_ART, frame)
-    target_width = max(1, min(len(rows[0]), width - 4))
+    terminal_height = _terminal_height()
+
+    # The 120x28 small-window composition is the visual source of truth.
+    # Scale its car, road and whitespace together, then centre the whole frame.
+    # Snapping around 1.0 preserves the approved small-screen layout exactly.
+    task_height = max(1, terminal_height - 8)
+    scale = min(
+        width / _DOGGY_DESIGN_WIDTH,
+        task_height / _DOGGY_DESIGN_TASK_HEIGHT,
+        _DOGGY_MAX_SCALE,
+    )
+    scale = max(0.25, scale)
+    if 0.92 <= scale <= 1.08:
+        scale = 1.0
+
+    stage_width = max(
+        1,
+        min(width, round(_DOGGY_DESIGN_WIDTH * scale)),
+    )
+    art_width = max(1, round(len(rows[0]) * scale))
+    art_source_height = max(2, round(len(rows) * scale))
+    if art_source_height % 2:
+        art_source_height += 1
+    if art_width != len(rows[0]) or art_source_height != len(rows):
+        rows = _resize_art(
+            rows,
+            width=art_width,
+            height=art_source_height,
+        )
+
+    target_width = max(1, min(len(rows[0]), stage_width - 4))
     if target_width < len(rows[0]):
         rows = tuple(_fit_art_row(row, target_width) for row in rows)
 
-    rows = _compose_doggy_scene(rows, width, clock)
+    rows = _compose_doggy_scene(rows, stage_width, clock)
     art_width = len(rows[0])
-    outer = max(0, width - art_width)
+    outer = max(0, (width - art_width) // 2)
     tick = frame % 2
     palette = dict(_DOGGY_ART_PALETTE)
     if tick:
         palette["M"] = "#ff5ab3"
         palette["S"] = "#aeaeb2"
 
-    fragments: StyleAndTextTuples = [("", "\n")]
+    art_height = len(rows) // 2
+    top_margin = max(1, round(_DOGGY_DESIGN_TOP_MARGIN * scale))
+    bottom_margin = max(0, round(_DOGGY_DESIGN_BOTTOM_MARGIN * scale))
+    runway_height = max(0, round(_DOGGY_DESIGN_RUNWAY_HEIGHT * scale))
+    scaled_frame_height = (
+        top_margin + art_height + runway_height + bottom_margin
+    )
+    vertical_slack = max(0, task_height - scaled_frame_height)
+    top_padding = top_margin + vertical_slack // 2
+    runway_height = min(
+        runway_height,
+        max(0, task_height - top_padding - art_height - bottom_margin),
+    )
+
+    fragments: StyleAndTextTuples = [("", "\n" * top_padding)]
     for top, bottom in zip(rows[::2], rows[1::2], strict=True):
         fragments.append(("", " " * outer))
         pairs = zip(top, bottom, strict=True)
@@ -1885,8 +2338,14 @@ def _render_doggy_empty(
             style, glyph = _half_block(pair[0], pair[1], palette)
             fragments.append((style, glyph * count))
         fragments.append(("", "\n"))
-    runway_height = max(0, min(16, _terminal_height() - 25))
-    fragments.extend(_render_neon_track(width, runway_height, int(clock * 6)))
+    fragments.extend(
+        _render_neon_track(
+            width,
+            runway_height,
+            int(clock * 6),
+            stage_width=stage_width,
+        )
+    )
     return fragments
 
 
@@ -1894,12 +2353,18 @@ def _render_neon_track(
     width: int,
     height: int,
     frame: int,
+    *,
+    stage_width: int | None = None,
 ) -> StyleAndTextTuples:
     """Continue the scene's parallel diagonal rails toward the lower-right."""
 
     if height <= 0 or width < 12:
         return []
     fragments: StyleAndTextTuples = []
+    canvas_width = width
+    stage_width = max(12, min(canvas_width, stage_width or canvas_width))
+    stage_left = max(0, (canvas_width - stage_width) // 2)
+    stage_right = stage_left + stage_width
     base_style = "bg:#0b0b0d"
     road_style = "bg:#071014"
     edge_pink = "fg:#ff2d9a bg:#071014 bold"
@@ -1907,42 +2372,39 @@ def _render_neon_track(
     glow_pink = "fg:#8f1b58 bg:#071014"
     glow_cyan = "fg:#0b6670 bg:#071014"
     lane_orange = "fg:#ff9a3c bg:#071014 bold"
-    road_width = max(24, int(width * 0.68))
-    left_start = int(width * 0.30)
-    diagonal_step = max(2, int(width * 0.035))
+    road_width = max(24, int(stage_width * 0.68))
+    left_start = stage_left + int(stage_width * 0.30)
+    diagonal_step = max(2, int(stage_width * 0.035))
     phase = frame % 10
-    hud_left = 2
-    hud_width = min(44, max(0, left_start - 4))
-    hud_right = hud_left + hud_width - 1
 
     for y in range(height):
-        chars = [" "] * width
-        styles = [base_style] * width
+        chars = [" "] * canvas_width
+        styles = [base_style] * canvas_width
 
         def put(x: int, glyph: str, style: str) -> None:
-            if 0 <= x < width:
+            if 0 <= x < canvas_width:
                 chars[x] = glyph
                 styles[x] = style
 
-        def write(x: int, text: str, style: str) -> None:
-            for offset, glyph in enumerate(text):
-                put(x + offset, glyph, style)
+        def put_track(x: int, glyph: str, style: str) -> None:
+            if stage_left <= x < stage_right:
+                put(x, glyph, style)
 
         left = left_start + y * diagonal_step
         right = left + road_width
-        for x in range(max(0, left + 1), min(width, right)):
+        for x in range(max(stage_left, left + 1), min(stage_right, right)):
             styles[x] = road_style
             if (x + y * 2 + phase // 2) % 17 == 0:
                 put(x, "·", "fg:#0b6670 bg:#071014")
 
-        put(left, "\\", edge_pink)
-        put(left + 1, "\\", edge_pink)
-        put(right - 1, "\\", edge_cyan)
-        put(right, "\\", edge_cyan)
+        put_track(left, "\\", edge_pink)
+        put_track(left + 1, "\\", edge_pink)
+        put_track(right - 1, "\\", edge_cyan)
+        put_track(right, "\\", edge_cyan)
 
         lane = left + road_width // 2
         if (y + phase - 2) % 8 == 0:
-            put(lane, "╲", lane_orange)
+            put_track(lane, "╲", lane_orange)
 
         # Sparse roadside reflectors retreat up-left beneath the right-facing
         # car. Deriving x from y follows the road perspective instead of
@@ -1950,62 +2412,16 @@ def _render_neon_track(
         pink_tail = (y + phase) % 10
         if pink_tail in (0, 1):
             marker = left + road_width // 3
-            put(marker, "╲", edge_pink if pink_tail == 0 else glow_pink)
+            put_track(marker, "╲", edge_pink if pink_tail == 0 else glow_pink)
             if pink_tail == 0:
-                put(marker + 1, "╲", edge_pink)
+                put_track(marker + 1, "╲", edge_pink)
 
         cyan_tail = (y + phase - 5) % 10
         if cyan_tail in (0, 1):
             marker = left + road_width * 2 // 3
-            put(marker, "╲", edge_cyan if cyan_tail == 0 else glow_cyan)
+            put_track(marker, "╲", edge_cyan if cyan_tail == 0 else glow_cyan)
             if cyan_tail == 0:
-                put(marker + 1, "╲", edge_cyan)
-
-        if height >= 5 and hud_width >= 28 and y < 5:
-            hud_bg = "bg:#071014"
-            hud_pink = "fg:#ff2d9a bg:#071014 bold"
-            hud_cyan = "fg:#16dfe8 bg:#071014 bold"
-            hud_orange = "fg:#ff9a3c bg:#071014 bold"
-            hud_dim = "fg:#0b6670 bg:#071014"
-            for x in range(hud_left, hud_right + 1):
-                styles[x] = hud_bg
-
-            if y == 0:
-                for x in range(hud_left + 1, hud_right):
-                    put(x, "─", hud_pink)
-                put(hud_left, "╭", hud_pink)
-                put(hud_right, "╮", hud_cyan)
-                title = " STREET MODE "
-                write(hud_left + 2, title, hud_pink)
-            elif y == 4:
-                for x in range(hud_left + 1, hud_right):
-                    put(x, "─", hud_cyan)
-                put(hud_left, "╰", hud_pink)
-                put(hud_right, "╯", hud_cyan)
-            else:
-                put(hud_left, "│", hud_pink)
-                put(hud_right, "│", hud_cyan)
-                if y == 1:
-                    speed = 274 + (frame * 11) % 25
-                    write(hud_left + 2, "SPEED", hud_cyan)
-                    write(hud_left + 9, f"{speed:03d}", hud_orange)
-                    write(hud_left + 13, "KM/H", hud_cyan)
-                elif y == 2:
-                    write(hud_left + 2, "GEAR", hud_cyan)
-                    write(hud_left + 7, "5", hud_orange)
-                    write(hud_left + 10, "BOOST", hud_cyan)
-                    bar_width = max(3, hud_width - 19)
-                    active = min(bar_width, max(1, bar_width - 2 + frame % 3))
-                    for index in range(bar_width):
-                        put(
-                            hud_left + 16 + index,
-                            "■" if index < active else "·",
-                            hud_pink if index < active else hud_dim,
-                        )
-                else:
-                    write(hud_left + 2, "NO BRAKES", hud_pink)
-                    swag = "SWAG MAX"
-                    write(hud_right - len(swag) - 2, swag, hud_orange)
+                put_track(marker + 1, "╲", edge_cyan)
 
         for (style, glyph), cells in groupby(zip(styles, chars, strict=True)):
             count = sum(1 for _ in cells)
@@ -2034,13 +2450,32 @@ def _render_doggy_corner(width: int) -> StyleAndTextTuples:
 
 
 def _fit_art_row(row: str, width: int) -> str:
-    """Keep bright silhouette pixels while fitting art to the terminal width."""
+    """Keep bright silhouette pixels while resizing art horizontally."""
     fitted: list[str] = []
     for index in range(width):
         start = index * len(row) // width
         end = max(start + 1, (index + 1) * len(row) // width)
         fitted.append(max(row[start:end], key=_DOGGY_ART_PRIORITY.__getitem__))
     return "".join(fitted)
+
+
+def _resize_art(
+    rows: tuple[str, ...],
+    *,
+    width: int,
+    height: int,
+) -> tuple[str, ...]:
+    """Nearest-neighbour resize for wide-screen terminal pixel art."""
+
+    if not rows:
+        return rows
+    width = max(1, width)
+    height = max(2, height + height % 2)
+    resized: list[str] = []
+    for index in range(height):
+        source = min(len(rows) - 1, index * len(rows) // height)
+        resized.append(_fit_art_row(rows[source], width))
+    return tuple(resized)
 
 
 def _half_block(

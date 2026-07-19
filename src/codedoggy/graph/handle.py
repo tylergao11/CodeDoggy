@@ -1,31 +1,53 @@
-"""Session-facing graph handle — IndexBuilder + IndexManager + Navigator.
+"""Session-facing lease over the process-wide codebase graph runtime.
 
-  IndexBuilder.build / cache load (query_version + mtime)
-  IndexManager FileEvent for incremental updates
-  WorkspaceWatcher (watchdog) on start_watch()
-  Navigator for goto_* queries
+``CodebaseGraph`` preserves the original Session/extensions API while sharing
+one single-owner runtime per canonical workspace.  It is intentionally a thin
+lease: extraction and incremental indexing remain owned by ``IndexBuilder`` and
+``IndexManager``.
 """
 
 from __future__ import annotations
 
 import logging
+import weakref
 from pathlib import Path
 from typing import Any
 
-from codedoggy.graph.builder import IndexBuilder
-from codedoggy.graph.cache import CACHE_FILE_NAME, get_cache_path, load_index, save_index
+from codedoggy.graph.cache import CACHE_FILE_NAME
 from codedoggy.graph.index import ScopeGraphIndex
 from codedoggy.graph.index_manager import FileEvent, IndexManager
-from codedoggy.graph.languages import LanguageRegistry
 from codedoggy.graph.navigation import Navigator
+from codedoggy.graph.runtime import (
+    WorkspaceGraphRuntime,
+    get_codebase_index_manager,
+)
 from codedoggy.graph.types import IndexStats
 from codedoggy.graph.watcher import WorkspaceWatcher
 
 logger = logging.getLogger(__name__)
 
 
+def _release_watch_finalizer(
+    runtime_ref: weakref.ReferenceType[WorkspaceGraphRuntime],
+    lease: object,
+) -> None:
+    """Best-effort leak shield when a host drops a Session without close()."""
+    runtime = runtime_ref()
+    if runtime is None:
+        return
+    try:
+        runtime.release_watch(lease)
+    except Exception:  # noqa: BLE001
+        logger.debug("graph watch finalizer failed", exc_info=True)
+
+
 class CodebaseGraph:
-    """Workspace code graph for Session.extensions.graph."""
+    """Session graph handle backed by one shared workspace runtime.
+
+    Constructing a handle is cheap and does not build the index.  ``start_watch``
+    is also lazy with respect to indexing: it starts OS observation immediately,
+    and mutations queue on the runtime actor until the first query/reindex.
+    """
 
     def __init__(
         self,
@@ -34,18 +56,43 @@ class CodebaseGraph:
         use_cache: bool = True,
         policy: Any = None,
     ) -> None:
-        self.root = Path(root).resolve()
+        self.root = Path(root).expanduser().resolve()
         self.use_cache = use_cache
         self._policy = policy
-        self._registry = LanguageRegistry()
+        self._runtime, self._runtime_was_new = (
+            get_codebase_index_manager().get_or_create(self.root)
+        )
+        self._registry = self._runtime.registry
+        self._lease_token = object()
+        self._finalizer = weakref.finalize(
+            self,
+            _release_watch_finalizer,
+            weakref.ref(self._runtime),
+            self._lease_token,
+        )
+
+        # Compatibility mirrors for callers that inspected the old handle.
+        # Runtime truth remains authoritative and is refreshed at API fences.
         self._index: ScopeGraphIndex | None = None
-        self._manager: IndexManager | None = None
+        self._manager: IndexManager | None = self._runtime.manager_if_ready
         self._navigator: Navigator | None = None
-        self._watcher: WorkspaceWatcher | None = None
-        self._dirty: bool = False
+        self._watcher: WorkspaceWatcher | None = self._runtime.watcher
+        self._dirty = self._runtime.is_dirty
+        self._watch_acquired = False
+        self._closed = False
+
+    @property
+    def runtime(self) -> WorkspaceGraphRuntime:
+        """Shared runtime/lease target, exposed for host integration probes."""
+        return self._runtime
+
+    @property
+    def runtime_was_new(self) -> bool:
+        """Whether this Session created the process workspace runtime."""
+        return self._runtime_was_new
 
     def set_policy(self, policy: Any) -> None:
-        """Attach workspace policy used to gate on-disk cache writes."""
+        """Attach the Session policy used to gate cache persistence."""
         self._policy = policy
 
     @property
@@ -53,11 +100,11 @@ class CodebaseGraph:
         return self._policy
 
     def _cache_writes_allowed(self, allow_write: bool | None = None) -> bool:
-        """Whether save_index / persist may touch CACHE_FILE_NAME.
+        """Preserve the previous explicit/policy cache-write contract.
 
-        * ``allow_write=True`` / ``False`` forces the decision for one call.
-        * ``allow_write=None`` consults attached policy (``check_write`` /
-          ``allow_writes``); no policy ⇒ allow (backward compatible).
+        The cache now lives under ``CODEDOGGY_HOME`` rather than the workspace,
+        but callers that explicitly disable writes still receive a no-write
+        execution path.
         """
         if allow_write is False:
             return False
@@ -68,180 +115,153 @@ class CodebaseGraph:
             return True
         check_w = getattr(policy, "check_write", None)
         if callable(check_w):
-            wd = check_w(CACHE_FILE_NAME)
-            if wd is not None and not getattr(wd, "allowed", True):
+            decision = check_w(CACHE_FILE_NAME)
+            if decision is not None and not getattr(decision, "allowed", True):
                 return False
             return True
-        if hasattr(policy, "allow_writes") and not bool(
-            getattr(policy, "allow_writes", True)
-        ):
-            return False
+        if hasattr(policy, "allow_writes"):
+            return bool(getattr(policy, "allow_writes", True))
         return True
+
+    def _ensure_manager(self) -> IndexManager:
+        if self._closed:
+            raise RuntimeError("CodebaseGraph is closed")
+        manager = self._runtime.ensure_indexed(
+            use_cache=self.use_cache,
+            allow_cache_write=self._cache_writes_allowed(),
+        )
+        self._sync_refs(manager)
+        return manager
+
+    def _sync_refs(self, manager: IndexManager | None = None) -> None:
+        manager = manager or self._runtime.manager_if_ready
+        self._manager = manager
+        self._watcher = self._runtime.watcher
+        self._dirty = self._runtime.is_dirty
+        if manager is None:
+            return
+        self._index = manager.index
+        if self._navigator is None or self._navigator._manager is not manager:
+            self._navigator = Navigator(
+                manager.index,
+                manager=manager,
+                before_read=self._runtime.fence,
+                registry=self._registry,
+                root=self.root,
+            )
 
     def ensure_indexed(self) -> ScopeGraphIndex:
-        if self._index is not None and self._manager is not None:
-            return self._manager.index
-        cache = get_cache_path(self.root)
-        if self.use_cache and cache.is_file():
-            try:
-                loaded = load_index(cache)
-                if self._cache_fresh(loaded):
-                    self._bind_index(loaded)
-                    return self._index  # type: ignore[return-value]
-            except Exception as e:  # noqa: BLE001
-                logger.warning("graph cache load failed: %s", e)
-        self.reindex()
-        assert self._index is not None
-        return self._index
-
-    def _bind_index(self, index: ScopeGraphIndex) -> None:
-        self._index = index
-        self._manager = IndexManager(self.root, index=index, registry=self._registry)
-        self._navigator = Navigator(index, root=self.root)
+        """Fence prior actor commands and return an isolated index snapshot."""
+        manager = self._ensure_manager()
+        if self.use_cache:
+            self._runtime.repair_cache_if_invalid(
+                allow_cache_write=self._cache_writes_allowed(),
+            )
+        snapshot = manager.get_snapshot()
+        self._index = snapshot
+        return snapshot
 
     def _cache_fresh(self, index: ScopeGraphIndex) -> bool:
-        """Full manifest check: every cached file + set equality vs disk scan."""
-        current_qv = self._registry.compute_query_hash()
-        if index.needs_query_rebuild(current_qv):
-            logger.info(
-                "graph cache query_version mismatch (cached=%s current=%s), rebuild",
-                index.query_version,
-                current_qv,
-            )
-            return False
-        if not index.file_meta:
-            return False
-        # All cached files must exist and match mtime/size
-        for rel, meta in index.file_meta.items():
-            if meta.is_stale(self.root / rel):
-                return False
-        # Disk set of supported files must match cache keys (add/delete detection)
-        try:
-            from codedoggy.graph.builder import IndexBuilder
-
-            on_disk = {
-                p.resolve().relative_to(self.root).as_posix()
-                for p in IndexBuilder(registry=self._registry)._collect_files(self.root)
-            }
-            cached = {str(k).replace("\\", "/") for k in index.file_meta.keys()}
-            if on_disk != cached:
-                logger.info(
-                    "graph cache file set mismatch disk=%s cache=%s, rebuild",
-                    len(on_disk),
-                    len(cached),
-                )
-                return False
-        except Exception:  # noqa: BLE001
-            logger.debug("graph cache disk scan failed", exc_info=True)
-            return False
-        return True
+        """Compatibility delegate for the previous private helper."""
+        return self._runtime.cache_fresh(index)
 
     def persist_if_dirty(self, *, allow_write: bool | None = None) -> None:
-        """Save index after incremental updates (session close / watcher).
-
-        In-memory index stays current either way; when policy denies cache
-        writes (or ``allow_write=False``), skip disk and leave ``_dirty`` set.
-        """
-        if self._index is None or not self.use_cache or not self._dirty:
-            return
-        if not self._cache_writes_allowed(allow_write):
-            logger.info(
-                "graph persist skipped (cache write denied for %s)",
-                CACHE_FILE_NAME,
-            )
+        """Fence prior events and atomically persist the shared index if dirty."""
+        allowed = self._cache_writes_allowed(allow_write)
+        if not allowed:
+            logger.info("graph cache persist skipped by policy")
             return
         try:
-            save_index(get_cache_path(self.root), self._index)
-            self._dirty = False
-        except Exception as e:  # noqa: BLE001
-            logger.warning("graph persist failed: %s", e)
+            self._runtime.persist(
+                use_cache=self.use_cache,
+                allow_cache_write=allowed,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("graph persist failed: %s", exc)
+        finally:
+            self._sync_refs()
 
     def mark_dirty(self, path: str | None = None) -> None:
-        self.ensure_indexed()
-        assert self._manager is not None
+        """Enqueue mutation without synchronously building the repository.
+
+        A known path becomes an incremental ``Modified`` event.  An unknown
+        mutation invalidates the runtime so the next query performs one full
+        rebuild.  Both operations return after actor submission.
+        """
+        if self._closed:
+            raise RuntimeError("CodebaseGraph is closed")
         if path:
-            self._manager.send_event(FileEvent.modified(path))
-            self._index = self._manager.index
-            self._navigator = Navigator(self._index, root=self.root)
-            self._dirty = True
+            self._runtime.send_event(FileEvent.modified(path))
         else:
-            self.reindex()
+            self._runtime.request_rebuild()
+        self._dirty = True
 
     def reindex(self, *, allow_write: bool | None = None) -> dict[str, Any]:
-        """Full rebuild of the in-memory index.
-
-        Disk cache (``.goto_index.json``) is written only when ``use_cache``
-        and cache writes are allowed (explicit ``allow_write`` or policy).
-        Tool path is additionally gated in ``code_nav``; this method still
-        rebuilds memory when writes are denied (fail-open for queries).
-        """
-        index = IndexBuilder(registry=self._registry).build(self.root)
-        self._bind_index(index)
-        self._dirty = False
-        # Re-point watcher at the new manager (do not leave events on dead index)
-        if self._watcher is not None and self._manager is not None:
-            self._watcher.set_manager(self._manager)
-        if self.use_cache:
-            if self._cache_writes_allowed(allow_write):
-                try:
-                    save_index(get_cache_path(self.root), index)
-                except Exception as e:  # noqa: BLE001
-                    logger.warning("graph cache save failed: %s", e)
-            else:
-                logger.info(
-                    "graph cache save skipped after reindex (write denied for %s)",
-                    CACHE_FILE_NAME,
-                )
-        s = index.stats()
-        return {
-            "files": s.files,
-            "definitions": s.definitions,
-            "references": s.references,
-            "query_version": index.query_version.to_wire(),
-        }
+        """Explicit full rebuild shared by every Session on this workspace."""
+        if self._closed:
+            raise RuntimeError("CodebaseGraph is closed")
+        allowed = self._cache_writes_allowed(allow_write)
+        stats = self._runtime.rebuild(
+            use_cache=self.use_cache,
+            allow_cache_write=allowed,
+        )
+        self._sync_refs()
+        return stats
 
     def send_event(self, event: FileEvent) -> None:
-        """Apply an incremental FileEvent and mark cache dirty for persist."""
-        self.ensure_indexed()
-        assert self._manager is not None
-        self._manager.send_event(event)
-        self._index = self._manager.index
-        self._navigator = Navigator(self._index, root=self.root)
+        """Submit an incremental event; a subsequent query is the read fence."""
+        if self._closed:
+            raise RuntimeError("CodebaseGraph is closed")
+        self._runtime.send_event(event)
         self._dirty = True
 
     def start_watch(self, *, debounce_secs: float = 0.35) -> None:
-        """Start OS file watch (watchdog)."""
-        self.ensure_indexed()
-        assert self._manager is not None
-        if self._watcher is not None and self._watcher.is_running():
-            return
-        self._watcher = WorkspaceWatcher(
-            self.root,
-            self._manager,
-            registry=self._registry,
+        """Acquire this Session's shared watcher lease without building index."""
+        if self._closed:
+            raise RuntimeError("CodebaseGraph is closed")
+        self._watcher = self._runtime.acquire_watch(
+            self._lease_token,
             debounce_secs=debounce_secs,
-            on_events_applied=self._on_watcher_events,
         )
-        self._watcher.start()
+        self._watch_acquired = True
 
     def _on_watcher_events(self) -> None:
-        """Watcher applied incremental events — keep handle in sync + dirty for persist."""
-        if self._manager is not None:
-            self._index = self._manager.index
-            self._navigator = Navigator(self._index, root=self.root)
+        """Compatibility hook; the shared runtime now owns watcher delivery."""
         self._dirty = True
+        self._sync_refs()
 
     def stop_watch(self) -> None:
-        if self._watcher is not None:
-            self._watcher.stop()
-            self._watcher = None
-            if self._manager is not None:
-                self._index = self._manager.index
-                self._navigator = Navigator(self._index, root=self.root)
+        """Release only this Session lease; final lease stops and flushes watch."""
+        if not self._watch_acquired:
+            self._sync_refs()
+            return
+        try:
+            self._runtime.release_watch(self._lease_token)
+            self._watch_acquired = False
+            # watcher.stop() flushes into the actor queue.  Persist again after
+            # that fence because RuntimeKernel currently calls persist *before*
+            # stop_watch during teardown.
+            self._runtime.persist(
+                use_cache=self.use_cache,
+                allow_cache_write=self._cache_writes_allowed(),
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("graph watch release failed: %s", exc)
+        finally:
+            self._sync_refs()
+
+    def close(self) -> None:
+        """Persist and release this Session lease; safe to call repeatedly."""
+        if self._closed:
+            return
+        self.persist_if_dirty()
+        self.stop_watch()
+        self._closed = True
+        self._finalizer.detach()
 
     @property
     def navigator(self) -> Navigator:
-        self.ensure_indexed()
+        self._ensure_manager()
         assert self._navigator is not None
         return self._navigator
 
@@ -249,13 +269,24 @@ class CodebaseGraph:
         return self.navigator
 
     def stats(self) -> IndexStats:
-        return self.ensure_indexed().stats()
+        if self._closed:
+            raise RuntimeError("CodebaseGraph is closed")
+        stats = self._runtime.stats(
+            use_cache=self.use_cache,
+            allow_cache_write=self._cache_writes_allowed(),
+        )
+        self._sync_refs()
+        return stats
 
     @property
     def manager(self) -> IndexManager | None:
-        self.ensure_indexed()
-        return self._manager
+        return self._ensure_manager()
 
     @property
     def watcher(self) -> WorkspaceWatcher | None:
+        self._watcher = self._runtime.watcher
         return self._watcher
+
+    @property
+    def watch_lease_count(self) -> int:
+        return self._runtime.watch_lease_count

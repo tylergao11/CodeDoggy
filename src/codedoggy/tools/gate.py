@@ -202,7 +202,9 @@ def enforce_policy(
                         )
         return
 
-    # code_nav reindex mutates graph cache — write policy even though kind is Search
+    # Graph cache is profile-owned (outside the workspace). Reindex remains a
+    # Search operation; CodebaseGraph separately decides whether cache writes
+    # are allowed for this Session.
     if tool_name == "code_nav" and (args.get("action") or "").strip() == "reindex":
         check_w = getattr(policy, "check_write", None)
         if callable(check_w):
@@ -211,8 +213,7 @@ def enforce_policy(
             wd = check_w(CACHE_FILE_NAME)
             if wd is not None and not getattr(wd, "allowed", True):
                 raise ToolError(
-                    getattr(wd, "reason", None)
-                    or f"reindex denied by policy (write to {CACHE_FILE_NAME})",
+                    getattr(wd, "reason", None) or "reindex denied by write policy",
                     code=getattr(wd, "code", None) or "policy_denied",
                 )
         return

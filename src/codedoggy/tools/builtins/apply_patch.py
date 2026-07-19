@@ -6,6 +6,7 @@ Engine: source-ported parser/apply/seek_sequence under tools/codex/apply_patch/.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -64,6 +65,20 @@ It is important to remember:
 """
 
 
+@dataclass(slots=True)
+class _FileChange:
+    """One fully computed change, ready for the write phase."""
+
+    action: str
+    path: Path
+    rel_path: str
+    before: str | None
+    after: str | None
+    dest_path: Path | None = None
+    dest_rel_path: str | None = None
+    dest_before: str | None = None
+
+
 class ApplyPatchTool(Tool):
     def id(self) -> ToolId:
         return ToolId("apply_patch")
@@ -104,14 +119,11 @@ class ApplyPatchTool(Tool):
         if not parsed.hunks:
             return "Success. (empty patch)"
 
-        results: list[str] = []
-        for hunk in parsed.hunks:
-            if isinstance(hunk, AddFile):
-                results.append(_apply_add(ctx, hunk))
-            elif isinstance(hunk, DeleteFile):
-                results.append(_apply_delete(ctx, hunk))
-            elif isinstance(hunk, UpdateFile):
-                results.append(_apply_update(ctx, hunk))
+        # Grok codex/apply_patch/tool.rs: compute every file change first.
+        # Path resolution, policy checks, file reads, and hunk matching all
+        # complete before the first filesystem mutation.
+        changes = _compute_all_changes(ctx, parsed.hunks)
+        results = _apply_all_changes(ctx, changes)
         return "Success. " + " ".join(results)
 
 
@@ -153,104 +165,230 @@ def _policy_write(ctx: ToolCallContext, path: str) -> None:
             )
 
 
-def _apply_add(ctx: ToolCallContext, hunk: AddFile) -> str:
-    path = _resolve_in_workspace(ctx, hunk.path)
-    _policy_write(ctx, hunk.path)
-    before = None
-    if path.is_file():
-        before = path.read_bytes().decode("utf-8", errors="replace")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(hunk.contents.encode("utf-8"))
-    ctx.set_mutation(
-        path=hunk.path,
-        before=before,
-        after=hunk.contents,
-        is_create=before is None,
-        tool_name="apply_patch",
-        args={"path": hunk.path, "op": "add"},
-    )
-    return f"A {hunk.path}"
+def _compute_all_changes(
+    ctx: ToolCallContext,
+    hunks: list[Any],
+) -> list[_FileChange]:
+    """Phase 1: resolve, authorize, read, and derive every hunk in memory.
 
-
-def _apply_delete(ctx: ToolCallContext, hunk: DeleteFile) -> str:
-    path = _resolve_in_workspace(ctx, hunk.path)
-    _policy_write(ctx, hunk.path)
-    if not path.is_file():
-        raise ToolError(f"File not found for delete: {hunk.path}", code="not_found")
-    before = path.read_bytes().decode("utf-8", errors="replace")
-    path.unlink()
-    ctx.set_mutation(
-        path=hunk.path,
-        before=before,
-        after=None,
-        is_delete=True,
-        tool_name="apply_patch",
-        args={"path": hunk.path, "op": "delete"},
-    )
-    return f"D {hunk.path}"
-
-
-def _apply_update(ctx: ToolCallContext, hunk: UpdateFile) -> str:
-    """Update in place, or Move: policy **both** paths before any write/delete.
-
-    Move mutations:
-      1. source delete (before=old content, after=None, is_delete)
-      2. dest create/edit (before=prior dest or None, after=new content)
+    A tiny virtual file map preserves sequential semantics when one patch has
+    multiple sections for the same path.  Any later not-found/no-match/policy
+    failure aborts this phase before an earlier hunk can touch disk.
     """
-    path = _resolve_in_workspace(ctx, hunk.path)
-    if hunk.move_path:
-        _resolve_in_workspace(ctx, hunk.move_path)
-        _policy_write(ctx, hunk.path)
-        _policy_write(ctx, hunk.move_path)
-    else:
-        _policy_write(ctx, hunk.path)
+    virtual: dict[Path, str | None] = {}
+    changes: list[_FileChange] = []
 
-    if not path.is_file():
-        raise ToolError(f"File not found for update: {hunk.path}", code="not_found")
-    text = path.read_bytes().decode("utf-8", errors="replace")
-    try:
-        new_content = derive_new_contents(text, hunk.path, hunk.chunks)
-    except ApplyPatchError as e:
-        raise ToolError(e.message, code="patch_no_match") from e
+    def read_virtual(path: Path, rel_path: str, *, operation: str) -> str:
+        if path in virtual:
+            content = virtual[path]
+            if content is None:
+                raise ToolError(
+                    f"File not found for {operation}: {rel_path}",
+                    code="not_found",
+                )
+            return content
+        if path.exists() and not path.is_file():
+            raise ToolError(
+                f"Path is not a file for {operation}: {rel_path}",
+                code="invalid_arguments",
+            )
+        if not path.is_file():
+            raise ToolError(
+                f"File not found for {operation}: {rel_path}",
+                code="not_found",
+            )
+        content = path.read_bytes().decode("utf-8", errors="replace")
+        virtual[path] = content
+        return content
 
-    if hunk.move_path:
+    def existing_or_none(
+        path: Path,
+        rel_path: str,
+        *,
+        operation: str,
+    ) -> str | None:
+        if path in virtual:
+            return virtual[path]
+        if path.exists() and not path.is_file():
+            raise ToolError(
+                f"Path is not a file for {operation}: {rel_path}",
+                code="invalid_arguments",
+            )
+        if not path.is_file():
+            virtual[path] = None
+            return None
+        content = path.read_bytes().decode("utf-8", errors="replace")
+        virtual[path] = content
+        return content
+
+    for hunk in hunks:
+        if isinstance(hunk, AddFile):
+            path = _resolve_in_workspace(ctx, hunk.path)
+            _policy_write(ctx, hunk.path)
+            before = existing_or_none(path, hunk.path, operation="add")
+            changes.append(
+                _FileChange(
+                    action="add",
+                    path=path,
+                    rel_path=hunk.path,
+                    before=before,
+                    after=hunk.contents,
+                )
+            )
+            virtual[path] = hunk.contents
+            continue
+
+        if isinstance(hunk, DeleteFile):
+            path = _resolve_in_workspace(ctx, hunk.path)
+            _policy_write(ctx, hunk.path)
+            before = read_virtual(path, hunk.path, operation="delete")
+            changes.append(
+                _FileChange(
+                    action="delete",
+                    path=path,
+                    rel_path=hunk.path,
+                    before=before,
+                    after=None,
+                )
+            )
+            virtual[path] = None
+            continue
+
+        if not isinstance(hunk, UpdateFile):
+            continue
+
+        path = _resolve_in_workspace(ctx, hunk.path)
+        _policy_write(ctx, hunk.path)
+        before = read_virtual(path, hunk.path, operation="update")
+        try:
+            after = derive_new_contents(before, hunk.path, hunk.chunks)
+        except ApplyPatchError as e:
+            raise ToolError(e.message, code="patch_no_match") from e
+
+        if not hunk.move_path:
+            changes.append(
+                _FileChange(
+                    action="update",
+                    path=path,
+                    rel_path=hunk.path,
+                    before=before,
+                    after=after,
+                )
+            )
+            virtual[path] = after
+            continue
+
         dest = _resolve_in_workspace(ctx, hunk.move_path)
-        # Re-check both after resolve (belt + suspenders)
-        _policy_write(ctx, hunk.path)
+        if dest == path:
+            raise ToolError(
+                f"Move destination must differ from source: {hunk.path}",
+                code="invalid_arguments",
+            )
         _policy_write(ctx, hunk.move_path)
-        dest_before: str | None = None
-        if dest.is_file():
-            dest_before = dest.read_bytes().decode("utf-8", errors="replace")
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        dest.write_bytes(new_content.encode("utf-8"))
-        path.unlink(missing_ok=True)
-        # Source removed
-        ctx.set_mutation(
-            path=hunk.path,
-            before=text,
-            after=None,
-            is_delete=True,
-            tool_name="apply_patch",
-            args={"path": hunk.path, "op": "move_delete", "move_to": hunk.move_path},
+        dest_before = existing_or_none(dest, hunk.move_path, operation="move")
+        changes.append(
+            _FileChange(
+                action="move",
+                path=path,
+                rel_path=hunk.path,
+                before=before,
+                after=after,
+                dest_path=dest,
+                dest_rel_path=hunk.move_path,
+                dest_before=dest_before,
+            )
         )
-        # Destination created or overwritten
-        ctx.set_mutation(
-            path=hunk.move_path,
-            before=dest_before,
-            after=new_content,
-            is_create=dest_before is None,
-            tool_name="apply_patch",
-            args={"path": hunk.move_path, "op": "move_create", "from": hunk.path},
-        )
-        return f"M {hunk.move_path}"
+        virtual[path] = None
+        virtual[dest] = after
 
-    path.write_bytes(new_content.encode("utf-8"))
-    ctx.set_mutation(
-        path=hunk.path,
-        before=text,
-        after=new_content,
-        is_create=False,
-        tool_name="apply_patch",
-        args={"path": hunk.path, "op": "update"},
-    )
-    return f"M {hunk.path}"
+    return changes
+
+
+def _apply_all_changes(
+    ctx: ToolCallContext,
+    changes: list[_FileChange],
+) -> list[str]:
+    """Phase 2: apply only changes that survived the complete preflight."""
+    results: list[str] = []
+    for change in changes:
+        try:
+            if change.action == "add":
+                change.path.parent.mkdir(parents=True, exist_ok=True)
+                change.path.write_bytes((change.after or "").encode("utf-8"))
+                ctx.set_mutation(
+                    path=change.rel_path,
+                    before=change.before,
+                    after=change.after,
+                    is_create=change.before is None,
+                    tool_name="apply_patch",
+                    args={"path": change.rel_path, "op": "add"},
+                )
+                results.append(f"A {change.rel_path}")
+                continue
+
+            if change.action == "delete":
+                change.path.unlink()
+                ctx.set_mutation(
+                    path=change.rel_path,
+                    before=change.before,
+                    after=None,
+                    is_delete=True,
+                    tool_name="apply_patch",
+                    args={"path": change.rel_path, "op": "delete"},
+                )
+                results.append(f"D {change.rel_path}")
+                continue
+
+            if change.action == "update":
+                change.path.write_bytes((change.after or "").encode("utf-8"))
+                ctx.set_mutation(
+                    path=change.rel_path,
+                    before=change.before,
+                    after=change.after,
+                    tool_name="apply_patch",
+                    args={"path": change.rel_path, "op": "update"},
+                )
+                results.append(f"M {change.rel_path}")
+                continue
+
+            if change.action == "move":
+                dest = change.dest_path
+                dest_rel = change.dest_rel_path
+                if dest is None or not dest_rel:
+                    raise ToolError("invalid precomputed move", code="internal")
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                dest.write_bytes((change.after or "").encode("utf-8"))
+                change.path.unlink()
+                ctx.set_mutation(
+                    path=change.rel_path,
+                    before=change.before,
+                    after=None,
+                    is_delete=True,
+                    tool_name="apply_patch",
+                    args={
+                        "path": change.rel_path,
+                        "op": "move_delete",
+                        "move_to": dest_rel,
+                    },
+                )
+                ctx.set_mutation(
+                    path=dest_rel,
+                    before=change.dest_before,
+                    after=change.after,
+                    is_create=change.dest_before is None,
+                    tool_name="apply_patch",
+                    args={
+                        "path": dest_rel,
+                        "op": "move_create",
+                        "from": change.rel_path,
+                    },
+                )
+                results.append(f"M {dest_rel}")
+        except ToolError:
+            raise
+        except OSError as e:
+            raise ToolError(
+                f"Failed to apply {change.action} for {change.rel_path}: {e}",
+                code="execution_error",
+            ) from e
+    return results

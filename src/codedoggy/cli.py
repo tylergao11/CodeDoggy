@@ -23,7 +23,12 @@ def main(argv: list[str] | None = None) -> None:
     )
     parser.add_argument("--cwd", default=".", help="Workspace root")
     parser.add_argument("--goal", default=None, help="Session-level objective")
-    parser.add_argument("--max-turns", type=int, default=16, help="Max sampling rounds")
+    parser.add_argument(
+        "--max-turns",
+        type=int,
+        default=None,
+        help="Optional sampling-round limit (default: unlimited)",
+    )
     parser.add_argument(
         "--no-memory",
         action="store_true",

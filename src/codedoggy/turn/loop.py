@@ -111,7 +111,12 @@ def run_agent_loop(
             if gr is not None:
                 extra["graph"] = gr
 
-    from codedoggy.context.live_history import copy_message, seed_messages
+    from codedoggy.context.live_history import (
+        copy_message,
+        model_sample_messages,
+        seed_messages,
+    )
+    from codedoggy.prompt.user_message import construct_user_message
 
     messages = seed_messages(
         system_prompt=system_prompt,
@@ -123,6 +128,27 @@ def run_agent_loop(
     from codedoggy.memory.hermes_seam import sample_messages_with_memory
 
     messages = strip_memory_context_from_messages(messages)
+    # Grok MAIN prefix is model-facing only.  Keep the canonical live/archive
+    # transcript free of user_info, git snapshots, and <user_query> wrappers.
+    prefix_owner = extra.get("kernel") or session
+    cached_prefix = (
+        getattr(prefix_owner, "_grok_main_user_message_prefix", None)
+        if prefix_owner is not None
+        else None
+    )
+    if isinstance(cached_prefix, str) and cached_prefix.strip():
+        user_message_prefix = cached_prefix
+    else:
+        user_message_prefix = construct_user_message(cwd_path)
+        if prefix_owner is not None:
+            try:
+                setattr(
+                    prefix_owner,
+                    "_grok_main_user_message_prefix",
+                    user_message_prefix,
+                )
+            except Exception:  # noqa: BLE001 - cache is optional
+                pass
     # Ephemeral fence only at sample time (conversation_loop inject into user).
     # Not archived, not SYSTEM, not a separate USER turn.
     prefetch_block = extra.get("prefetch_user_block")
@@ -137,7 +163,8 @@ def run_agent_loop(
 
     tools_called: list[str] = []
     rounds = 0
-    # P0: every sample *attempt* counts (incl. overflow), so max_turns cannot spin forever
+    # Successful model samples count toward max_turns. Context-overflow retries
+    # have their own bounded budget and never consume a normal Grok turn.
     sample_attempts = 0
     overflow_resubmits = 0
     MAX_OVERFLOW_RESUBMITS = 2
@@ -222,20 +249,6 @@ def run_agent_loop(
                 exit_reason="max_turns",
                 metadata={"hint": f"stopped after {max_turns} sampling round(s)"},
             )
-        # Absolute ceiling: successful rounds + overflow attempts cannot spin forever
-        attempt_cap = (max_turns if max_turns is not None else 32) + MAX_OVERFLOW_RESUBMITS
-        if sample_attempts >= attempt_cap:
-            return _finish(
-                completed=False,
-                error="sample attempt budget exhausted (overflow/max_turns)",
-                exit_reason="error",
-                metadata={
-                    "sample_attempts": sample_attempts,
-                    "overflow_resubmits": overflow_resubmits,
-                    "rounds": rounds,
-                },
-            )
-
         # Grok: drain pending interjections before each sample (turn.rs safe point)
         # Framing: xai-interjection-core format_interjection — not [interjection]
         _drain_interjections_into_messages(
@@ -281,6 +294,10 @@ def run_agent_loop(
                     logger.debug("bind_sample_tools failed", exc_info=True)
         # Hermes seam: API-only inject into current user (no transcript mutate)
         sample_messages = sample_messages_with_memory(messages, prefetch_block)
+        sample_messages = model_sample_messages(
+            sample_messages,
+            user_message_prefix=user_message_prefix,
+        )
         sample_attempts += 1
         try:
             sample = _sample_with_host_stream(
@@ -365,11 +382,16 @@ def run_agent_loop(
         # Real usage → budget (single path; clears awaiting_real_usage after fold)
         _note_sample_usage(context_compactor, sample)
 
+        _pdata = getattr(sample, "provider_data", None)
+        if not isinstance(_pdata, dict) and isinstance(sample.raw, dict):
+            _pdata = sample.raw.get("provider_data")
         messages.append(
             Message(
                 role=Role.ASSISTANT,
                 content=sample.content,
                 tool_calls=list(sample.tool_calls) if sample.tool_calls else None,
+                reasoning_content=getattr(sample, "reasoning_content", None),
+                provider_data=dict(_pdata) if isinstance(_pdata, dict) else None,
             )
         )
 
@@ -380,12 +402,16 @@ def run_agent_loop(
                 role=Role.ASSISTANT,
                 content=f"{sample.content}\n{decision.append_observation}",
                 tool_calls=messages[-1].tool_calls,
+                reasoning_content=messages[-1].reasoning_content,
+                provider_data=messages[-1].provider_data,
             )
         elif decision and decision.append_observation and not sample.content:
             messages[-1] = Message(
                 role=Role.ASSISTANT,
                 content=decision.append_observation,
                 tool_calls=messages[-1].tool_calls,
+                reasoning_content=messages[-1].reasoning_content,
+                provider_data=messages[-1].provider_data,
             )
         _archive(on_archive_message, messages[-1])
         if decision and decision.abort:
@@ -408,6 +434,8 @@ def run_agent_loop(
                         role=Role.ASSISTANT,
                         content=final_text,
                         tool_calls=messages[-1].tool_calls,
+                        reasoning_content=messages[-1].reasoning_content,
+                        provider_data=messages[-1].provider_data,
                     )
                     # Re-archive filled final (first archive may have been empty).
                     _archive(on_archive_message, messages[-1])
@@ -698,7 +726,16 @@ def _normalize_sample(sample: SampleResult) -> SampleResult:
         call_id = tc.id or f"call_{uuid4().hex[:12]}"
         args = parse_tool_arguments(tc.arguments)
         calls.append(ToolCall(id=call_id, name=tc.name, arguments=args))
-    return SampleResult(content=sample.content, tool_calls=calls, raw=sample.raw)
+    pdata = getattr(sample, "provider_data", None)
+    if not isinstance(pdata, dict) and isinstance(sample.raw, dict):
+        pdata = sample.raw.get("provider_data")
+    return SampleResult(
+        content=sample.content,
+        tool_calls=calls,
+        raw=sample.raw,
+        reasoning_content=getattr(sample, "reasoning_content", None),
+        provider_data=dict(pdata) if isinstance(pdata, dict) else None,
+    )
 
 
 def _append_tool_message(

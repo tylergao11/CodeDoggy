@@ -1,8 +1,11 @@
-"""use_tool — Grok UseTool wire surface + host-dispatch glue.
+"""use_tool — Grok UseTool wire surface + inner-dispatch/host glue.
 
 Source: implementations/use_tool/mod.rs
-Dispatch via host extra['mcp_dispatch'](tool_name, tool_input) only.
-No invented MCP client / transport / sandbox — host owns transport.
+Canonical dispatch uses
+``extra['mcp_inner_dispatch'](tool_name, tool_input, ToolCallContext)`` to
+mirror Grok's ``InnerDispatch``. Existing two-argument ``mcp_dispatch`` hosts
+remain compatible. The standard product path injects the Session-owned
+``codedoggy.mcp.McpRuntime``; embedding hosts may replace that seam.
 
 Prepare-before-execute (gate spirit, not full Grok MCP sandbox):
   1. tool_name format + tool_input object
@@ -10,9 +13,9 @@ Prepare-before-execute (gate spirit, not full Grok MCP sandbox):
   3. when policy present → path-like keys via check_read / check_write
   4. after dispatch → set_mutation from structured host return (see below)
 
-Host-owned (not CodeDoggy):
-  - MCP transport, auth, process isolation
-  - BM25 tool index (optional extra['mcp_tool_index'])
+Runtime-owned on the standard product path:
+  - MCP transport, connection lifecycle, and BM25 tool index
+  - auth adapters and process policy remain explicit transport concerns
 
 **Host mutation contract (for write tools):**
 
@@ -61,11 +64,14 @@ from codedoggy.tools.runtime import (
 )
 
 from codedoggy.tools.grok_build.use_tool_logic import (
+    MCP_INNER_DISPATCH_KEY,
+    MCP_LEGACY_DISPATCH_KEY,
     USE_TOOL_DESCRIPTION,
     UseToolInput,
     UseToolParams,
     gateway_result_is_error,
     gateway_result_to_text,
+    missing_mcp_dispatch_message,
     native_tool_correction_message,
     normalize_mcp_arguments,
     unqualified_mcp_name_message,
@@ -342,8 +348,16 @@ def _record_host_mutations(
             continue
         ctx.set_mutation(
             path=path.strip(),
-            before=m.get("before") if isinstance(m.get("before"), (str, type(None))) else None,
-            after=m.get("after") if isinstance(m.get("after"), (str, type(None))) else None,
+            before=(
+                m.get("before")
+                if isinstance(m.get("before"), (str, type(None)))
+                else None
+            ),
+            after=(
+                m.get("after")
+                if isinstance(m.get("after"), (str, type(None)))
+                else None
+            ),
             is_create=bool(m.get("is_create")),
             is_delete=bool(m.get("is_delete")),
             tool_name=tool_name,
@@ -351,6 +365,24 @@ def _record_host_mutations(
         )
 
     return _model_text_from_host_result(result)
+
+
+def _call_inner_dispatch(
+    dispatch: Any,
+    tool_name: str,
+    tool_input: dict[str, Any],
+    ctx: ToolCallContext,
+) -> Any:
+    """Invoke CodeDoggy's Grok-style inner dispatch with the full context."""
+    if callable(dispatch):
+        return dispatch(tool_name, tool_input, ctx)
+    call = getattr(dispatch, "call", None)
+    if callable(call):
+        return call(tool_name, tool_input, ctx)
+    raise ToolError(
+        f"extra['{MCP_INNER_DISPATCH_KEY}'] must be callable or expose call()",
+        code="mcp_inner_dispatch_invalid",
+    )
 
 
 class UseToolTool(Tool):
@@ -451,14 +483,20 @@ class UseToolTool(Tool):
         except Exception:  # noqa: BLE001
             pass
 
-        dispatch = extra.get("mcp_dispatch")
-        if not callable(dispatch):
+        inner_dispatch = extra.get(MCP_INNER_DISPATCH_KEY)
+        legacy_dispatch = extra.get(MCP_LEGACY_DISPATCH_KEY)
+        if inner_dispatch is None and not callable(legacy_dispatch):
             raise ToolError(
-                "MCP dispatch is not available (host must provide extra['mcp_dispatch']).",
+                missing_mcp_dispatch_message(),
                 code="mcp_dispatch_missing",
             )
         try:
-            result = dispatch(name, tool_input)
+            if inner_dispatch is not None:
+                result = _call_inner_dispatch(inner_dispatch, name, tool_input, ctx)
+            else:
+                result = legacy_dispatch(name, tool_input)
+        except ToolError:
+            raise
         except Exception as e:  # noqa: BLE001
             raise ToolError(f"Failed to call {name}: {e}", code="mcp_error") from e
 
@@ -466,14 +504,22 @@ class UseToolTool(Tool):
         if isinstance(result, dict) and (
             "content" in result or "isError" in result or "is_error" in result
         ):
+            # Standard MCP content and a host mutation envelope may coexist.
+            # Record first-hand mutations before flattening content[].
+            _record_host_mutations(
+                ctx, tool_name=name, tool_input=tool_input, result=result
+            )
             text = gateway_result_to_text(result)
             if gateway_result_is_error(result):
-                return f"Error from MCP tool {name}: {text}"
+                raise ToolError(
+                    f"Error from MCP tool {name}: {text}",
+                    code="mcp_tool_error",
+                )
             result = text
-
-        result = _record_host_mutations(
-            ctx, tool_name=name, tool_input=tool_input, result=result
-        )
+        else:
+            result = _record_host_mutations(
+                ctx, tool_name=name, tool_input=tool_input, result=result
+            )
 
         if result is None:
             return "(empty MCP result)"

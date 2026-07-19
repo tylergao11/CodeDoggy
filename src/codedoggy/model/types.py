@@ -42,6 +42,10 @@ class ChatMessage:
     name: str | None = None
     tool_call_id: str | None = None
     tool_calls: list[dict[str, Any]] | None = None
+    # Provider thinking / CoT (DeepSeek reasoning_content, etc.)
+    reasoning_content: str | None = None
+    # Opaque provider payload (e.g. anthropic_content_blocks for signed thinking)
+    provider_data: dict[str, Any] | None = None
 
 
 @dataclass(slots=True)
@@ -54,3 +58,6 @@ class CompletionResult:
     tool_calls: list[dict[str, Any]] = field(default_factory=list)
     raw: dict[str, Any] = field(default_factory=dict)
     usage: dict[str, Any] = field(default_factory=dict)
+    # Separated chain-of-thought when the provider returns it
+    reasoning_content: str | None = None
+    provider_data: dict[str, Any] | None = None

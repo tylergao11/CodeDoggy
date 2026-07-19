@@ -4,7 +4,38 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
+
+if TYPE_CHECKING:
+    from codedoggy.tools.runtime import ToolCallContext
+
+
+# MAIN-owned host seam corresponding to Grok's Resources<InnerDispatch>.
+MCP_INNER_DISPATCH_KEY = "mcp_inner_dispatch"
+MCP_LEGACY_DISPATCH_KEY = "mcp_dispatch"
+MCP_CATALOG_KEY = "mcp_tools"
+
+
+@runtime_checkable
+class McpInnerDispatch(Protocol):
+    """Canonical dispatch contract for a registered MCP target tool."""
+
+    def __call__(
+        self,
+        tool_name: str,
+        tool_input: dict[str, Any],
+        ctx: "ToolCallContext",
+    ) -> Any: ...
+
+
+def missing_mcp_dispatch_message() -> str:
+    """Explicit MAIN integration requirement when no MCP runtime is wired."""
+    return (
+        "MCP dispatch is not available. MAIN must provide "
+        f"extra['{MCP_INNER_DISPATCH_KEY}'](tool_name, tool_input, ToolCallContext); "
+        f"legacy extra['{MCP_LEGACY_DISPATCH_KEY}'](tool_name, tool_input) "
+        "is also supported."
+    )
 
 
 @dataclass

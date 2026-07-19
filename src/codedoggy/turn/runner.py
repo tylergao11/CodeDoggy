@@ -42,6 +42,10 @@ class AgentTurnRunner:
         self.resume_live = resume_live
         # Last completed loop messages (incl. system); next turn strips system.
         self.live_messages: list[Message] = []
+        # Optional host-only observer for user-visible live transcript surfaces.
+        # It receives the same assistant/tool messages that are archived, but
+        # never changes the model transcript or persistence path.
+        self.on_live_message: Any | None = None
 
     def clear_live_history(self) -> None:
         """Drop in-process cross-prompt history (tests / new topic)."""
@@ -134,6 +138,46 @@ class AgentTurnRunner:
                 f"{system_prompt}\n\n{blocks}" if system_prompt else blocks
             )
 
+        # Grok refreshes the MCP snapshot and injects a per-turn server
+        # reminder after progressive initialization. Build it from the same
+        # live ToolIndex used by search_tool so prompt/catalog cannot drift.
+        if kernel is not None and getattr(kernel, "mcp_runtime", None) is not None:
+            refresh_extra = getattr(kernel, "refresh_tool_extra", None)
+            if callable(refresh_extra):
+                refresh_extra()
+            from codedoggy.tools.builtins.search_tool import (
+                mcp_server_reminder_from_extra,
+            )
+
+            runtime = kernel.mcp_runtime
+            connecting = list(getattr(runtime, "connecting_servers", []) or [])
+            connected_reminder = mcp_server_reminder_from_extra(
+                getattr(kernel, "tool_extra", None)
+            )
+            reminder_parts: list[str] = []
+            if connected_reminder:
+                reminder_parts.append(connected_reminder)
+            if connecting:
+                lines = [
+                    "MCP servers currently connecting (tools will become available shortly):",
+                    *(f"- {name}" for name in connecting),
+                    "",
+                    "Do not attempt to use tools from these servers yet. If the user's "
+                    "request likely requires one of these servers, mention that the server "
+                    "is still connecting and proceed with what you can do in the meantime.",
+                ]
+                reminder_parts.append("\n".join(lines))
+            mcp_reminder = "\n\n".join(reminder_parts)
+            if mcp_reminder:
+                reminder_block = (
+                    f"<system-reminder>\n{mcp_reminder}\n</system-reminder>"
+                )
+                system_prompt = (
+                    f"{system_prompt}\n\n{reminder_block}"
+                    if system_prompt
+                    else reminder_block
+                )
+
         from codedoggy.memory.hermes_select import HermesMemorySelector
 
         selector = None
@@ -194,6 +238,12 @@ class AgentTurnRunner:
         prior = self.live_messages if self.resume_live and self.live_messages else None
 
         def _archive(msg: Message) -> None:
+            observer = self.on_live_message
+            if callable(observer):
+                try:
+                    observer(msg)
+                except Exception:  # noqa: BLE001
+                    logger.debug("live message observer failed", exc_info=True)
             if session_store is None or not session_id:
                 return
             try:
@@ -255,6 +305,9 @@ class AgentTurnRunner:
         if prefetch_user_block:
             tool_extra = dict(tool_extra)
             tool_extra["prefetch_user_block"] = prefetch_user_block
+        if request.prompt_id:
+            tool_extra = dict(tool_extra)
+            tool_extra["prompt_id"] = request.prompt_id
 
         loop = run_agent_loop(
             user_text=request.text,
@@ -287,16 +340,6 @@ class AgentTurnRunner:
             if callable(on_ok):
                 on_ok()
 
-        # Hermes post-turn: sync_all + queue_prefetch_all (seam)
-        on_turn_end(
-            memory_manager,
-            user_text=request.text or "",
-            assistant_text=loop.final_text or "",
-            session_id=session_id or "",
-            cwd=cwd_s,
-            messages=list(loop.messages) if loop.messages else None,
-        )
-
         meta_extra = {
             "live_messages": len(loop.messages),
             "resumed_prior": bool(prior),
@@ -305,7 +348,7 @@ class AgentTurnRunner:
         }
 
         if loop.error and not loop.aborted and not loop.cancelled:
-            return TurnResult(
+            result = TurnResult(
                 status=TurnStatus.ERROR,
                 final_text=loop.final_text,
                 tools_called=loop.tools_called,
@@ -316,15 +359,15 @@ class AgentTurnRunner:
                     **meta_extra,
                 },
             )
-        if loop.cancelled:
-            return TurnResult(
+        elif loop.cancelled:
+            result = TurnResult(
                 status=TurnStatus.CANCELLED,
                 final_text=loop.final_text,
                 tools_called=loop.tools_called,
                 metadata={"rounds": loop.rounds, **loop.metadata, **meta_extra},
             )
-        if loop.max_turns_reached:
-            return TurnResult(
+        elif loop.max_turns_reached:
+            result = TurnResult(
                 status=TurnStatus.MAX_TURNS_REACHED,
                 final_text=loop.final_text,
                 tools_called=loop.tools_called,
@@ -335,8 +378,8 @@ class AgentTurnRunner:
                     **meta_extra,
                 },
             )
-        if loop.aborted:
-            return TurnResult(
+        elif loop.aborted:
+            result = TurnResult(
                 status=TurnStatus.ERROR,
                 final_text=loop.final_text,
                 tools_called=loop.tools_called,
@@ -348,12 +391,26 @@ class AgentTurnRunner:
                     **meta_extra,
                 },
             )
-        return TurnResult(
-            status=TurnStatus.COMPLETED,
-            final_text=loop.final_text,
-            tools_called=loop.tools_called,
-            metadata={"rounds": loop.rounds, **loop.metadata, **meta_extra},
+        else:
+            result = TurnResult(
+                status=TurnStatus.COMPLETED,
+                final_text=loop.final_text,
+                tools_called=loop.tools_called,
+                metadata={"rounds": loop.rounds, **loop.metadata, **meta_extra},
+            )
+
+        # Classify before durable provider sync. Cancel/abort/error/max-turn
+        # transcripts remain observable, but cannot be learned as successes.
+        on_turn_end(
+            memory_manager,
+            outcome=result.status.value,
+            user_text=request.text or "",
+            assistant_text=loop.final_text or "",
+            session_id=session_id or "",
+            cwd=cwd_s,
+            messages=list(loop.messages) if loop.messages else None,
         )
+        return result
 
 
 def _bind_compactor_model_window(compactor: Any, sampler: Any) -> None:
@@ -425,6 +482,3 @@ def _resolve_model_config(sampler: Any) -> Any | None:
     if hasattr(sampler, "context_window") or hasattr(sampler, "max_tokens"):
         return sampler
     return None
-
-
-

@@ -44,6 +44,10 @@ def test_builtin_providers_registered() -> None:
     names = list_providers()
     assert "ollama" in names
     assert "openai_compat" in names
+    # OAuth session providers present
+    assert "grok" in names or "xai" in names
+    assert "claude" in names
+    assert "codex" in names
 
 
 def test_register_custom_provider() -> None:

@@ -316,6 +316,46 @@ def test_agent_turn_runner_via_session(tmp_path: Path) -> None:
     s.close()
 
 
+def test_agent_turn_runner_emits_live_transcript_messages(tmp_path: Path) -> None:
+    (tmp_path / "a.txt").write_text("observer payload\n", encoding="utf-8")
+    tools = ToolRegistryBuilder.new().finalize()
+    sampler = ScriptedSampler(
+        [
+            SampleResult(
+                content="先读取文件",
+                tool_calls=[
+                    ToolCall(
+                        id="read-1",
+                        name="read_file",
+                        arguments={"target_file": "a.txt"},
+                    )
+                ],
+            ),
+            SampleResult(content="读取完成"),
+        ]
+    )
+    runner = AgentTurnRunner(sampler=sampler, tools=tools)
+    observed: list[Message] = []
+    runner.on_live_message = observed.append
+    session = Session.create(tmp_path, max_turns=3)
+    session.bind_turn_runner(runner)
+
+    result = session.handle_prompt("读取 a.txt")
+
+    assert result.status is TurnStatus.COMPLETED
+    assert any(message.role is Role.USER for message in observed)
+    assistant_calls = next(
+        message
+        for message in observed
+        if message.role is Role.ASSISTANT and message.tool_calls
+    )
+    assert assistant_calls.tool_calls[0].name == "read_file"
+    tool_message = next(message for message in observed if message.role is Role.TOOL)
+    assert "observer payload" in (tool_message.content or "")
+    assert observed[-1].content == "读取完成"
+    session.close()
+
+
 def test_agent_turn_runner_max_turns_status(tmp_path: Path) -> None:
     tools = ToolRegistryBuilder.new().finalize()
     (tmp_path / "a.txt").write_text("x", encoding="utf-8")

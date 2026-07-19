@@ -38,6 +38,10 @@ class Message:
     tool_calls: list[ToolCall] | None = None
     tool_call_id: str | None = None
     name: str | None = None
+    # DeepSeek / thinking-mode CoT; replayed by model profile when required
+    reasoning_content: str | None = None
+    # e.g. anthropic_content_blocks for signed thinking + tool_use order
+    provider_data: dict[str, Any] | None = None
 
 
 @dataclass(slots=True)
@@ -47,6 +51,8 @@ class SampleResult:
     content: str | None = None
     tool_calls: list[ToolCall] = field(default_factory=list)
     raw: dict[str, Any] = field(default_factory=dict)
+    reasoning_content: str | None = None
+    provider_data: dict[str, Any] | None = None
 
     @property
     def has_tool_calls(self) -> bool:

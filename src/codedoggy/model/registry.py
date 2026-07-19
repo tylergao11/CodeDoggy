@@ -1,8 +1,4 @@
-"""Provider registry — register by name, create clients from ModelConfig.
-
-Inspired by Hermes provider profiles + Grok SamplerConfig construction:
-config is pure data; factories produce clients. Only one factory per name.
-"""
+"""Provider registry — auth → profile → transport (OpenAI | Anthropic)."""
 
 from __future__ import annotations
 
@@ -11,7 +7,22 @@ import os
 from collections.abc import Callable
 from typing import Any
 
+from codedoggy.model.anthropic_messages import AnthropicMessagesClient
+from codedoggy.model.bedrock import BedrockConverseClient
+from codedoggy.model.codex_app_server import CodexAppServerClient
+from codedoggy.model.codex_responses import CodexResponsesClient
 from codedoggy.model.openai_compat import OpenAICompatClient
+from codedoggy.model.profile import (
+    API_ANTHROPIC_MESSAGES,
+    API_CHAT_COMPLETIONS,
+    API_CODEX_RESPONSES,
+)
+from codedoggy.model.vertex import VertexClient
+from codedoggy.model.profile_registry import (
+    get_profile,
+    list_profiles,
+    resolve_profile_name,
+)
 from codedoggy.model.provider import ChatClient
 from codedoggy.model.types import ModelConfig
 
@@ -23,7 +34,6 @@ _REGISTRY: dict[str, ClientFactory] = {}
 
 
 def register_provider(name: str, factory: ClientFactory, *, replace: bool = False) -> None:
-    """Register a provider factory under ``name`` (e.g. ``ollama``)."""
     key = name.strip().lower()
     if not key:
         raise ValueError("provider name must be non-empty")
@@ -38,25 +48,49 @@ def unregister_provider(name: str) -> None:
 
 
 def list_providers() -> list[str]:
-    return sorted(_REGISTRY.keys())
+    names = set(_REGISTRY.keys()) | set(list_profiles())
+    return sorted(names)
 
 
 def get_factory(name: str) -> ClientFactory | None:
     return _REGISTRY.get(name.strip().lower())
 
 
-def create_client(config: ModelConfig) -> ChatClient:
-    """Build a ChatClient for ``config.provider`` (fallback: openai_compat)."""
-    key = (config.provider or "openai_compat").strip().lower()
-    factory = _REGISTRY.get(key)
-    if factory is None:
-        if key not in {"openai_compat", "openai", "custom"}:
-            logger.warning("unknown provider %r — using openai_compat transport", key)
-        factory = _REGISTRY.get("openai_compat")
-    if factory is None:
-        # Always available default.
-        return OpenAICompatClient(config)
-    return factory(config)
+def create_client(config: ModelConfig, *, require_auth: bool | None = None) -> ChatClient:
+    """Auth layer fills credentials, then api_mode picks transport.
+
+    ``require_auth`` defaults to True for OAuth providers (Grok/Claude/Codex),
+    False for api_key providers. Pass explicitly to override.
+    """
+    from codedoggy.model.auth.resolve import apply_auth_to_config
+
+    cfg = apply_auth_to_config(config, require=require_auth)
+    key = (cfg.provider or "openai_compat").strip().lower()
+    canon = resolve_profile_name(key) or key
+    profile = get_profile(key) or get_profile(canon)
+
+    factory = _REGISTRY.get(key) or _REGISTRY.get(canon or "")
+    if factory is not None:
+        return factory(cfg)
+
+    # Profile-driven transport
+    if profile is not None:
+        mode = profile.api_mode
+        if mode == API_ANTHROPIC_MESSAGES:
+            return AnthropicMessagesClient(cfg, profile=profile)
+        if mode == API_CODEX_RESPONSES:
+            return CodexResponsesClient(cfg, profile=profile)
+        if mode == "bedrock_converse":
+            return BedrockConverseClient(cfg, profile=profile)
+        if mode == "codex_app_server":
+            return CodexAppServerClient(cfg, profile=profile)
+        if profile.name in {"vertex", "vertex-ai", "google-vertex"}:
+            return VertexClient(cfg, profile=profile)
+        return OpenAICompatClient(cfg, profile=profile)
+
+    if key not in {"openai_compat", "openai", "custom"}:
+        logger.warning("unknown provider %r — using openai_compat transport", key)
+    return OpenAICompatClient(cfg, profile=get_profile("openai_compat"))
 
 
 def model_config_from_env(
@@ -66,41 +100,93 @@ def model_config_from_env(
     base_url: str | None = None,
     api_key: str | None = None,
 ) -> ModelConfig:
-    """Resolve config from args + environment (Ollama-friendly defaults)."""
+    """Resolve config from args + environment, using provider profiles + auth."""
+    _ensure_profiles()
+
     prov = (
         provider
         or os.environ.get("CODEDOGGY_PROVIDER")
         or "ollama"
     ).strip().lower()
-    if prov == "ollama":
+    profile = get_profile(prov)
+
+    if profile is not None:
+        default_base = profile.resolve_base_url(None) or profile.base_url
+        default_model = profile.default_model or "gpt-4o-mini"
+    elif prov == "ollama":
         default_base = "http://127.0.0.1:11434/v1"
         default_model = "qwen3:8b"
-        default_key = os.environ.get("OLLAMA_API_KEY") or "ollama"
     else:
         default_base = "http://127.0.0.1:11434/v1"
         default_model = "gpt-4o-mini"
-        default_key = os.environ.get("OPENAI_API_KEY") or ""
 
-    return ModelConfig(
+    resolved_base = (
+        base_url
+        or os.environ.get("CODEDOGGY_BASE_URL")
+        or (profile.resolve_base_url(None) if profile else None)
+        or os.environ.get("OLLAMA_HOST")
+        or default_base
+        or ""
+    )
+    if prov == "ollama":
+        resolved_base = _normalize_ollama_base(resolved_base)
+
+    # Leave api_key as explicit only; create_client / apply_auth fills OAuth.
+    cfg = ModelConfig(
         provider=prov,
-        model=(model or os.environ.get("CODEDOGGY_MODEL") or default_model).strip(),
-        base_url=(
-            base_url
-            or os.environ.get("CODEDOGGY_BASE_URL")
-            or os.environ.get("OLLAMA_HOST")
-            or default_base
+        model=(
+            model
+            or os.environ.get("CODEDOGGY_MODEL")
+            or default_model
         ).strip(),
-        api_key=(
-            api_key
-            if api_key is not None
-            else (os.environ.get("CODEDOGGY_API_KEY") or default_key or None)
-        ),
+        base_url=str(resolved_base).strip(),
+        api_key=api_key if api_key is not None else os.environ.get("CODEDOGGY_API_KEY"),
         temperature=_env_float("CODEDOGGY_TEMPERATURE", 0.2),
         max_tokens=_env_int("CODEDOGGY_MAX_TOKENS", None),
         timeout_s=_env_float("CODEDOGGY_TIMEOUT_S", 120.0) or 120.0,
         context_window=_env_int("CODEDOGGY_CONTEXT_WINDOW", None)
         or _env_int("CODEDOGGY_CONTEXT_MAX_TOKENS", 32768),
+        extra=_reasoning_extra_from_env(),
     )
+    # Soft hydrate: fill tokens when present; do not raise LoginRequired here
+    # (callers that need hard gate use create_client / apply_auth with require).
+    try:
+        from codedoggy.model.auth.resolve import apply_auth_to_config
+
+        cfg = apply_auth_to_config(cfg, require=False)
+    except Exception:  # noqa: BLE001
+        logger.debug("auth hydrate skipped", exc_info=True)
+    return cfg
+
+
+def _reasoning_extra_from_env() -> dict[str, Any]:
+    extra: dict[str, Any] = {}
+    enabled_raw = os.environ.get("CODEDOGGY_REASONING_ENABLED")
+    effort_raw = os.environ.get("CODEDOGGY_REASONING_EFFORT")
+    if enabled_raw is None and effort_raw is None:
+        return extra
+    rc: dict[str, Any] = {}
+    if enabled_raw is not None:
+        rc["enabled"] = enabled_raw.strip().lower() in {"1", "true", "yes", "on"}
+    if effort_raw is not None and effort_raw.strip():
+        rc["effort"] = effort_raw.strip().lower()
+    if rc:
+        extra["reasoning"] = rc
+    return extra
+
+
+def _normalize_ollama_base(base: str) -> str:
+    b = (base or "").rstrip("/")
+    if not b:
+        return "http://127.0.0.1:11434/v1"
+    if b.endswith(":11434"):
+        return b + "/v1"
+    if "/v1" not in b and "11434" in b and not b.endswith("/v1"):
+        if b.count("/") <= 2 or b.rstrip("/").endswith("11434"):
+            return b.rstrip("/") + "/v1"
+    if "://" not in b and "11434" in b:
+        return f"http://{b}/v1" if not b.endswith("/v1") else f"http://{b}"
+    return b
 
 
 def _env_float(name: str, default: float | None) -> float | None:
@@ -123,15 +209,42 @@ def _env_int(name: str, default: int | None) -> int | None:
         return default
 
 
+def _openai_factory(config: ModelConfig) -> ChatClient:
+    return OpenAICompatClient(
+        config, profile=get_profile(config.provider) or get_profile("openai_compat")
+    )
+
+
+def _anthropic_factory(config: ModelConfig) -> ChatClient:
+    return AnthropicMessagesClient(config, profile=get_profile(config.provider) or get_profile("claude"))
+
+
+def _codex_factory(config: ModelConfig) -> ChatClient:
+    return CodexResponsesClient(
+        config, profile=get_profile(config.provider) or get_profile("codex")
+    )
+
+
+def _bedrock_factory(config: ModelConfig) -> ChatClient:
+    return BedrockConverseClient(
+        config, profile=get_profile(config.provider) or get_profile("bedrock")
+    )
+
+
+def _vertex_factory(config: ModelConfig) -> ChatClient:
+    return VertexClient(
+        config, profile=get_profile(config.provider) or get_profile("vertex")
+    )
+
+
+def _codex_app_server_factory(config: ModelConfig) -> ChatClient:
+    return CodexAppServerClient(
+        config, profile=get_profile(config.provider) or get_profile("codex_app_server")
+    )
+
+
 def _ollama_factory(config: ModelConfig) -> ChatClient:
-    # Normalize host-only URLs to OpenAI-compatible /v1 root.
-    base = config.base_url.rstrip("/")
-    if base.endswith(":11434"):
-        base = base + "/v1"
-    elif "/v1" not in base and "11434" in base and not base.endswith("/v1"):
-        # e.g. http://127.0.0.1:11434
-        if base.count("/") <= 2 or base.rstrip("/").endswith("11434"):
-            base = base.rstrip("/") + "/v1"
+    base = _normalize_ollama_base(config.base_url)
     cfg = ModelConfig(
         provider="ollama",
         model=config.model,
@@ -140,27 +253,47 @@ def _ollama_factory(config: ModelConfig) -> ChatClient:
         temperature=config.temperature,
         max_tokens=config.max_tokens,
         timeout_s=config.timeout_s,
+        context_window=config.context_window,
         extra_headers=dict(config.extra_headers),
         extra=dict(config.extra),
     )
-    return OpenAICompatClient(cfg)
+    return OpenAICompatClient(cfg, profile=get_profile("ollama"))
 
 
-def _openai_compat_factory(config: ModelConfig) -> ChatClient:
-    return OpenAICompatClient(config)
+def _ensure_profiles() -> None:
+    from codedoggy.model.builtin_profiles import register_builtin_profiles
+
+    register_builtin_profiles()
+    # Ensure auth providers registered
+    from codedoggy.model.auth import resolve as _auth_resolve
+
+    _auth_resolve._bootstrap()  # noqa: SLF001
 
 
 def register_builtin_providers() -> None:
-    """Idempotent registration of stock providers."""
-    if "openai_compat" not in _REGISTRY:
-        register_provider("openai_compat", _openai_compat_factory)
-    if "openai" not in _REGISTRY:
-        register_provider("openai", _openai_compat_factory)
-    if "custom" not in _REGISTRY:
-        register_provider("custom", _openai_compat_factory)
-    if "ollama" not in _REGISTRY:
-        register_provider("ollama", _ollama_factory)
+    _ensure_profiles()
+    factories: dict[str, ClientFactory] = {
+        "openai_compat": _openai_factory,
+        "openai": _openai_factory,
+        "custom": _openai_factory,
+        "ollama": _ollama_factory,
+        "deepseek": _openai_factory,
+        # OAuth session providers (Hermes: xai + codex → Responses)
+        "grok": _codex_factory,
+        "xai": _codex_factory,
+        "codex": _codex_factory,
+        "openai-codex": _codex_factory,
+        "claude": _anthropic_factory,
+        "anthropic": _anthropic_factory,
+        "bedrock": _bedrock_factory,
+        "aws-bedrock": _bedrock_factory,
+        "vertex": _vertex_factory,
+        "vertex-ai": _vertex_factory,
+        "codex_app_server": _codex_app_server_factory,
+        "codex-app-server": _codex_app_server_factory,
+    }
+    for name, factory in factories.items():
+        register_provider(name, factory, replace=True)
 
 
-# Register on import so create_client always works.
 register_builtin_providers()

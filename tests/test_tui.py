@@ -506,6 +506,7 @@ def test_full_screen_agent_window_is_opaque_and_interactive() -> None:
         assert top.startswith("  ╭") and top.endswith("╮")
         assert bottom.startswith("  ╰") and "model · auto" in bottom
         assert "Enter:" in shortcuts and "Ctrl+Q:退出" in shortcuts
+        assert "Ctrl+L:登录" in shortcuts or "登录" in shortcuts
         assert tui._input.control.input_processors
 
         tui._set_feedback("MAIN 已汇总，任务完成", "success")

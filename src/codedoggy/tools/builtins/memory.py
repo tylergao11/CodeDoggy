@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any
 
 from codedoggy.memory.store import MemoryStore
@@ -15,6 +16,8 @@ from codedoggy.tools.runtime import (
     ToolError,
     ToolId,
 )
+
+logger = logging.getLogger(__name__)
 
 _DESCRIPTION = """\
 Manage curated persistent memory that survives across sessions.
@@ -138,7 +141,46 @@ class MemoryTool(Tool):
                 raise ToolError.invalid_arguments("operations list is required for batch")
             result = store.apply_batch(target, ops)
 
+        # Hermes bridge contract: the built-in tool hands the raw result and
+        # args to MemoryManager. The manager owns success/staged gating, batch
+        # expansion, frozen-snapshot refresh, and external-provider mirroring.
+        manager = (ctx.extra or {}).get("memory_manager")
+        notify = getattr(manager, "notify_memory_tool_write", None)
+        if callable(notify):
+            try:
+                notify(
+                    result,
+                    args,
+                    build_metadata=lambda: self._build_write_metadata(ctx),
+                )
+            except Exception:  # noqa: BLE001
+                # The curated write already committed. A mirror failure must
+                # not turn that durable success into a tool-level failure.
+                logger.debug("memory write notification failed", exc_info=True)
+
         return json.dumps(result, ensure_ascii=False)
+
+    @staticmethod
+    def _build_write_metadata(ctx: ToolCallContext) -> dict[str, Any]:
+        extra = ctx.extra or {}
+        metadata: dict[str, Any] = {
+            "write_origin": "assistant_tool",
+            "execution_context": "foreground",
+            "session_id": ctx.session_id or "",
+            "platform": str(extra.get("platform") or "codedoggy"),
+            "tool_name": "memory",
+            "cwd": str(ctx.cwd),
+        }
+        for key in (
+            "parent_session_id",
+            "prompt_id",
+            "task_id",
+            "tool_call_id",
+        ):
+            value = extra.get(key)
+            if value not in {None, ""}:
+                metadata[key] = value
+        return {key: value for key, value in metadata.items() if value not in {None, ""}}
 
     def _resolve_store(self, ctx: ToolCallContext) -> MemoryStore:
         if self._store is not None:

@@ -15,17 +15,19 @@ from __future__ import annotations
 
 import logging
 import threading
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Callable
+from typing import Callable, TypeVar
 
 from codedoggy.graph.builder import MAX_INDEXABLE_FILE_SIZE, IndexBuilder
 from codedoggy.graph.index import ScopeGraphIndex
 from codedoggy.graph.languages import LanguageRegistry
-from codedoggy.graph.types import FileMeta
+from codedoggy.graph.types import FileMeta, IndexStats
 
 logger = logging.getLogger(__name__)
+
+_T = TypeVar("_T")
 
 
 class FileEventKind(str, Enum):
@@ -79,15 +81,34 @@ class IndexManager:
             return self._index
 
     def get_snapshot(self) -> ScopeGraphIndex:
-        """Return a shallow immutable-enough copy for lock-free reads.
+        """Return an isolated snapshot of the current index.
 
-        Watcher continues mutating ``_index``; navigators must use this copy
-        or hold the manager lock.
+        Grok returns an ``Arc`` snapshot and uses copy-on-write for subsequent
+        mutations.  Python has no equivalent cheap COW container here, so take
+        the copy while holding the owner lock.  This path is reserved for cache
+        persistence and the compatibility ``ensure_indexed`` API; navigation
+        uses :meth:`read_index` and does not clone the repository index.
         """
         import copy
 
         with self._lock:
-            return copy.copy(self._index)
+            return copy.deepcopy(self._index)
+
+    def read_index(self, reader: Callable[[ScopeGraphIndex], _T]) -> _T:
+        """Run a lightweight query while the owned index is stable."""
+        with self._lock:
+            return reader(self._index)
+
+    def stats(self) -> IndexStats:
+        """Return stats without cloning the whole index."""
+        with self._lock:
+            return self._index.stats()
+
+    def replace_index(self, index: ScopeGraphIndex) -> ScopeGraphIndex:
+        """Atomically replace the owned index while keeping this handle stable."""
+        with self._lock:
+            self._index = index
+            return self._index
 
     def rebuild(self) -> ScopeGraphIndex:
         with self._lock:

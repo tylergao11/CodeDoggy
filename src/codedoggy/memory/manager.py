@@ -15,12 +15,12 @@ and injected into the current user message at sample time only — not SYSTEM.
 
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 import threading
-import time
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any
+from typing import Any, Callable
 
 from codedoggy.memory.provider import (
     CuratedMemoryProvider,
@@ -207,6 +207,35 @@ class MemoryManager:
 
         self._submit_background(_run)
 
+    @staticmethod
+    def _supported_keyword_args(
+        fn: Callable[..., Any], candidates: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Select keyword arguments from a callable signature before invoking it.
+
+        Compatibility is decided before the call so a runtime ``TypeError``
+        cannot trigger a second execution of a provider side effect.
+        """
+        try:
+            signature = inspect.signature(fn)
+        except (TypeError, ValueError):
+            # Some extension callables do not expose signatures. Prefer the
+            # current contract and still invoke exactly once.
+            return dict(candidates)
+        params = signature.parameters
+        if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
+            return dict(candidates)
+        return {
+            key: value
+            for key, value in candidates.items()
+            if key in params
+            and params[key].kind
+            in {
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                inspect.Parameter.KEYWORD_ONLY,
+            }
+        }
+
     def sync_all(
         self,
         user_text: str,
@@ -223,6 +252,8 @@ class MemoryManager:
         sid = session_id or self._session_id
         u = user_text or ""
         a = assistant_text or ""
+        if not u.strip():
+            return
 
         def _run() -> None:
             from codedoggy.memory.redact import redact_secrets
@@ -232,16 +263,19 @@ class MemoryManager:
             safe_msgs = _redact_messages_for_provider(messages)
             for p in providers:
                 try:
-                    try:
-                        p.sync_turn(
-                            safe_u,
-                            safe_a,
-                            session_id=sid,
-                            cwd=cwd,
-                            messages=safe_msgs,
-                        )
-                    except TypeError:
-                        p.sync_turn(safe_u, safe_a, session_id=sid, cwd=cwd)
+                    candidates: dict[str, Any] = {
+                        "session_id": sid,
+                        "cwd": cwd,
+                    }
+                    if safe_msgs is not None:
+                        candidates["messages"] = safe_msgs
+                    kwargs = self._supported_keyword_args(
+                        p.sync_turn,
+                        candidates,
+                    )
+                    # Exactly one call. A TypeError raised by provider logic is
+                    # a real provider failure, not evidence of an old signature.
+                    p.sync_turn(safe_u, safe_a, **kwargs)
                 except Exception as e:  # noqa: BLE001
                     logger.warning(
                         "Memory provider '%s' sync_turn failed: %s", p.name, e
@@ -273,6 +307,10 @@ class MemoryManager:
             except Exception as e:  # noqa: BLE001
                 logger.warning("provider %s get_tool_schemas failed: %s", p.name, e)
         return schemas
+
+    def get_all_tool_names(self) -> set[str]:
+        """Return provider-owned tool names for child/toolset isolation."""
+        return set(self._tool_to_provider)
 
     def has_tool(self, tool_name: str) -> bool:
         return tool_name in self._tool_to_provider
@@ -445,6 +483,11 @@ class MemoryManager:
 
         Skips builtin_* sources of the write (Hermes skips name=='builtin').
         """
+        self._refresh_curated_snapshot()
+        self.on_memory_write(action, target, content, metadata=metadata)
+
+    def _refresh_curated_snapshot(self) -> None:
+        """Refresh the frozen curated prompt after a committed local write."""
         store = self.curated_store
         if store is not None:
             refresh = getattr(store, "refresh_system_prompt_snapshot", None)
@@ -453,7 +496,34 @@ class MemoryManager:
                     refresh()
                 except Exception as e:  # noqa: BLE001
                     logger.warning("notify_memory_write refresh failed: %s", e)
-        self.on_memory_write(action, target, content, metadata=metadata)
+
+    @staticmethod
+    def _provider_memory_write_metadata_mode(provider: Any) -> str:
+        """Resolve metadata compatibility without retrying provider effects."""
+        hook = getattr(provider, "on_memory_write", None)
+        try:
+            signature = inspect.signature(hook)
+        except (TypeError, ValueError):
+            return "keyword"
+        params = signature.parameters
+        if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
+            return "keyword"
+        metadata_param = params.get("metadata")
+        if metadata_param is not None and metadata_param.kind in {
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.KEYWORD_ONLY,
+        }:
+            return "keyword"
+        positional = [
+            p
+            for p in params.values()
+            if p.kind
+            in {
+                inspect.Parameter.POSITIONAL_ONLY,
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            }
+        ]
+        return "positional" if len(positional) >= 4 else "legacy"
 
     def on_memory_write(
         self,
@@ -471,13 +541,88 @@ class MemoryManager:
             if not callable(hook):
                 continue
             try:
-                try:
+                metadata_mode = self._provider_memory_write_metadata_mode(p)
+                if metadata_mode == "keyword":
                     hook(action, target, content, metadata=dict(metadata or {}))
-                except TypeError:
+                elif metadata_mode == "positional":
+                    hook(action, target, content, dict(metadata or {}))
+                else:
                     hook(action, target, content)
             except Exception as e:  # noqa: BLE001
                 logger.debug(
                     "Memory provider '%s' on_memory_write failed: %s", p.name, e
+                )
+
+    _MIRRORED_MEMORY_ACTIONS = frozenset({"add", "replace", "remove"})
+
+    @staticmethod
+    def _memory_tool_result_succeeded(result: Any) -> bool:
+        """Fail closed unless the built-in tool committed a non-staged write."""
+        if isinstance(result, str):
+            try:
+                result = json.loads(result)
+            except Exception:  # noqa: BLE001
+                return False
+        if not isinstance(result, dict):
+            return False
+        return result.get("success") is True and result.get("staged") is not True
+
+    def notify_memory_tool_write(
+        self,
+        tool_result: Any,
+        tool_args: dict[str, Any],
+        *,
+        build_metadata: Callable[[], dict[str, Any]] | None = None,
+    ) -> None:
+        """Refresh and mirror one successful built-in memory invocation.
+
+        Batch expansion, result gating, per-operation metadata, and ``old_text``
+        forwarding follow Hermes' built-in memory bridge contract.
+        """
+        if not self._memory_tool_result_succeeded(tool_result):
+            return
+
+        target = str(tool_args.get("target") or "memory")
+        operations = tool_args.get("operations")
+        if isinstance(operations, list) and operations:
+            raw_operations = operations
+        else:
+            raw_operations = [
+                {
+                    "action": tool_args.get("action"),
+                    "content": tool_args.get("content"),
+                    "old_text": tool_args.get("old_text"),
+                }
+            ]
+
+        mirrored = [
+            op
+            for op in raw_operations
+            if isinstance(op, dict)
+            and str(op.get("action") or "") in self._MIRRORED_MEMORY_ACTIONS
+        ]
+        if not mirrored:
+            return
+
+        # The local store has already committed. Refresh once for the complete
+        # atomic batch, then fan out per-op notifications to external providers.
+        self._refresh_curated_snapshot()
+        for op in mirrored:
+            action = str(op.get("action") or "")
+            try:
+                metadata = dict(build_metadata() if build_metadata else {})
+                old_text = op.get("old_text")
+                if old_text:
+                    metadata["old_text"] = str(old_text)
+                self.on_memory_write(
+                    action,
+                    target,
+                    str(op.get("content") or ""),
+                    metadata=metadata,
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.debug(
+                    "notify_memory_tool_write failed for op %s: %s", action, e
                 )
 
     def on_delegation(
@@ -508,13 +653,18 @@ class MemoryManager:
     def flush_pending(self, timeout: float | None = None) -> bool:
         """Hermes flush_pending — barrier on single-worker queue."""
         with self._lock:
+            if self._shutdown:
+                return True
             executor = self._executor
-        if executor is None:
-            return True
-        try:
-            fut = executor.submit(lambda: None)
-        except RuntimeError:
-            return True
+            if executor is None:
+                return True
+            try:
+                # Submit under the lifecycle lock. Shutdown cannot move the
+                # manager to CLOSED between observing the pool and enqueueing
+                # the barrier.
+                fut = executor.submit(lambda: None)
+            except RuntimeError:
+                return False
         try:
             fut.result(timeout=timeout)
             return True
@@ -526,26 +676,42 @@ class MemoryManager:
         self.shutdown_all(timeout_s=timeout_s)
 
     def shutdown_all(self, *, timeout_s: float = _SYNC_DRAIN_TIMEOUT_S) -> None:
-        # Drain queued work
-        self.flush_pending(timeout=max(0.1, float(timeout_s)))
+        """Atomically close submissions, then drain before provider teardown."""
         with self._lock:
+            if self._shutdown:
+                return
             self._shutdown = True
             ex = self._executor
             self._executor = None
-            providers = list(self._providers)
-        if ex is not None:
-            try:
-                ex.shutdown(wait=False, cancel_futures=True)
-            except TypeError:
-                ex.shutdown(wait=False)
-            deadline = time.time() + max(0.1, float(timeout_s))
-            while time.time() < deadline:
-                alive = any(
-                    t.is_alive() for t in (getattr(ex, "_threads", None) or [])
-                )
-                if not alive:
-                    break
-                time.sleep(0.05)
+            providers = list(reversed(self._providers))
+
+        if ex is None:
+            self._close_providers(providers)
+            return
+
+        # No caller can enqueue after CLOSED because submission takes the same
+        # lock. Accepted work drains in order; providers close only afterwards.
+        try:
+            ex.shutdown(wait=False, cancel_futures=False)
+        except Exception:  # noqa: BLE001
+            logger.debug("memory executor stop-accepting failed", exc_info=True)
+
+        drainer = threading.Thread(
+            target=self._drain_executor_and_close,
+            args=(ex, providers),
+            daemon=True,
+            name="mem-sync-drain",
+        )
+        drainer.start()
+        drainer.join(timeout=max(0.0, float(timeout_s)))
+        if drainer.is_alive():
+            logger.warning(
+                "Memory sync did not drain within %.2fs; provider teardown deferred",
+                max(0.0, float(timeout_s)),
+            )
+
+    @staticmethod
+    def _close_providers(providers: list[Any]) -> None:
         for p in providers:
             close = getattr(p, "shutdown", None) or getattr(p, "close", None)
             if callable(close):
@@ -554,23 +720,46 @@ class MemoryManager:
                 except Exception:  # noqa: BLE001
                     logger.debug("provider shutdown failed", exc_info=True)
 
+    @classmethod
+    def _drain_executor_and_close(
+        cls, executor: ThreadPoolExecutor, providers: list[Any]
+    ) -> None:
+        try:
+            executor.shutdown(wait=True)
+        except Exception:  # noqa: BLE001
+            logger.debug("memory executor drain failed", exc_info=True)
+        finally:
+            cls._close_providers(providers)
+
     # -- Background dispatch (Hermes _submit_background) ---------------------
 
-    def _submit_background(self, fn: Any) -> None:
-        executor = self._get_executor()
-        if executor is None:
+    def _submit_background(self, fn: Any) -> bool:
+        """Enqueue once while OPEN; CLOSED managers drop late work."""
+        with self._lock:
+            if self._shutdown:
+                return False
+            executor = self._executor
+            if executor is None:
+                try:
+                    from codedoggy.memory.daemon_pool import (
+                        DaemonThreadPoolExecutor,
+                    )
+
+                    executor = DaemonThreadPoolExecutor(
+                        max_workers=1, thread_name_prefix="mem-sync"
+                    )
+                    self._executor = executor
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("Failed to create memory sync executor: %s", e)
+                    return False
             try:
-                fn()
-            except Exception as e:  # noqa: BLE001
-                logger.debug("Inline memory background task failed: %s", e)
-            return
-        try:
-            executor.submit(fn)
-        except RuntimeError:
-            try:
-                fn()
-            except Exception as e:  # noqa: BLE001
-                logger.debug("Inline memory background task failed: %s", e)
+                # Submit while holding the lifecycle lock so shutdown cannot
+                # interleave and force an inline replay of the side effect.
+                executor.submit(fn)
+                return True
+            except RuntimeError:
+                logger.debug("Memory background submission rejected", exc_info=True)
+                return False
 
     def _submit(self, fn: Any) -> None:
         self._submit_background(fn)
@@ -581,7 +770,11 @@ class MemoryManager:
                 return None
             if self._executor is None:
                 try:
-                    self._executor = ThreadPoolExecutor(
+                    from codedoggy.memory.daemon_pool import (
+                        DaemonThreadPoolExecutor,
+                    )
+
+                    self._executor = DaemonThreadPoolExecutor(
                         max_workers=1, thread_name_prefix="mem-sync"
                     )
                 except Exception as e:  # noqa: BLE001
