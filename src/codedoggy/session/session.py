@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -66,18 +67,26 @@ class Session:
         self._closed = False
         self._closing = False
         self._close_finalizing = False
+        self._close_finalizer_thread: threading.Thread | None = None
         self._cancel_requested = False
+        self._cancel_event = threading.Event()
         self._kernel: Any | None = getattr(self._ext, "kernel", None)
         # Serialise phase / close / live-history transitions (Actor-lite)
         self._lock = threading.RLock()
         # A full-prompt driver owns the queue until it is empty.  This mirrors
         # Grok's pager/actor serialization and avoids recursive queue draining.
         self._prompt_drain_active = False
+        self._prompt_ingress_stopped = False
         # Close is a barrier: resources stay live until the active turn exits.
         self._turn_done = threading.Event()
         self._turn_done.set()
         self._close_done = threading.Event()
         self._turn_thread_id: int | None = None
+        # Host surfaces (TUI, RPC) observe every full turn, including prompts
+        # injected by the scheduler.  Listeners are copied under the session
+        # lock and invoked outside it; a start listener may enrich request
+        # metadata with stream/live-message callbacks before the runner starts.
+        self._turn_listeners: list[Any] = []
 
     @classmethod
     def create(
@@ -174,6 +183,8 @@ class Session:
         """
         self._ensure_open()
         with self._lock:
+            if self._prompt_ingress_stopped:
+                raise SessionClosedError("full-prompt ingress is stopped")
             kernel = self._kernel or getattr(self._ext, "kernel", None)
             if kernel is None:
                 raise SessionError(
@@ -216,6 +227,8 @@ class Session:
         """
         with self._lock:
             self._ensure_open()
+            if self._prompt_ingress_stopped:
+                raise SessionClosedError("full-prompt ingress is stopped")
             queued = self.enqueue_prompt(
                 text,
                 prompt_id=prompt_id,
@@ -269,19 +282,21 @@ class Session:
         reason: str = "new_session",
     ) -> str:
         """Hermes /new — rotate session id; memory providers rebind async."""
-        self._ensure_open()
-        if self._phase is SessionPhase.TURN_RUNNING:
-            raise SessionBusyError("cannot rotate session during a turn")
-        kernel = self._kernel or getattr(self._ext, "kernel", None)
-        if kernel is None or not hasattr(kernel, "new_session"):
-            raise SessionError("new_session requires RuntimeKernel")
-        new_id = kernel.new_session(
-            title=title, clear_live=clear_live, reason=reason
-        )
-        # Keep Session handle id in sync with kernel
-        self._id = SessionId(new_id)
-        self._config.session_id = new_id
-        return new_id
+        with self._lock:
+            self._ensure_open()
+            if self._phase is SessionPhase.TURN_RUNNING:
+                raise SessionBusyError("cannot rotate session during a turn")
+            kernel = self._kernel or getattr(self._ext, "kernel", None)
+            if kernel is None or not hasattr(kernel, "new_session"):
+                raise SessionError("new_session requires RuntimeKernel")
+            new_id = kernel.new_session(
+                title=title, clear_live=clear_live, reason=reason
+            )
+            # Keep Session handle id in sync with kernel while the same lock
+            # still excludes handle_prompt from reserving a turn.
+            self._id = SessionId(new_id)
+            self._config.session_id = new_id
+            return new_id
 
     def rewind_context(self, *, as_reference: bool = True) -> dict:
         """Restore last context checkpoint into the live transcript window.
@@ -289,9 +304,14 @@ class Session:
         Context-pillar thicken API. Call between prompts when fold lost detail.
         Notifies Hermes providers with rewound=True (same session_id).
         """
-        self._ensure_open()
-        if self._phase is SessionPhase.TURN_RUNNING:
-            raise SessionBusyError("cannot rewind during a turn")
+        with self._lock:
+            self._ensure_open()
+            if self._phase is SessionPhase.TURN_RUNNING:
+                raise SessionBusyError("cannot rewind during a turn")
+            return self._rewind_context_locked(as_reference=as_reference)
+
+    def _rewind_context_locked(self, *, as_reference: bool) -> dict:
+        """Rewind implementation; caller holds ``self._lock``."""
         runner = self._ext.turn_runner
         # Prefer runner method; fall back to context handle + live_messages
         rew = getattr(runner, "rewind_context", None)
@@ -308,7 +328,10 @@ class Session:
                     runner._session_id = str(self._id)  # type: ignore[attr-defined]
                 except Exception:  # noqa: BLE001
                     pass
-            return rew(as_reference=as_reference)
+            result = rew(as_reference=as_reference)
+            if isinstance(result, dict) and result.get("ok"):
+                self._persist_live_snapshot()
+            return result
         compactor = self._ext.context
         live = getattr(runner, "live_messages", None)
         rew2 = getattr(compactor, "rewind_from_checkpoint", None)
@@ -326,8 +349,22 @@ class Session:
             if mm is None and k is not None:
                 mm = getattr(k, "memory_manager", None)
             on_transcript_rewound(mm, session_id=str(self._id))
+            self._persist_live_snapshot()
             return {"ok": True, "checkpoint": str(path), "messages_after": len(new)}
         return {"ok": False, "reason": "rewind unavailable"}
+
+    def _persist_live_snapshot(self) -> None:
+        """Persist the canonical live window after an out-of-turn mutation."""
+        kernel = self._kernel or getattr(self._ext, "kernel", None)
+        store = getattr(kernel, "session_store", None) if kernel is not None else None
+        runner = self._ext.turn_runner
+        live = getattr(runner, "live_messages", None)
+        save = getattr(store, "save_context_snapshot", None)
+        if callable(save) and isinstance(live, list):
+            try:
+                save(str(self._id), live)
+            except Exception:  # noqa: BLE001
+                logger.warning("rewound context snapshot save failed", exc_info=True)
 
     @property
     def turn_count(self) -> int:
@@ -356,6 +393,34 @@ class Session:
     def bind_turn_runner(self, runner: TurnRunner) -> None:
         self.bind_extensions(self._ext.with_turn_runner(runner))
 
+    def add_turn_listener(self, listener: Any) -> None:
+        """Observe ``start``/``end`` for all full turns in this Session."""
+        if not callable(listener):
+            raise TypeError("turn listener must be callable")
+        with self._lock:
+            if listener not in self._turn_listeners:
+                self._turn_listeners.append(listener)
+
+    def remove_turn_listener(self, listener: Any) -> None:
+        with self._lock:
+            self._turn_listeners = [
+                item for item in self._turn_listeners if item != listener
+            ]
+
+    def _notify_turn_listeners(
+        self,
+        event: str,
+        request: TurnRequest,
+        result: TurnResult | None,
+    ) -> None:
+        with self._lock:
+            listeners = list(self._turn_listeners)
+        for listener in listeners:
+            try:
+                listener(event, request, result)
+            except Exception:  # host observability must never break execution
+                logger.exception("session turn listener failed event=%s", event)
+
     def handle_prompt(
         self,
         text: str,
@@ -377,6 +442,8 @@ class Session:
         """
         with self._lock:
             self._ensure_open()
+            if self._prompt_ingress_stopped:
+                raise SessionClosedError("prompt ingress is stopped")
             if self._phase is SessionPhase.TURN_RUNNING:
                 # Grok: mid-turn → interjection only (drained before next sample).
                 # Do NOT also push PromptQueue (would double-run after turn).
@@ -411,6 +478,10 @@ class Session:
     def _begin_turn_locked(self) -> None:
         """Reserve the single turn slot while ``self._lock`` is held."""
         self._cancel_requested = False
+        # Per-request token identity matters: an abandoned transport owner may
+        # outlive this turn.  Never clear/reuse its Event (ABA); the next turn
+        # receives a fresh token while the old worker permanently sees set().
+        self._cancel_event = threading.Event()
         self._phase = SessionPhase.TURN_RUNNING
         self._turn_thread_id = threading.get_ident()
         self._turn_done.clear()
@@ -425,9 +496,12 @@ class Session:
             prompt_id,
         )
 
+        result: TurnResult | None = None
+        self._notify_turn_listeners("start", request, None)
         try:
             if self._cancel_requested:
-                return TurnResult(status=TurnStatus.CANCELLED)
+                result = TurnResult(status=TurnStatus.CANCELLED)
+                return result
 
             runner = self._ext.turn_runner or StubTurnRunner()
             result = runner.run(request, session=self)
@@ -438,8 +512,10 @@ class Session:
             logger.exception("session.turn.error id=%s", self._id)
             with self._lock:
                 self._turn_count += 1
-            return TurnResult(status=TurnStatus.ERROR, error=str(e))
+            result = TurnResult(status=TurnStatus.ERROR, error=str(e))
+            return result
         finally:
+            self._notify_turn_listeners("end", request, result)
             with self._lock:
                 closing = self._closing
                 if not closing and not self._closed:
@@ -452,11 +528,14 @@ class Session:
                 self._turn_count,
             )
             if closing:
-                # Handles close() called by the turn thread itself.  A concurrent
-                # closer may race here; _finalize_close elects one owner.
-                self._finalize_close()
+                # Final teardown has one daemon owner.  The turn thread must
+                # not inherit a blocking Graph/MCP/memory close operation.
+                self._start_close_finalizer()
             elif not self._prompt_drain_active:
-                self._drain_prompt_queue()
+                with self._lock:
+                    drain_allowed = not self._prompt_ingress_stopped
+                if drain_allowed:
+                    self._drain_prompt_queue()
 
     def _push_prompt_queue(
         self,
@@ -492,6 +571,7 @@ class Session:
             if (
                 self._closed
                 or self._closing
+                or self._prompt_ingress_stopped
                 or self._phase is not SessionPhase.IDLE
                 or self._prompt_drain_active
             ):
@@ -504,6 +584,7 @@ class Session:
                     if (
                         self._closed
                         or self._closing
+                        or self._prompt_ingress_stopped
                         or self._phase is not SessionPhase.IDLE
                     ):
                         return
@@ -540,31 +621,65 @@ class Session:
         """Request cancellation of the active turn."""
         with self._lock:
             self._cancel_requested = True
+            self._cancel_event.set()
         logger.info("session.cancel_requested id=%s", self._id)
 
-    def is_cancel_requested(self) -> bool:
-        return self._cancel_requested
+    def stop_prompt_ingress(self, *, clear_queue: bool = True) -> int:
+        """Freeze host/full-prompt ingress and optionally discard queued work.
 
-    def close(self) -> None:
+        This is a host-lifecycle barrier, not a normal user cancellation.  It
+        prevents a finishing turn from starting scheduler work after its TUI or
+        RPC owner has already shut down.
+        """
+        cleared = 0
+        with self._lock:
+            self._prompt_ingress_stopped = True
+            kernel = self._kernel or getattr(self._ext, "kernel", None)
+            queue = getattr(kernel, "prompt_queue", None) if kernel is not None else None
+            if clear_queue and queue is not None:
+                try:
+                    cleared = len(queue)
+                except Exception:  # noqa: BLE001
+                    cleared = 0
+                clear = getattr(queue, "clear", None)
+                if callable(clear):
+                    clear()
+        return int(cleared)
+
+    def wait_for_turn(self, timeout_s: float | None = None) -> bool:
+        """Wait for the active full-turn barrier without exposing internals."""
+        timeout = None if timeout_s is None else max(0.0, float(timeout_s))
+        return bool(self._turn_done.wait(timeout=timeout))
+
+    def is_cancel_requested(self) -> bool:
+        return self._cancel_event.is_set()
+
+    @property
+    def cancel_event(self) -> threading.Event:
+        """Per-turn cancellation token passed through the model transport."""
+        return self._cancel_event
+
+    def close(self, *, timeout_s: float | None = None) -> None:
         """Close the session and refuse further prompts.
 
         Prefers :meth:`RuntimeKernel.close` (memory shutdown, subagent pool,
         session store, context end hooks). Falls back to extension handles
         when no kernel is bound.
         """
+        timeout = None if timeout_s is None else max(0.0, float(timeout_s))
+        deadline = None if timeout is None else time.monotonic() + timeout
         caller = threading.get_ident()
         with self._lock:
             if self._closed:
                 return
             if self._closing:
                 same_turn = self._turn_thread_id == caller
-                wait_existing = not same_turn
                 stop_ingress = False
             else:
                 self._closing = True
                 self._cancel_requested = True
+                self._cancel_event.set()
                 same_turn = self._turn_thread_id == caller
-                wait_existing = False
                 stop_ingress = True
             turn_running = self._phase is SessionPhase.TURN_RUNNING
 
@@ -575,38 +690,56 @@ class Session:
             kernel = self._kernel or getattr(self._ext, "kernel", None)
             extra = getattr(kernel, "tool_extra", None) if kernel is not None else None
             handle = (extra or {}).get("scheduler_runtime")
-            stop = getattr(handle, "stop", None)
-            if callable(stop):
+            # Signal immediately without joining here.  The single close owner
+            # performs the potentially blocking join inside kernel.close().
+            stop_event = getattr(handle, "stop_event", None)
+            set_stop = getattr(stop_event, "set", None)
+            if callable(set_stop):
                 try:
-                    stop()
+                    set_stop()
                 except Exception:  # noqa: BLE001
-                    logger.debug("scheduler ingress stop failed", exc_info=True)
+                    logger.debug("scheduler ingress signal failed", exc_info=True)
 
-        if wait_existing:
-            self._close_done.wait()
-            return
         if turn_running:
             if same_turn:
                 # The active turn's finally block owns final teardown.
                 return
-            self._turn_done.wait()
-        self._finalize_close()
+            remaining = _remaining_timeout(deadline)
+            if not self._turn_done.wait(timeout=remaining):
+                logger.warning(
+                    "session close deferred: active turn did not stop within %.1fs id=%s",
+                    float(timeout or 0.0),
+                    self._id,
+                )
+                return
+        self._start_close_finalizer()
+        remaining = _remaining_timeout(deadline)
+        if not self._close_done.wait(timeout=remaining):
+            logger.warning(
+                "session close deferred: teardown continues after %.1fs id=%s",
+                float(timeout or 0.0),
+                self._id,
+            )
 
-    def _finalize_close(self) -> None:
-        """Elect one teardown owner after no foreground turn is executing."""
+    def _start_close_finalizer(self) -> None:
+        """Elect and start the one teardown owner without blocking its caller."""
         with self._lock:
             if self._closed:
                 return
             if self._close_finalizing:
-                wait_existing = True
-            else:
-                self._close_finalizing = True
-                self._phase = SessionPhase.CLOSED
-                wait_existing = False
-        if wait_existing:
-            self._close_done.wait()
-            return
+                return
+            self._close_finalizing = True
+            self._phase = SessionPhase.CLOSED
+            owner = threading.Thread(
+                target=self._run_close_finalizer,
+                name=f"codedoggy-close-{self._id}",
+                daemon=True,
+            )
+            self._close_finalizer_thread = owner
+        owner.start()
 
+    def _run_close_finalizer(self) -> None:
+        """Close owned resources; always runs on the elected daemon owner."""
         kernel = self._kernel or getattr(self._ext, "kernel", None)
         try:
             if kernel is not None and callable(getattr(kernel, "close", None)):
@@ -657,6 +790,7 @@ class Session:
                 self._closed = True
                 self._closing = True
                 self._close_finalizing = False
+                self._close_finalizer_thread = None
                 self._phase = SessionPhase.CLOSED
                 self._close_done.set()
         logger.info("session.closed id=%s turns=%s", self._id, self._turn_count)
@@ -676,3 +810,9 @@ class Session:
 
     def __exit__(self, *args: object) -> None:
         self.close()
+
+
+def _remaining_timeout(deadline: float | None) -> float | None:
+    if deadline is None:
+        return None
+    return max(0.0, deadline - time.monotonic())

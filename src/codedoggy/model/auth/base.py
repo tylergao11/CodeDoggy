@@ -25,6 +25,10 @@ class AuthCredential:
     source: str = ""
     # Extra headers the transport should merge (e.g. anthropic-version)
     headers: dict[str, str] = field(default_factory=dict)
+    # Credential-specific inference endpoint.  Subscription/OAuth tokens are
+    # not interchangeable with public API keys even when the provider name is
+    # the same (Grok proxy, ChatGPT Codex backend).
+    base_url: str | None = None
     # Opaque metadata (email, expires_at, …) — no secrets beyond token fields
     meta: dict[str, Any] = field(default_factory=dict)
 
@@ -35,6 +39,7 @@ class AuthCredential:
             "provider": self.provider,
             "kind": self.kind,
             "source": self.source,
+            "base_url": self.base_url,
             "token": tip,
             "has_refresh": bool(self.refresh_token),
             "meta": {k: v for k, v in self.meta.items() if k not in {"token", "key"}},
@@ -81,7 +86,7 @@ class AuthProvider(Protocol):
         """Return a usable credential or None if login/key missing."""
         ...
 
-    def begin_login(self) -> AuthStatus:
+    def begin_login(self, *, cancel_event: Any | None = None) -> AuthStatus:
         """Start interactive login (open browser / print device code).
 
         Phase-1 implementations may only document the official CLI to run

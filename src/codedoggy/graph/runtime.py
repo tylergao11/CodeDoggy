@@ -71,14 +71,92 @@ class WorkspaceGraphRuntime:
         self._watch_lock = threading.RLock()
         self._watcher: WorkspaceWatcher | None = None
         self._watch_leases: set[object] = set()
+        self._handle_lock = threading.RLock()
+        self._handle_leases: set[object] = set()
+        self._lifecycle_lock = threading.RLock()
+        self._closing = False
+        self._closed = False
 
     # ----- actor command submission -----
 
     def _submit(self, fn, /, *args):  # noqa: ANN001, ANN202
         # A submission mutex gives commands from competing session threads one
         # definite queue order, matching a multi-producer actor channel.
-        with self._submit_lock:
-            return self._executor.submit(fn, *args)
+        with self._lifecycle_lock:
+            if self._closing or self._closed:
+                raise RuntimeError("workspace graph runtime is closed")
+            # Keep the lifecycle admission gate through enqueue.  Otherwise a
+            # shutdown can mark/terminate the executor between the check and
+            # submit, rejecting a command that was already admitted.
+            with self._submit_lock:
+                return self._executor.submit(fn, *args)
+
+    @property
+    def closed(self) -> bool:
+        with self._lifecycle_lock:
+            return self._closing or self._closed
+
+    def acquire_handle(self, lease: object) -> None:
+        with self._lifecycle_lock:
+            if self._closing or self._closed:
+                raise RuntimeError("workspace graph runtime is closed")
+            with self._handle_lock:
+                self._handle_leases.add(lease)
+
+    def release_handle(self, lease: object) -> bool:
+        """Release one Session handle; final release shuts the actor down."""
+        start_shutdown = False
+        with self._lifecycle_lock:
+            with self._handle_lock:
+                self._handle_leases.discard(lease)
+                final = not self._handle_leases
+            # Last-lease removal and lifecycle closure are one atomic gate.
+            # A concurrent acquire now either joins before ``final`` is seen or
+            # observes ``_closing`` and resolves a fresh registry generation.
+            if final and not self._closing and not self._closed:
+                self._closing = True
+                start_shutdown = True
+        if start_shutdown:
+            self._finish_shutdown()
+        return final
+
+    def shutdown(self) -> None:
+        """Fence queued events and terminate the single-owner executor."""
+        with self._lifecycle_lock:
+            if self._closed or self._closing:
+                return
+            self._closing = True
+
+        self._finish_shutdown()
+
+    def _finish_shutdown(self) -> None:
+        """Complete shutdown after the lifecycle admission gate is closed."""
+
+        # No handle remains, so no watcher lease should remain either.  Stop a
+        # leaked watcher defensively before fencing its final event batch.
+        with self._watch_lock:
+            watcher = self._watcher
+            self._watcher = None
+            self._watch_leases.clear()
+            if watcher is not None:
+                try:
+                    watcher.stop()
+                except Exception:  # noqa: BLE001
+                    logger.debug("graph watcher shutdown failed", exc_info=True)
+
+        try:
+            with self._submit_lock:
+                fence = self._executor.submit(lambda: None)
+            fence.result()
+        finally:
+            self._executor.shutdown(wait=True, cancel_futures=True)
+            with self._state_lock:
+                self._manager = None
+                self._pending_events = []
+                self._rebuild_future = None
+            with self._lifecycle_lock:
+                self._closed = True
+                self._closing = False
 
     @staticmethod
     def _log_background_failure(future: Future[Any]) -> None:
@@ -220,11 +298,14 @@ class WorkspaceGraphRuntime:
         allow_cache_write: bool = True,
     ) -> dict[str, Any]:
         """Run one explicit rebuild; concurrent callers share the in-flight work."""
-        with self._submit_lock:
-            future = self._rebuild_future
-            if future is None or future.done():
-                future = self._executor.submit(self._rebuild_worker)
-                self._rebuild_future = future
+        with self._lifecycle_lock:
+            if self._closing or self._closed:
+                raise RuntimeError("workspace graph runtime is closed")
+            with self._submit_lock:
+                future = self._rebuild_future
+                if future is None or future.done():
+                    future = self._executor.submit(self._rebuild_worker)
+                    self._rebuild_future = future
         result = future.result()
         # Cache policy belongs to each Session lease, not to whichever caller
         # happened to win the shared rebuild submission race.
@@ -409,7 +490,7 @@ class CodebaseIndexManager:
         canonical = Path(root).expanduser().resolve()
         with self._lock:
             runtime = self._runtimes.get(canonical)
-            if runtime is not None:
+            if runtime is not None and not runtime.closed:
                 return runtime, False
             runtime = WorkspaceGraphRuntime(canonical)
             self._runtimes[canonical] = runtime

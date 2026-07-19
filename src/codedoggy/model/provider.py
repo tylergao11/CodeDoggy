@@ -22,5 +22,6 @@ class ChatClient(Protocol):
         temperature: float | None = None,
         max_tokens: int | None = None,
         tools: list[dict[str, Any]] | None = None,
+        cancel_event: Any | None = None,
     ) -> CompletionResult:
         ...

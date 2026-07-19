@@ -10,6 +10,8 @@ via SessionStore incremental append at message-create time.
 
 from __future__ import annotations
 
+from copy import deepcopy
+
 from codedoggy.turn.types import Message, Role
 
 
@@ -100,7 +102,9 @@ def copy_message(m: Message) -> Message:
     return Message(
         role=m.role,
         content=m.content,
-        tool_calls=list(m.tool_calls) if m.tool_calls else None,
+        tool_calls=deepcopy(m.tool_calls) if m.tool_calls else None,
         tool_call_id=m.tool_call_id,
         name=m.name,
+        reasoning_content=m.reasoning_content,
+        provider_data=deepcopy(m.provider_data) if m.provider_data else None,
     )

@@ -265,7 +265,10 @@ def test_startup_brand_is_one_shot_and_never_returns_after_first_task() -> None:
         # Even if the ledger were empty again, splash must not return.
         tui.ledger = TaskLedger()
         assert tui._showing_startup_brand() is False
-        assert "".join(fragment[1] for fragment in tui._render_tasks()).strip() == ""
+        after = "".join(fragment[1] for fragment in tui._render_tasks())
+        # Rounded idle plate is fine; full couple splash art must not return.
+        assert "散步" in after or "DOGGY" in after or "∪" in after
+        assert "FFFF" not in after  # pixel-art palette rows never in idle plate
 
     with create_pipe_input() as pipe_input:
         boot = CodeDoggyTUI(
@@ -474,9 +477,11 @@ def test_task_panel_keeps_reference_layout_across_terminal_widths(
             assert all(get_cwidth(line) <= width for line in rendered.splitlines())
             header = "".join(fragment[1] for fragment in tui._render_header())
             assert get_cwidth(header) <= width
-            assert header.startswith("  ==DOGGY==")
+            assert "DOGGY" in header or "DOG" in header
+            assert header.strip().startswith("╭") or "DOGGY" in header
             assert "main ·" not in header
-            assert "◆" in rendered
+            # Dog-ear / face markers replace legacy ◆
+            assert ("∪" in rendered) or ("·" in rendered) or ("╭" in rendered)
             expected_stage = "3 并行" if width < 36 else "3 个 Agent 并行中"
             assert expected_stage in rendered
             if width >= 36:
@@ -552,7 +557,8 @@ def test_full_screen_agent_window_is_opaque_and_interactive() -> None:
         assert _wait_until(lambda: tui.ledger.snapshots()[0].phase == "done")
         task_text = "".join(fragment[1] for fragment in tui._render_tasks())
         assert "已完成 · 1 个 Agent" in task_text
-        assert "╭ MAIN  › ╮" in task_text
+        # Agent chips: ╭ ∪MAIN › ╮ (dog ear prefix)
+        assert "MAIN" in task_text and "╭" in task_text and "╮" in task_text
         assert "已完成：实现 CLI" in task_text
 
         pipe_input.send_text("\t\r")

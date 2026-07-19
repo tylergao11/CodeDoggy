@@ -138,11 +138,15 @@ class ConnectionService:
         *,
         client: Any | None = None,
         runner: Any | None = None,
+        kernel: Any | None = None,
+        context: Any | None = None,
     ) -> None:
         self._lock = RLock()
         self._state = state
         self._client = client
         self._runner = runner
+        self._kernel = kernel
+        self._context = context
 
     @classmethod
     def bootstrap(
@@ -160,6 +164,27 @@ class ConnectionService:
         with self._lock:
             self._runner = runner
 
+    def bind_runtime(
+        self,
+        *,
+        runner: Any | None = None,
+        kernel: Any | None = None,
+        context: Any | None = None,
+    ) -> None:
+        """Bind every runtime consumer updated by a connection switch.
+
+        MAIN, context budget, and child-agent sampler creation must observe one
+        generation.  Keeping this binding here prevents the TUI from reaching
+        into each subsystem independently.
+        """
+        with self._lock:
+            if runner is not None:
+                self._runner = runner
+            if kernel is not None:
+                self._kernel = kernel
+            if context is not None:
+                self._context = context
+
     def bind_client(self, client: Any) -> None:
         with self._lock:
             self._client = client
@@ -171,6 +196,18 @@ class ConnectionService:
     def client(self) -> Any | None:
         with self._lock:
             return self._client
+
+    def new_sampler(self) -> ChatSampler:
+        """Return an isolated sampler over the current client generation.
+
+        Parallel child agents must not share ChatSampler's mutable tool-call id
+        sequence or retain the bootstrap client after a TUI provider switch.
+        """
+        with self._lock:
+            client = self._client
+        if client is None:
+            raise RuntimeError("active connection has no model client")
+        return ChatSampler(client)
 
     def refresh_auth(self) -> ActiveConnection:
         """Re-probe auth for the current provider; does not rebuild the client."""
@@ -221,6 +258,8 @@ class ConnectionService:
                 mod = cur.model
 
             cfg = model_config_from_env(provider=prov, model=mod)
+            if prov != cur.provider:
+                cfg = _clean_cross_provider_config(cfg, provider=prov)
             # Preserve session sampling knobs when env does not override.
             if cfg.temperature is None:
                 cfg = replace_config(cfg, temperature=cur.temperature)
@@ -230,7 +269,12 @@ class ConnectionService:
                 cfg = replace_config(cfg, context_window=cur.context_window)
 
             try:
-                client = create_client(cfg, require_auth=require_auth)
+                # Ollama is deliberately credential-free.  The TUI hard auth
+                # gate must not turn a local model change into "API key needed".
+                client = create_client(
+                    cfg,
+                    require_auth=bool(require_auth and prov != "ollama"),
+                )
             except Exception as exc:
                 self._state = replace(
                     cur,
@@ -243,11 +287,12 @@ class ConnectionService:
             st = auth_status(prov)
             profile = get_profile(prov)
             api_mode = str(getattr(profile, "api_mode", "") or cur.api_mode or "chat_completions")
-            aux_provider = cur.aux_provider if prov == cur.provider else prov
+            # AUX is independently configured and the compactor keeps that
+            # client.  Changing these labels without rebuilding AUX made the
+            # connection snapshot claim a runtime that did not exist.
+            aux_provider = cur.aux_provider
             aux_model = cur.aux_model
-            if prov != cur.provider and profile is not None:
-                aux_model = profile.default_aux_model or profile.default_model or mod
-            aux_base = cfg.base_url if prov != cur.provider else cur.aux_base_url
+            aux_base = cur.aux_base_url
 
             self._client = client
             self._state = ActiveConnection(
@@ -275,17 +320,49 @@ class ConnectionService:
 
     def _push_runtime(self, client: Any, cfg: ModelConfig) -> None:
         runner = self._runner
-        if runner is None:
-            return
-        old = getattr(runner, "sampler", None)
-        stream = bool(getattr(old, "stream", False))
-        on_delta = getattr(old, "on_delta", None)
-        runner.sampler = ChatSampler(client, stream=stream, on_delta=on_delta)
-        sp = getattr(runner, "system_prompt", None)
-        if isinstance(sp, str) and sp:
-            runner.system_prompt = rewrite_system_model_identity(
-                sp, model=cfg.model, provider=cfg.provider
+        if runner is not None:
+            old = getattr(runner, "sampler", None)
+            stream = bool(getattr(old, "stream", False))
+            on_delta = getattr(old, "on_delta", None)
+            runner.sampler = ChatSampler(client, stream=stream, on_delta=on_delta)
+            sp = getattr(runner, "system_prompt", None)
+            if isinstance(sp, str) and sp:
+                runner.system_prompt = rewrite_system_model_identity(
+                    sp, model=cfg.model, provider=cfg.provider
+                )
+
+        kernel = self._kernel
+        if kernel is not None:
+            sp = getattr(kernel, "base_system_prompt", None)
+            if isinstance(sp, str) and sp:
+                kernel.base_system_prompt = rewrite_system_model_identity(
+                    sp, model=cfg.model, provider=cfg.provider
+                )
+            # Keep tool_extra['connection'] current so image/video/search follow login.
+            refresh = getattr(kernel, "refresh_tool_extra", None)
+            if callable(refresh):
+                try:
+                    refresh()
+                except Exception:  # noqa: BLE001
+                    pass
+
+        context = self._context
+        if context is None and runner is not None:
+            context = getattr(runner, "context_compactor", None)
+        bind = getattr(context, "bind_model_window", None)
+        if callable(bind):
+            bind(
+                context_window=cfg.context_window,
+                max_completion_tokens=cfg.max_tokens,
             )
+        budget = getattr(context, "budget", None)
+        if budget is not None:
+            # Usage belongs to the previous provider generation.  Preserve the
+            # transcript, but show an unknown live count until the new model's
+            # first response supplies real usage.
+            budget.last_prompt_tokens = None
+            budget.last_completion_tokens = None
+            budget.awaiting_usage_ensures = 0
 
 
 def replace_config(cfg: ModelConfig, **kwargs: Any) -> ModelConfig:
@@ -304,6 +381,31 @@ def replace_config(cfg: ModelConfig, **kwargs: Any) -> ModelConfig:
     }
     data.update(kwargs)
     return ModelConfig(**data)
+
+
+def _clean_cross_provider_config(cfg: ModelConfig, *, provider: str) -> ModelConfig:
+    """Drop credentials/endpoints imported from the previous ecosystem.
+
+    ``CODEDOGGY_BASE_URL`` and ``CODEDOGGY_API_KEY`` describe the bootstrap
+    connection.  A runtime panel switch must resolve the target profile's own
+    endpoint and auth source instead of sending an Anthropic request to xAI (or
+    reusing an OpenAI key as a Claude token).
+    """
+    profile = get_profile(provider)
+    canonical = str(getattr(profile, "name", None) or provider).strip().lower()
+    if canonical in {"custom", "openai_compat"}:
+        return cfg
+    base_url = profile.resolve_base_url(None) if profile is not None else cfg.base_url
+    extra = dict(cfg.extra)
+    extra.pop("auth_kind", None)
+    extra.pop("auth_source", None)
+    return replace_config(
+        cfg,
+        base_url=str(base_url or "").strip(),
+        api_key=None,
+        extra_headers={},
+        extra=extra,
+    )
 
 
 def connection_of(session: Any) -> ConnectionService | None:

@@ -227,12 +227,18 @@ def test_config_default_disabled_without_key(monkeypatch: pytest.MonkeyPatch) ->
         "CODEDOGGY_API_KEY",
         "OPENAI_API_KEY",
         "CODEDOGGY_WEB_SEARCH_URL",
+        "CODEDOGGY_PROVIDER",
+        "CODEDOGGY_MODEL_PROVIDER",
     ):
         monkeypatch.delenv(k, raising=False)
     monkeypatch.setenv("CODEDOGGY_WEB_SEARCH_ENABLED", "1")
+    monkeypatch.setattr(
+        "codedoggy.tools.util.web_search_api.resolve_provider_token",
+        lambda *_a, **_k: (None, ""),
+    )
     cfg = WebSearchConfig.from_env()
     assert not cfg.is_enabled()
-    assert "API key" in cfg.reason_disabled
+    assert "API key" in cfg.reason_disabled or "login" in cfg.reason_disabled.lower()
 
 
 def test_config_enabled_with_key(monkeypatch: pytest.MonkeyPatch) -> None:

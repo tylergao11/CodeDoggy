@@ -15,19 +15,29 @@ import hashlib
 import json
 import logging
 import re
+import threading
 import urllib.error
 import urllib.request
 from typing import Any
 from urllib.parse import urlparse
 
+from codedoggy.model.errors import ModelStreamCancelled
 from codedoggy.model.openai_compat import ModelError, normalize_openai_usage, scrub_model_content
 from codedoggy.model.profile import ProviderProfile
 from codedoggy.model.profile_registry import get_profile
+from codedoggy.model.stream_cancel import (
+    HTTPErrorSnapshot,
+    cancellable_read,
+    cancellable_readline,
+    run_cancellable_request,
+    snapshot_http_error,
+)
 from codedoggy.model.types import ChatMessage, CompletionResult, ModelConfig
 
 logger = logging.getLogger(__name__)
 
 _MAX_ITEM_ID_LEN = 64
+_RESPONSE_MESSAGE_STATUSES = frozenset({"completed", "incomplete", "in_progress"})
 _TOOL_CALL_LEAK = re.compile(
     r"(?:^|[\s>|])to=functions\.[A-Za-z_][\w.]*",
     re.IGNORECASE,
@@ -50,6 +60,8 @@ class CodexResponsesClient:
             base_url=config.base_url,
             provider=config.provider,
         )
+        self._replay_lock = threading.Lock()
+        self._reasoning_replay_enabled = True
 
     @property
     def config(self) -> ModelConfig:
@@ -66,6 +78,7 @@ class CodexResponsesClient:
         temperature: float | None = None,
         max_tokens: int | None = None,
         tools: list[dict[str, Any]] | None = None,
+        cancel_event: Any | None = None,
     ) -> CompletionResult:
         cfg = self._config
         url = responses_url(cfg.normalized_base_url())
@@ -78,14 +91,31 @@ class CodexResponsesClient:
         headers = self._headers()
         data = json.dumps(body).encode("utf-8")
         req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+        def _request() -> bytes:
+            try:
+                with urllib.request.urlopen(req, timeout=cfg.timeout_s) as resp:
+                    return cancellable_read(resp, cancel_event)
+            except urllib.error.HTTPError as exc:
+                raise snapshot_http_error(exc, cancel_event, max_body_bytes=600) from None
+
         try:
-            with urllib.request.urlopen(req, timeout=cfg.timeout_s) as resp:
-                raw_bytes = resp.read()
-        except urllib.error.HTTPError as e:
-            err_body = e.read().decode("utf-8", errors="replace") if e.fp else ""
+            raw_bytes = run_cancellable_request(_request, cancel_event)
+        except HTTPErrorSnapshot as e:
+            if self._disable_rejected_reasoning_replay(messages, e):
+                logger.warning(
+                    "Responses endpoint rejected encrypted reasoning; "
+                    "disabled replay for this connection and retrying once"
+                )
+                return self.complete(
+                    messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    tools=tools,
+                    cancel_event=cancel_event,
+                )
             raise ModelError(
-                f"HTTP {e.code} from {url}: {err_body[:600]}",
-                status=e.code,
+                f"HTTP {e.status} from {url}: {e.body[:600]}",
+                status=e.status,
             ) from e
         except urllib.error.URLError as e:
             raise ModelError(f"Failed to reach {url}: {e.reason}") from e
@@ -109,6 +139,7 @@ class CodexResponsesClient:
         max_tokens: int | None = None,
         tools: list[dict[str, Any]] | None = None,
         on_delta: Any | None = None,
+        cancel_event: Any | None = None,
     ) -> CompletionResult:
         """Responses SSE stream; falls back to non-stream complete()."""
         cfg = self._config
@@ -123,31 +154,74 @@ class CodexResponsesClient:
         headers = self._headers(accept="text/event-stream")
         data = json.dumps(body).encode("utf-8")
         req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+        def _request() -> CompletionResult:
+            try:
+                with urllib.request.urlopen(req, timeout=cfg.timeout_s) as resp:
+                    return _consume_responses_sse(
+                        resp,
+                        model=cfg.model,
+                        issuer_kind=self._issuer_kind,
+                        on_delta=on_delta,
+                        cancel_event=cancel_event,
+                    )
+            except urllib.error.HTTPError as exc:
+                raise snapshot_http_error(
+                    exc,
+                    cancel_event,
+                    # A 400 body may classify invalid_encrypted_content and
+                    # enable Hermes' one-shot replay recovery.
+                    read_body=exc.code not in {404, 422},
+                    max_body_bytes=600,
+                ) from None
+
         try:
-            with urllib.request.urlopen(req, timeout=cfg.timeout_s) as resp:
-                return _consume_responses_sse(
-                    resp,
-                    model=cfg.model,
-                    issuer_kind=self._issuer_kind,
-                    on_delta=on_delta,
+            return run_cancellable_request(_request, cancel_event)
+        except HTTPErrorSnapshot as e:
+            if self._disable_rejected_reasoning_replay(messages, e):
+                logger.warning(
+                    "Responses stream rejected encrypted reasoning; "
+                    "disabled replay for this connection and retrying once"
                 )
-        except urllib.error.HTTPError as e:
-            if e.code in {400, 404, 422}:
-                logger.debug("responses stream rejected (%s); complete()", e.code)
+                return self.complete_stream(
+                    messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    tools=tools,
+                    on_delta=on_delta,
+                    cancel_event=cancel_event,
+                )
+            if e.status in {400, 404, 422}:
+                logger.debug("responses stream rejected (%s); complete()", e.status)
                 body.pop("stream", None)
                 return self.complete(
                     messages,
                     temperature=temperature,
                     max_tokens=max_tokens,
                     tools=tools,
+                    cancel_event=cancel_event,
                 )
-            err_body = e.read().decode("utf-8", errors="replace") if e.fp else ""
             raise ModelError(
-                f"HTTP {e.code} from {url}: {err_body[:600]}",
-                status=e.code,
+                f"HTTP {e.status} from {url}: {e.body[:600]}",
+                status=e.status,
             ) from e
         except urllib.error.URLError as e:
             raise ModelError(f"Failed to reach {url}: {e.reason}") from e
+
+    def _disable_rejected_reasoning_replay(
+        self,
+        messages: list[ChatMessage] | list[dict[str, Any]],
+        error: HTTPErrorSnapshot,
+    ) -> bool:
+        """Apply Hermes' one-shot invalid_encrypted_content recovery."""
+        if error.status != 400 or "invalid_encrypted_content" not in error.body.lower():
+            return False
+        if not _messages_have_encrypted_reasoning(messages):
+            return False
+        with self._replay_lock:
+            if not self._reasoning_replay_enabled:
+                return False
+            self._reasoning_replay_enabled = False
+            return True
 
     def _headers(self, *, accept: str = "application/json") -> dict[str, str]:
         import os
@@ -196,6 +270,7 @@ class CodexResponsesClient:
         input_items = chat_messages_to_responses_input(
             chat_msgs,
             current_issuer_kind=self._issuer_kind,
+            replay_encrypted_reasoning=self._reasoning_replay_enabled,
         )
         body: dict[str, Any] = {
             "model": cfg.model,
@@ -203,7 +278,7 @@ class CodexResponsesClient:
             "input": input_items,
             "store": False,
         }
-        resp_tools = responses_tools(tools)
+        resp_tools = responses_tools(tools, issuer_kind=self._issuer_kind)
         if resp_tools:
             body["tools"] = resp_tools
             body["parallel_tool_calls"] = True
@@ -219,10 +294,19 @@ class CodexResponsesClient:
         if isinstance(cfg.extra, dict):
             rc = cfg.extra.get("reasoning")
             if isinstance(rc, dict) and rc.get("enabled") is not False:
-                effort = (rc.get("effort") or "medium").strip().lower()
-                if effort in {"low", "medium", "high", "xhigh", "minimal"}:
-                    body["reasoning"] = {"effort": effort if effort != "minimal" else "low"}
+                effort = (rc.get("effort") or "high").strip().lower()
+                if effort in {"low", "medium", "high", "xhigh", "max", "minimal"}:
+                    if effort in {"max", "ultra"}:
+                        effort = "xhigh"
+                    body["reasoning"] = {
+                        "effort": effort if effort != "minimal" else "low"
+                    }
                     body["include"] = ["reasoning.encrypted_content"]
+        if self._issuer_kind == "xai_responses":
+            # xAI can return encrypted reasoning even when no effort dial is
+            # legal for the selected Grok model.  Request replay material
+            # without forcing an unsupported reasoning.effort parameter.
+            body.setdefault("include", ["reasoning.encrypted_content"])
 
         # Stable prompt_cache_key from instructions + tools (Hermes)
         pck = content_cache_key(body["instructions"], body.get("tools"))
@@ -240,6 +324,8 @@ def responses_url(base: str) -> str:
     if b.endswith("/responses"):
         return b
     if b.endswith("/v1"):
+        return f"{b}/responses"
+    if "/backend-api/codex" in b:
         return f"{b}/responses"
     return f"{b}/v1/responses"
 
@@ -279,6 +365,65 @@ def content_cache_key(instructions: str, tools: list[dict[str, Any]] | None) -> 
     return f"pck_{digest}"
 
 
+def _normalize_responses_message_status(
+    value: Any,
+    *,
+    default: str = "completed",
+) -> str:
+    if isinstance(value, str):
+        status = value.strip().lower().replace("-", "_").replace(" ", "_")
+        if status in _RESPONSE_MESSAGE_STATUSES:
+            return status
+    return default
+
+
+def _deterministic_call_id(name: str, arguments: str, index: int = 0) -> str:
+    seed = f"{name}:{arguments}:{index}"
+    digest = hashlib.sha256(seed.encode("utf-8", errors="replace")).hexdigest()[:12]
+    return f"call_{digest}"
+
+
+def _split_responses_tool_id(raw_id: Any) -> tuple[str | None, str | None]:
+    if not isinstance(raw_id, str) or not raw_id.strip():
+        return None, None
+    value = raw_id.strip()
+    if "|" in value:
+        call_id, item_id = value.split("|", 1)
+        return call_id.strip() or None, item_id.strip() or None
+    if value.startswith("fc_"):
+        return None, value
+    return value, None
+
+
+def _messages_have_encrypted_reasoning(
+    messages: list[ChatMessage] | list[dict[str, Any]],
+) -> bool:
+    for message in messages:
+        if isinstance(message, ChatMessage):
+            provider_data = message.provider_data or {}
+        elif isinstance(message, dict):
+            provider_data = (
+                message.get("provider_data")
+                if isinstance(message.get("provider_data"), dict)
+                else {}
+            )
+            direct = message.get("codex_reasoning_items")
+            if isinstance(direct, list) and any(
+                isinstance(item, dict) and item.get("encrypted_content")
+                for item in direct
+            ):
+                return True
+        else:
+            continue
+        items = provider_data.get("codex_reasoning_items")
+        if isinstance(items, list) and any(
+            isinstance(item, dict) and item.get("encrypted_content")
+            for item in items
+        ):
+            return True
+    return False
+
+
 # ── conversion ───────────────────────────────────────────────────────
 
 
@@ -303,7 +448,11 @@ def split_system_instructions(
     return "\n\n".join(parts), rest
 
 
-def responses_tools(tools: list[dict[str, Any]] | None) -> list[dict[str, Any]] | None:
+def responses_tools(
+    tools: list[dict[str, Any]] | None,
+    *,
+    issuer_kind: str | None = None,
+) -> list[dict[str, Any]] | None:
     if not tools:
         return None
     converted: list[dict[str, Any]] = []
@@ -329,6 +478,14 @@ def responses_tools(tools: list[dict[str, Any]] | None) -> list[dict[str, Any]] 
                 or {"type": "object", "properties": {}},
             }
         )
+    if issuer_kind == "xai_responses" and converted:
+        # xAI reserves web_search for its server-side Responses tool.  Sending
+        # a same-named client function starts search progress that never
+        # reconciles into a final response.
+        has_web_search = any(t.get("name") == "web_search" for t in converted)
+        if has_web_search:
+            converted = [t for t in converted if t.get("name") != "web_search"]
+            converted.append({"type": "web_search"})
     return converted or None
 
 
@@ -430,11 +587,18 @@ def chat_messages_to_responses_input(
                             ri = {
                                 "type": "message",
                                 "role": "assistant",
-                                "status": "completed",
+                                "status": _normalize_responses_message_status(
+                                    raw.get("status")
+                                ),
                                 "content": norm_parts,
                             }
                             iid = raw.get("id")
-                            if isinstance(iid, str) and iid.strip() and len(iid) <= _MAX_ITEM_ID_LEN:
+                            if (
+                                current_issuer_kind != "github_responses"
+                                and isinstance(iid, str)
+                                and iid.strip()
+                                and len(iid) <= _MAX_ITEM_ID_LEN
+                            ):
                                 ri["id"] = iid.strip()
                             phase = raw.get("phase")
                             if isinstance(phase, str) and phase.strip():
@@ -463,14 +627,26 @@ def chat_messages_to_responses_input(
                     name = fn.get("name")
                     if not isinstance(name, str) or not name.strip():
                         continue
-                    call_id = tc.get("call_id") or tc.get("id") or f"call_{name}"
-                    if not isinstance(call_id, str) or not call_id.strip():
-                        call_id = f"call_{name}"
                     args = fn.get("arguments", "{}")
                     if isinstance(args, dict):
                         args = json.dumps(args, ensure_ascii=False)
                     elif not isinstance(args, str):
                         args = str(args)
+                    embedded_call_id, response_item_id = _split_responses_tool_id(
+                        tc.get("id")
+                    )
+                    call_id = tc.get("call_id")
+                    if not isinstance(call_id, str) or not call_id.strip():
+                        call_id = embedded_call_id
+                    if not isinstance(call_id, str) or not call_id.strip():
+                        if response_item_id and response_item_id.startswith("fc_"):
+                            call_id = f"call_{response_item_id[3:]}"
+                        else:
+                            call_id = _deterministic_call_id(
+                                name,
+                                args,
+                                len(items),
+                            )
                     items.append(
                         {
                             "type": "function_call",
@@ -489,7 +665,10 @@ def chat_messages_to_responses_input(
             continue
 
         if role == "tool":
-            call_id = msg.get("tool_call_id") or msg.get("call_id")
+            raw_call_id = msg.get("tool_call_id") or msg.get("call_id")
+            call_id, _ = _split_responses_tool_id(raw_call_id)
+            if call_id is None and isinstance(raw_call_id, str):
+                call_id = raw_call_id.strip() or None
             if not isinstance(call_id, str) or not call_id.strip():
                 continue
             tool_content = msg.get("content")
@@ -525,9 +704,17 @@ def _content_to_parts(content: list[Any], *, role: str) -> list[dict[str, Any]]:
                 out.append({"type": text_type, "text": t})
         elif ptype in {"image_url", "input_image"}:
             ref = part.get("image_url")
-            url = ref.get("url") if isinstance(ref, dict) else ref
+            detail = part.get("detail")
+            if isinstance(ref, dict):
+                url = ref.get("url")
+                detail = ref.get("detail", detail)
+            else:
+                url = ref
             if isinstance(url, str) and url:
-                out.append({"type": "input_image", "image_url": url})
+                image_part = {"type": "input_image", "image_url": url}
+                if isinstance(detail, str) and detail.strip():
+                    image_part["detail"] = detail.strip()
+                out.append(image_part)
     return out
 
 
@@ -569,6 +756,7 @@ def _consume_responses_sse(
     model: str,
     issuer_kind: str | None,
     on_delta: Any | None,
+    cancel_event: Any | None = None,
 ) -> CompletionResult:
     """Parse OpenAI Responses SSE; assemble a final payload for normalize."""
     text_parts: list[str] = []
@@ -577,12 +765,14 @@ def _consume_responses_sse(
     message_items: list[dict[str, Any]] = []
     usage: dict[str, Any] = {}
     model_name = model
-    status = "completed"
+    status = ""
+    incomplete_reason = ""
+    saw_terminal = False
     # Accumulate function call args by item_id
     fc_buf: dict[str, dict[str, Any]] = {}
 
     while True:
-        line = resp.readline()
+        line = cancellable_readline(resp, cancel_event)
         if not line:
             break
         if isinstance(line, bytes):
@@ -615,7 +805,10 @@ def _consume_responses_sse(
                 text_parts.append(piece)
                 if callable(on_delta):
                     try:
-                        on_delta(piece)
+                        if on_delta(piece) is False:
+                            raise ModelStreamCancelled()
+                    except ModelStreamCancelled:
+                        raise
                     except Exception:  # noqa: BLE001
                         logger.debug("on_delta failed", exc_info=True)
         elif et == "response.function_call_arguments.delta":
@@ -651,10 +844,22 @@ def _consume_responses_sse(
                 continue
             itype = item.get("type")
             if itype == "function_call":
+                call_id = item.get("call_id")
+                if not isinstance(call_id, str) or not call_id.strip():
+                    _, response_item_id = _split_responses_tool_id(item.get("id"))
+                    if response_item_id and response_item_id.startswith("fc_"):
+                        call_id = f"call_{response_item_id[3:]}"
+                    else:
+                        args = str(item.get("arguments") or "{}")
+                        call_id = _deterministic_call_id(
+                            str(item.get("name") or ""),
+                            args,
+                            len(tool_calls),
+                        )
                 tool_calls.append(
                     {
-                        "id": str(item.get("call_id") or item.get("id") or ""),
-                        "call_id": str(item.get("call_id") or item.get("id") or ""),
+                        "id": str(call_id),
+                        "call_id": str(call_id),
                         "type": "function",
                         "function": {
                             "name": str(item.get("name") or ""),
@@ -663,6 +868,9 @@ def _consume_responses_sse(
                     }
                 )
             elif itype == "reasoning":
+                item_id = item.get("id")
+                if isinstance(item_id, str) and item_id.startswith("rs_tmp_"):
+                    continue
                 ri = dict(item)
                 if issuer_kind:
                     ri["_issuer_kind"] = issuer_kind
@@ -676,9 +884,21 @@ def _consume_responses_sse(
                         if isinstance(t, str) and t and t not in "".join(text_parts):
                             # only append if not already streamed
                             pass
-        elif et == "response.completed":
+        elif et in {"response.failed", "response.cancelled"}:
             resp_obj = data.get("response") or {}
-            status = str(resp_obj.get("status") or "completed")
+            error = resp_obj.get("error") or data.get("error") or data
+            message = error.get("message") if isinstance(error, dict) else str(error)
+            raise ModelError(f"Responses API stream {et}: {message or error!r}"[:400])
+        elif et in {"response.completed", "response.incomplete"}:
+            resp_obj = data.get("response") or {}
+            saw_terminal = True
+            status = str(
+                resp_obj.get("status")
+                or ("incomplete" if et == "response.incomplete" else "completed")
+            )
+            details = resp_obj.get("incomplete_details") or {}
+            if isinstance(details, dict):
+                incomplete_reason = str(details.get("reason") or "").lower()
             if isinstance(resp_obj.get("usage"), dict):
                 usage = dict(resp_obj["usage"])
             # prefer full response if present
@@ -691,6 +911,8 @@ def _consume_responses_sse(
         elif et == "error":
             raise ModelError(f"Responses stream error: {data!r}"[:400])
 
+    if not saw_terminal:
+        raise ModelError("Responses stream ended before a terminal response event")
     # Assemble from deltas if no full response.completed payload
     if not tool_calls and fc_buf:
         for slot in fc_buf.values():
@@ -711,7 +933,9 @@ def _consume_responses_sse(
         # empty stream — still return structure
         pass
     finish = "tool_calls" if tool_calls else "stop"
-    if status == "incomplete":
+    if incomplete_reason == "content_filter":
+        finish = "content_filter"
+    elif status == "incomplete":
         finish = "length"
     pdata: dict[str, Any] = {}
     if reasoning_items:
@@ -757,7 +981,10 @@ def normalize_responses_payload(
                 }
             ]
         else:
-            raise ModelError("Responses API returned no output items")
+            if _responses_content_filtered(payload):
+                output = []
+            else:
+                raise ModelError("Responses API returned no output items")
 
     content_parts: list[str] = []
     reasoning_parts: list[str] = []
@@ -780,7 +1007,9 @@ def normalize_responses_payload(
                 mi: dict[str, Any] = {
                     "type": "message",
                     "role": "assistant",
-                    "status": "completed",
+                    "status": _normalize_responses_message_status(
+                        item.get("status")
+                    ),
                     "content": [{"type": "output_text", "text": text}],
                 }
                 if isinstance(item.get("id"), str) and item["id"]:
@@ -795,16 +1024,31 @@ def normalize_responses_payload(
             # keep encrypted blob for replay
             enc = item.get("encrypted_content")
             if enc or rtext:
+                item_id = item.get("id")
+                if isinstance(item_id, str) and item_id.startswith("rs_tmp_"):
+                    continue
                 ri = {k: v for k, v in item.items() if k != "_issuer_kind"}
                 if issuer_kind:
                     ri["_issuer_kind"] = issuer_kind
                 reasoning_items.append(ri)
         elif itype == "function_call":
             name = item.get("name") or ""
-            call_id = item.get("call_id") or item.get("id") or f"call_{name}"
             args = item.get("arguments") or "{}"
             if isinstance(args, dict):
-                args = json.dumps(args)
+                args = json.dumps(args, ensure_ascii=False)
+            elif not isinstance(args, str):
+                args = str(args)
+            call_id = item.get("call_id")
+            if not isinstance(call_id, str) or not call_id.strip():
+                _, response_item_id = _split_responses_tool_id(item.get("id"))
+                if response_item_id and response_item_id.startswith("fc_"):
+                    call_id = f"call_{response_item_id[3:]}"
+                else:
+                    call_id = _deterministic_call_id(
+                        str(name),
+                        str(args),
+                        len(tool_calls),
+                    )
             tool_calls.append(
                 {
                     "id": str(call_id),
@@ -823,7 +1067,9 @@ def normalize_responses_payload(
         text = scrub_model_content(_TOOL_CALL_LEAK.sub("", text))
 
     finish = "tool_calls" if tool_calls else "stop"
-    if status == "incomplete":
+    if _responses_content_filtered(payload):
+        finish = "content_filter"
+    elif status == "incomplete":
         finish = "length"
 
     usage = normalize_openai_usage(payload.get("usage") or {})
@@ -857,6 +1103,24 @@ def normalize_responses_payload(
         reasoning_content="\n\n".join(reasoning_parts) if reasoning_parts else None,
         provider_data=provider_data or None,
     )
+
+
+def _responses_content_filtered(payload: dict[str, Any]) -> bool:
+    details = payload.get("incomplete_details") or {}
+    if isinstance(details, dict) and str(details.get("reason") or "").lower() in {
+        "content_filter",
+        "content_filtered",
+    }:
+        return True
+    error = payload.get("error") or {}
+    if isinstance(error, dict) and str(
+        error.get("code") or error.get("type") or ""
+    ).lower() in {"content_filter", "content_filtered"}:
+        return True
+    return str(payload.get("finish_reason") or "").lower() in {
+        "content_filter",
+        "content_filtered",
+    }
 
 
 def _extract_message_text(item: dict[str, Any]) -> str:

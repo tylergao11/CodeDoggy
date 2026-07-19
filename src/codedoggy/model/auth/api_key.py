@@ -56,7 +56,7 @@ class ApiKeyAuth:
             source=source,
         )
 
-    def begin_login(self) -> AuthStatus:
+    def begin_login(self, *, cancel_event: Any | None = None) -> AuthStatus:
         # No browser flow — tell user which env to set.
         return AuthStatus(
             provider=self._name,

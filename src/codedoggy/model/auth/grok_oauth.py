@@ -52,6 +52,34 @@ _API_KEY_SCOPE = "xai::api_key"
 _SCOPE_KEY = f"{XAI_OAUTH2_ISSUER}::{XAI_OAUTH2_CLIENT_ID}"
 # Refresh this many seconds before expires_at
 _REFRESH_SKEW_S = 120
+GROK_OAUTH_INFERENCE_BASE_URL = "https://cli-chat-proxy.grok.com/v1"
+# This is the Grok wire-protocol baseline CodeDoggy is aligned against, not
+# CodeDoggy's package version.  cli-chat-proxy gates sampling requests on the
+# upstream client's ``x-grok-client-version`` header.
+GROK_PROTOCOL_CLIENT_VERSION = "0.2.102"
+
+
+def _oauth_inference_base_url() -> str:
+    return (
+        os.environ.get("GROK_CLI_CHAT_PROXY_BASE_URL")
+        or GROK_OAUTH_INFERENCE_BASE_URL
+    ).strip().rstrip("/")
+
+
+def _oauth_inference_headers() -> dict[str, str]:
+    # Grok's URL-derived sampling headers for the cli-chat-proxy session path.
+    client_version = (
+        os.environ.get("CODEDOGGY_GROK_CLIENT_VERSION")
+        or os.environ.get("GROK_CLIENT_VERSION")
+        or GROK_PROTOCOL_CLIENT_VERSION
+    ).strip()
+    return {
+        "X-XAI-Token-Auth": "xai-grok-cli",
+        "x-authenticateresponse": "authenticate-response",
+        "x-grok-client-mode": "interactive",
+        "x-grok-client-version": client_version,
+        "x-grok-client-identifier": "grok-shell",
+    }
 
 
 def grok_home() -> Path:
@@ -136,7 +164,7 @@ class GrokOAuthAuth:
             )
         return None
 
-    def begin_login(self) -> AuthStatus:
+    def begin_login(self, *, cancel_event: Any | None = None) -> AuthStatus:
         """Open browser (device-code); block until approved; persist session."""
         try:
             session = request_device_code(
@@ -144,6 +172,8 @@ class GrokOAuthAuth:
                 client_id=XAI_OAUTH2_CLIENT_ID,
                 scopes=list(XAI_OAUTH2_SCOPES),
                 referrer="codedoggy",
+                timeout_s=5.0,
+                cancel_event=cancel_event,
             )
         except DeviceFlowError as exc:
             return AuthStatus(
@@ -166,6 +196,7 @@ class GrokOAuthAuth:
                 issuer=XAI_OAUTH2_ISSUER,
                 client_id=XAI_OAUTH2_CLIENT_ID,
                 session=session,
+                cancel_event=cancel_event,
             )
         except DeviceFlowError as exc:
             return AuthStatus(
@@ -243,6 +274,8 @@ class GrokOAuthAuth:
             token=key,
             refresh_token=refresh,
             source=f"file:{path}",
+            headers=_oauth_inference_headers(),
+            base_url=_oauth_inference_base_url(),
             meta={
                 "auth_mode": str(entry.get("auth_mode") or "oidc"),
                 "email": entry.get("email"),

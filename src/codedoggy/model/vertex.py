@@ -19,6 +19,7 @@ from typing import Any
 from codedoggy.model.openai_compat import ModelError, OpenAICompatClient
 from codedoggy.model.profile import ProviderProfile
 from codedoggy.model.profile_registry import get_profile
+from codedoggy.model.stream_cancel import run_cancellable_request
 from codedoggy.model.types import ChatMessage, CompletionResult, ModelConfig
 
 logger = logging.getLogger(__name__)
@@ -162,13 +163,19 @@ class VertexClient:
         temperature: float | None = None,
         max_tokens: int | None = None,
         tools: list[dict[str, Any]] | None = None,
+        cancel_event: Any | None = None,
     ) -> CompletionResult:
         try:
-            return self._client().complete(
+            # ADC/service-account refresh is network I/O too.  Acquire the
+            # short-lived client inside an abandonable owner before handing
+            # the actual request to OpenAICompat's own cancellable owner.
+            client = run_cancellable_request(self._client, cancel_event)
+            return client.complete(
                 messages,
                 temperature=temperature,
                 max_tokens=max_tokens,
                 tools=tools,
+                cancel_event=cancel_event,
             )
         except ModelError:
             raise
@@ -183,10 +190,11 @@ class VertexClient:
         max_tokens: int | None = None,
         tools: list[dict[str, Any]] | None = None,
         on_delta: Any | None = None,
+        cancel_event: Any | None = None,
     ) -> CompletionResult:
-        client = self._client()
-        stream_fn = getattr(client, "complete_stream", None)
         try:
+            client = run_cancellable_request(self._client, cancel_event)
+            stream_fn = getattr(client, "complete_stream", None)
             if callable(stream_fn):
                 return stream_fn(
                     messages,
@@ -194,12 +202,14 @@ class VertexClient:
                     max_tokens=max_tokens,
                     tools=tools,
                     on_delta=on_delta,
+                    cancel_event=cancel_event,
                 )
             return self.complete(
                 messages,
                 temperature=temperature,
                 max_tokens=max_tokens,
                 tools=tools,
+                cancel_event=cancel_event,
             )
         except ModelError:
             raise

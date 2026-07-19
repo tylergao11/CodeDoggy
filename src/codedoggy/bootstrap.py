@@ -87,11 +87,11 @@ def build_session(
         db = Path(session_db) if session_db else default_session_db_path()
         session_store = SessionStore(db)
         if session_id:
-            ownership = session_store.validate_session_cwd(
+            ownership = session_store.claim_session(
                 session_id,
                 cwd_path,
-                allow_missing=True,
                 allow_unbound=False,
+                goal=goal,
             )
             if not ownership.allowed:
                 session_store.close()
@@ -263,6 +263,7 @@ def build_session(
         subagent_coordinator=subagent_coord,
         subagent_run_fn=subagent_run,
     )
+    connection.bind_runtime(runner=runner, kernel=kernel, context=compactor)
     # Re-bind parent_session into runner after session object exists
     kernel.subagent_run_fn = make_child_runner(
         parent_cwd=cwd_path,
@@ -270,6 +271,7 @@ def build_session(
         parent_sampler=ChatSampler(main),
         parent_system_prompt=default_system,
         parent_session=session,
+        parent_sampler_factory=connection.new_sampler,
         context_compactor_factory=lambda: ContextCompactor.from_env(
             summary_client=None,
             memory_store=None,
@@ -345,12 +347,22 @@ def build_session(
         pass
 
     if session_store is not None:
-        session_store.ensure_session(
+        ownership = session_store.claim_session(
             str(session.id),
-            cwd=str(session.cwd),
+            session.cwd,
             goal=goal,
             title=(goal or "")[:80] or None,
         )
+        if not ownership.allowed:
+            try:
+                session.close()
+            finally:
+                raise ValueError(
+                    "refusing to hydrate session "
+                    f"{str(session.id)!r} in workspace "
+                    f"{ownership.requested_cwd!r}: {ownership.reason}; "
+                    f"stored workspace={ownership.stored_cwd!r}"
+                )
         # True restore: hydrate live transcript when resuming an existing id
         if provisional_id:
             n = kernel.hydrate_from_store()

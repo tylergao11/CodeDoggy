@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import webbrowser
+import base64
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +25,47 @@ from codedoggy.model.auth.base import (
 logger = logging.getLogger(__name__)
 
 CODEX_LOGIN_URL = "https://chatgpt.com"
+CODEX_OAUTH_INFERENCE_BASE_URL = "https://chatgpt.com/backend-api/codex"
+
+
+def _oauth_inference_base_url() -> str:
+    return (
+        os.environ.get("CODEDOGGY_CODEX_BASE_URL")
+        or os.environ.get("HERMES_CODEX_BASE_URL")
+        or CODEX_OAUTH_INFERENCE_BASE_URL
+    ).strip().rstrip("/")
+
+
+def _codex_oauth_headers(token: str, meta: dict[str, Any]) -> dict[str, str]:
+    """Match the first-party Codex backend request identity.
+
+    The account id is routing data, not a credential.  Prefer the auth file and
+    fall back to the namespaced JWT claim used by codex-rs.
+    """
+    headers = {
+        "User-Agent": "codex_cli_rs/0.0.0 (CodeDoggy)",
+        "originator": "codex_cli_rs",
+    }
+    account_id = _as_str(
+        meta.get("account_id")
+        or meta.get("accountId")
+        or meta.get("chatgpt_account_id")
+    )
+    if account_id is None:
+        try:
+            parts = token.split(".")
+            if len(parts) >= 2:
+                raw = parts[1] + "=" * (-len(parts[1]) % 4)
+                claims = json.loads(base64.urlsafe_b64decode(raw))
+                namespaced = claims.get("https://api.openai.com/auth") or {}
+                if isinstance(namespaced, dict):
+                    account_id = _as_str(namespaced.get("chatgpt_account_id"))
+                account_id = account_id or _as_str(claims.get("chatgpt_account_id"))
+        except Exception:  # malformed token should surface as 401, not crash setup
+            account_id = None
+    if account_id:
+        headers["ChatGPT-Account-ID"] = account_id
+    return headers
 
 
 def codex_home() -> Path:
@@ -78,6 +120,8 @@ class CodexOAuthAuth:
                 token=tok,
                 refresh_token=entry.get("refresh_token"),
                 source=f"file:{path}",
+                headers=_codex_oauth_headers(tok, entry) if kind == AUTH_OAUTH else {},
+                base_url=_oauth_inference_base_url() if kind == AUTH_OAUTH else None,
                 meta={
                     k: v
                     for k, v in entry.items()
@@ -95,7 +139,7 @@ class CodexOAuthAuth:
             )
         return None
 
-    def begin_login(self) -> AuthStatus:
+    def begin_login(self, *, cancel_event: Any | None = None) -> AuthStatus:
         opened = False
         try:
             opened = bool(webbrowser.open(CODEX_LOGIN_URL))
@@ -172,6 +216,12 @@ def _load_codex_auth(path: Path) -> dict[str, Any] | None:
                         tokens.get("refresh_token") or tokens.get("refreshToken")
                     ),
                     "auth_mode": f"tokens.{key}",
+                    "account_id": _as_str(
+                        tokens.get("account_id")
+                        or tokens.get("accountId")
+                        or data.get("account_id")
+                        or data.get("accountId")
+                    ),
                 }
 
     for _, entry in data.items():

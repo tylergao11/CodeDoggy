@@ -11,37 +11,44 @@ from codedoggy.model.profile_registry import get_profile
 # Curated shortlists. Order = display order; first is usually the default.
 _PROVIDER_MODELS: dict[str, tuple[str, ...]] = {
     "grok": (
-        "grok-3",
-        "grok-3-mini",
+        "grok-4.5",
         "grok-4",
         "grok-4-0709",
+        "grok-3",
+        "grok-3-mini",
         "grok-2",
         "grok-2-vision-1212",
     ),
     "claude": (
+        "claude-opus-4-5",
         "claude-sonnet-4-5",
         "claude-haiku-4-5",
-        "claude-opus-4-5",
         "claude-sonnet-4-0",
         "claude-3-5-haiku-latest",
     ),
     "codex": (
+        "gpt-5.6-sol",
+        "gpt-5.6",
+        "gpt-5.6-terra",
+        "gpt-5.6-luna",
+        "gpt-5.5",
         "gpt-5.1-codex",
         "gpt-5.1",
-        "gpt-4.1",
-        "gpt-4.1-mini",
         "o4-mini",
     ),
     "openai": (
+        "gpt-5.6-sol",
+        "gpt-5.6",
+        "gpt-5.6-terra",
+        "gpt-5.6-luna",
+        "gpt-5.4",
         "gpt-4o",
         "gpt-4o-mini",
-        "gpt-4.1",
-        "gpt-4.1-mini",
         "o4-mini",
     ),
     "deepseek": (
-        "deepseek-chat",
         "deepseek-reasoner",
+        "deepseek-chat",
     ),
     "ollama": (
         "qwen3:8b",
@@ -51,12 +58,17 @@ _PROVIDER_MODELS: dict[str, tuple[str, ...]] = {
         "mistral",
     ),
     "custom": (
+        "gpt-5.6-sol",
+        "gpt-5.6-luna",
         "gpt-4o-mini",
     ),
     "openai_compat": (
+        "gpt-5.6-sol",
+        "gpt-5.6-luna",
         "gpt-4o-mini",
     ),
     "bedrock": (
+        "anthropic.claude-opus-4-5-20251101-v1:0",
         "anthropic.claude-sonnet-4-5-20250929-v1:0",
         "anthropic.claude-haiku-4-5-20251001-v1:0",
     ),
@@ -65,8 +77,10 @@ _PROVIDER_MODELS: dict[str, tuple[str, ...]] = {
         "google/gemini-2.5-flash",
     ),
     "codex_app_server": (
+        "gpt-5.6-sol",
+        "gpt-5.6",
+        "gpt-5.6-luna",
         "gpt-5.1-codex",
-        "gpt-5.1",
     ),
 }
 

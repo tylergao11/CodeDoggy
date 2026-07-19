@@ -180,7 +180,10 @@ class SubagentCoordinator:
         self, callback: Callable[[SubagentSnapshot, Any], None]
     ) -> None:
         with self._lock:
-            self._listeners = [c for c in self._listeners if c is not callback]
+            # Bound-method objects are recreated on attribute access.  Equality
+            # matches the same instance+function pair; identity leaks TUI
+            # listeners forever across repeated attach/detach cycles.
+            self._listeners = [c for c in self._listeners if c != callback]
 
     def publish_live_message(self, subagent_id: str, message: Any) -> None:
         """Append one live transcript message while a child is still running.
@@ -654,6 +657,7 @@ def make_child_runner(
     parent_system_prompt: str | None,
     parent_session: Any = None,
     context_compactor_factory: Callable[[], Any] | None = None,
+    parent_sampler_factory: Callable[[], Any] | None = None,
 ) -> Callable[[SubagentRequest, threading.Event], SubagentSnapshot]:
     """Build the function that actually runs a child agentic loop."""
 
@@ -715,6 +719,24 @@ def make_child_runner(
                 compactor = context_compactor_factory()
             except Exception:  # noqa: BLE001
                 logger.debug("child compactor factory failed", exc_info=True)
+
+        # One sampler per child: ChatSampler contains mutable tool-call id and
+        # streaming state.  The factory also resolves the latest connection
+        # generation, so children spawned after a TUI provider switch do not
+        # stay pinned to the bootstrap client.
+        runtime_sampler = parent_sampler
+        if parent_sampler_factory is not None:
+            try:
+                runtime_sampler = parent_sampler_factory()
+            except Exception:  # noqa: BLE001
+                logger.debug("child sampler factory failed", exc_info=True)
+        if compactor is not None:
+            try:
+                from codedoggy.turn.runner import _bind_compactor_model_window
+
+                _bind_compactor_model_window(compactor, runtime_sampler)
+            except Exception:  # noqa: BLE001
+                logger.debug("child model-window bind failed", exc_info=True)
 
         max_turns = definition.max_turns
         if max_turns is None and parent_session is not None:
@@ -840,6 +862,10 @@ def make_child_runner(
             "isolation": isolation_mode.value,
             "resumed": is_resume,
         }
+        # Media extras follow the parent's ActiveConnection (same login as MAIN).
+        parent_connection = _parent_resource(parent_session, "connection")
+        if parent_connection is not None:
+            tool_extra["connection"] = parent_connection
         if wt is not None:
             tool_extra["worktree_path"] = str(wt.path)
             tool_extra["worktree_branch"] = wt.branch
@@ -916,12 +942,13 @@ def make_child_runner(
         try:
             loop = run_agent_loop(
                 user_text=request.prompt,
-                sampler=parent_sampler,
+                sampler=runtime_sampler,
                 tools=child_tools,
                 cwd=child_cwd,
                 max_turns=max_turns,
                 system_prompt=system_prompt,
                 is_cancelled=_cancelled,
+                cancel_event=cancel,
                 hooks=child_hooks,
                 # Keep session=None so child does not mutate parent phase/live.
                 session=None,
@@ -949,9 +976,9 @@ def make_child_runner(
                     except Exception:  # noqa: BLE001
                         logger.debug("child graph persist failed", exc_info=True)
                 try:
-                    owned_graph.stop_watch()
+                    owned_graph.close()
                 except Exception:  # noqa: BLE001
-                    logger.debug("child graph stop failed", exc_info=True)
+                    logger.debug("child graph close failed", exc_info=True)
             if owned_task_manager is not None:
                 try:
                     owned_task_manager.close()
@@ -981,7 +1008,11 @@ def make_child_runner(
                 child_error = loop.error or "Child agent stopped without completion."
 
         # Hermes: parent memory provider observes delegation (child has no provider)
-        if parent_session is not None and status == "completed":
+        parent_session_still_owned = (
+            parent_session is not None
+            and str(getattr(parent_session, "id", "")) == request.parent_session_id
+        )
+        if parent_session_still_owned and status == "completed":
             try:
                 from codedoggy.memory.hermes_seam import on_delegation
 
@@ -1191,9 +1222,20 @@ def _serialize_messages(messages: list) -> list[dict[str, Any]]:
                     "id": getattr(tc, "id", ""),
                     "name": getattr(tc, "name", ""),
                     "arguments": getattr(tc, "arguments", {}) or {},
+                    **(
+                        {"provider_data": dict(tc.provider_data)}
+                        if isinstance(getattr(tc, "provider_data", None), dict)
+                        else {}
+                    ),
                 }
                 for tc in tcs
             ]
+        reasoning = getattr(m, "reasoning_content", None)
+        if isinstance(reasoning, str) and reasoning:
+            d["reasoning_content"] = reasoning
+        provider_data = getattr(m, "provider_data", None)
+        if isinstance(provider_data, dict) and provider_data:
+            d["provider_data"] = dict(provider_data)
         out.append(d)
     return out
 
@@ -1227,6 +1269,11 @@ def _hydrate_prior_messages(prior: list[Any] | None) -> list | None:
                     id=str(tc.get("id") or ""),
                     name=str(tc.get("name") or ""),
                     arguments=tc.get("arguments") or {},
+                    provider_data=(
+                        dict(tc["provider_data"])
+                        if isinstance(tc.get("provider_data"), dict)
+                        else None
+                    ),
                 )
                 for tc in raw_tcs
                 if isinstance(tc, dict)
@@ -1238,6 +1285,12 @@ def _hydrate_prior_messages(prior: list[Any] | None) -> list | None:
                 name=item.get("name"),
                 tool_call_id=item.get("tool_call_id"),
                 tool_calls=tcs,
+                reasoning_content=item.get("reasoning_content"),
+                provider_data=(
+                    dict(item["provider_data"])
+                    if isinstance(item.get("provider_data"), dict)
+                    else None
+                ),
             )
         )
     return out or None

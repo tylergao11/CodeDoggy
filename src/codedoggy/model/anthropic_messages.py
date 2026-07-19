@@ -12,10 +12,18 @@ import urllib.error
 import urllib.request
 from typing import Any
 
+from codedoggy.model.errors import ModelStreamCancelled
 from codedoggy.model.openai_compat import ModelError, scrub_model_content
 from codedoggy.model.profile import ProviderProfile
 from codedoggy.model.profile_registry import get_profile
 from codedoggy.model.protocol_context import assistant_blocks_for_anthropic
+from codedoggy.model.stream_cancel import (
+    HTTPErrorSnapshot,
+    cancellable_read,
+    cancellable_readline,
+    run_cancellable_request,
+    snapshot_http_error,
+)
 from codedoggy.model.types import ChatMessage, CompletionResult, ModelConfig
 
 logger = logging.getLogger(__name__)
@@ -57,6 +65,7 @@ class AnthropicMessagesClient:
         temperature: float | None = None,
         max_tokens: int | None = None,
         tools: list[dict[str, Any]] | None = None,
+        cancel_event: Any | None = None,
     ) -> CompletionResult:
         cfg = self._config
         url = _messages_url(cfg.normalized_base_url())
@@ -69,14 +78,19 @@ class AnthropicMessagesClient:
         headers = self._headers()
         data = json.dumps(body).encode("utf-8")
         req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+        def _request() -> bytes:
+            try:
+                with urllib.request.urlopen(req, timeout=cfg.timeout_s) as resp:
+                    return cancellable_read(resp, cancel_event)
+            except urllib.error.HTTPError as exc:
+                raise snapshot_http_error(exc, cancel_event, max_body_bytes=500) from None
+
         try:
-            with urllib.request.urlopen(req, timeout=cfg.timeout_s) as resp:
-                raw_bytes = resp.read()
-        except urllib.error.HTTPError as e:
-            err_body = e.read().decode("utf-8", errors="replace") if e.fp else ""
+            raw_bytes = run_cancellable_request(_request, cancel_event)
+        except HTTPErrorSnapshot as e:
             raise ModelError(
-                f"HTTP {e.code} from {url}: {err_body[:500]}",
-                status=e.code,
+                f"HTTP {e.status} from {url}: {e.body[:500]}",
+                status=e.status,
             ) from e
         except urllib.error.URLError as e:
             raise ModelError(f"Failed to reach {url}: {e.reason}") from e
@@ -96,6 +110,7 @@ class AnthropicMessagesClient:
         max_tokens: int | None = None,
         tools: list[dict[str, Any]] | None = None,
         on_delta: Any | None = None,
+        cancel_event: Any | None = None,
     ) -> CompletionResult:
         """Anthropic SSE stream; falls back to complete() if rejected."""
         cfg = self._config
@@ -110,24 +125,38 @@ class AnthropicMessagesClient:
         headers = self._headers(accept="text/event-stream")
         data = json.dumps(body).encode("utf-8")
         req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+        def _request() -> CompletionResult:
+            try:
+                with urllib.request.urlopen(req, timeout=cfg.timeout_s) as resp:
+                    return _consume_anthropic_sse(
+                        resp,
+                        model=cfg.model,
+                        on_delta=on_delta,
+                        cancel_event=cancel_event,
+                    )
+            except urllib.error.HTTPError as exc:
+                raise snapshot_http_error(
+                    exc,
+                    cancel_event,
+                    read_body=exc.code not in {400, 404, 422},
+                    max_body_bytes=500,
+                ) from None
+
         try:
-            with urllib.request.urlopen(req, timeout=cfg.timeout_s) as resp:
-                return _consume_anthropic_sse(
-                    resp, model=cfg.model, on_delta=on_delta
-                )
-        except urllib.error.HTTPError as e:
-            if e.code in {400, 404, 422}:
-                logger.debug("anthropic stream rejected (%s); complete()", e.code)
+            return run_cancellable_request(_request, cancel_event)
+        except HTTPErrorSnapshot as e:
+            if e.status in {400, 404, 422}:
+                logger.debug("anthropic stream rejected (%s); complete()", e.status)
                 return self.complete(
                     messages,
                     temperature=temperature,
                     max_tokens=max_tokens,
                     tools=tools,
+                    cancel_event=cancel_event,
                 )
-            err_body = e.read().decode("utf-8", errors="replace") if e.fp else ""
             raise ModelError(
-                f"HTTP {e.code} from {url}: {err_body[:500]}",
-                status=e.code,
+                f"HTTP {e.status} from {url}: {e.body[:500]}",
+                status=e.status,
             ) from e
         except urllib.error.URLError as e:
             raise ModelError(f"Failed to reach {url}: {e.reason}") from e
@@ -185,16 +214,35 @@ class AnthropicMessagesClient:
         }
         if system:
             body["system"] = system
+        if isinstance(cfg.extra, dict) and cfg.extra.get("auth_kind") == "oauth":
+            identity = {
+                "type": "text",
+                "text": "You are Claude Code, Anthropic's official CLI for Claude.",
+            }
+            current = body.get("system")
+            if isinstance(current, list):
+                body["system"] = [identity, *current]
+            elif isinstance(current, str) and current:
+                body["system"] = [identity, {"type": "text", "text": current}]
+            else:
+                body["system"] = [identity]
         temp = temperature if temperature is not None else cfg.temperature
         if temp is not None:
             body["temperature"] = temp
         if tools:
             anth_tools = convert_tools_to_anthropic(tools)
-            # Hermes: cache_control on last tool caches the tool schema prefix
+            # Anthropic accepts at most four cache breakpoints.  Preserve the
+            # Hermes last-tool marker when capacity exists, but never create
+            # the invalid fifth marker after system/message policy used all
+            # four slots.
+            cache_points = _count_cache_controls(body.get("system")) + _count_cache_controls(
+                body.get("messages")
+            )
             if (
                 self._profile is not None
                 and self._profile.prompt_cache
                 and anth_tools
+                and cache_points < 4
             ):
                 anth_tools[-1] = dict(anth_tools[-1])
                 anth_tools[-1]["cache_control"] = {
@@ -207,6 +255,18 @@ class AnthropicMessagesClient:
                 }
             body["tools"] = anth_tools
         return body
+
+
+def _count_cache_controls(value: Any) -> int:
+    if isinstance(value, dict):
+        return int("cache_control" in value) + sum(
+            _count_cache_controls(item)
+            for key, item in value.items()
+            if key != "cache_control"
+        )
+    if isinstance(value, list):
+        return sum(_count_cache_controls(item) for item in value)
+    return 0
 
 
 def _messages_url(base: str) -> str:
@@ -383,6 +443,7 @@ def _consume_anthropic_sse(
     *,
     model: str,
     on_delta: Any | None,
+    cancel_event: Any | None = None,
 ) -> CompletionResult:
     """Parse Anthropic Messages SSE into CompletionResult."""
     text_parts: list[str] = []
@@ -393,9 +454,10 @@ def _consume_anthropic_sse(
     usage: dict[str, Any] = {}
     model_name = model
     event_type = ""
+    saw_message_stop = False
 
     while True:
-        line = resp.readline()
+        line = cancellable_readline(resp, cancel_event)
         if not line:
             break
         if isinstance(line, bytes):
@@ -416,6 +478,10 @@ def _consume_anthropic_sse(
         except json.JSONDecodeError:
             continue
         et = data.get("type") or event_type
+        if et == "error":
+            error = data.get("error") or data
+            message = error.get("message") if isinstance(error, dict) else str(error)
+            raise ModelError(f"Anthropic stream error: {message or error!r}"[:400])
         if et == "message_start":
             msg = data.get("message") or {}
             if msg.get("model"):
@@ -439,7 +505,10 @@ def _consume_anthropic_sse(
                     text_parts.append(piece)
                     if callable(on_delta):
                         try:
-                            on_delta(piece)
+                            if on_delta(piece) is False:
+                                raise ModelStreamCancelled()
+                        except ModelStreamCancelled:
+                            raise
                         except Exception:  # noqa: BLE001
                             logger.debug("on_delta failed", exc_info=True)
                     b = blocks.setdefault(idx, {"type": "text", "text": ""})
@@ -473,8 +542,11 @@ def _consume_anthropic_sse(
             if isinstance(data.get("usage"), dict):
                 usage.update(data["usage"])
         elif et == "message_stop":
+            saw_message_stop = True
             break
 
+    if not saw_message_stop:
+        raise ModelError("Anthropic stream ended before message_stop")
     ordered = [blocks[i] for i in sorted(blocks)]
     # synthesize payload for normalize path
     payload = {

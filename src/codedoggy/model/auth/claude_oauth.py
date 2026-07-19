@@ -79,7 +79,7 @@ class ClaudeOAuthAuth:
                 kind=_classify_anthropic_token(tok),
                 token=tok,
                 source="explicit",
-                headers=_headers_for_token(),
+                headers=_headers_for_token(_classify_anthropic_token(tok)),
             )
 
         # Prefer OAuth-shaped env over API key
@@ -91,7 +91,7 @@ class ClaudeOAuthAuth:
                     kind=_classify_anthropic_token(raw),
                     token=raw,
                     source=f"env:{env_name}",
-                    headers=_headers_for_token(),
+                    headers=_headers_for_token(_classify_anthropic_token(raw)),
                 )
 
         for path in _claude_paths():
@@ -102,7 +102,7 @@ class ClaudeOAuthAuth:
                     kind=_classify_anthropic_token(token),
                     token=token,
                     source=f"file:{path}",
-                    headers=_headers_for_token(),
+                    headers=_headers_for_token(_classify_anthropic_token(token)),
                     meta=meta,
                 )
 
@@ -113,11 +113,11 @@ class ClaudeOAuthAuth:
                 kind=AUTH_API_KEY,
                 token=api,
                 source="env:ANTHROPIC_API_KEY",
-                headers=_headers_for_token(),
+                headers=_headers_for_token(AUTH_API_KEY),
             )
         return None
 
-    def begin_login(self) -> AuthStatus:
+    def begin_login(self, *, cancel_event: Any | None = None) -> AuthStatus:
         opened = False
         try:
             opened = bool(webbrowser.open(CLAUDE_LOGIN_URL))
@@ -160,8 +160,23 @@ def _classify_anthropic_token(token: str) -> str:
     return AUTH_API_KEY
 
 
-def _headers_for_token() -> dict[str, str]:
-    return {"anthropic-version": "2023-06-01"}
+def _headers_for_token(kind: str) -> dict[str, str]:
+    betas = [
+        "interleaved-thinking-2025-05-14",
+        "fine-grained-tool-streaming-2025-05-14",
+    ]
+    headers = {"anthropic-version": "2023-06-01"}
+    if kind == AUTH_OAUTH:
+        betas.extend(("claude-code-20250219", "oauth-2025-04-20"))
+        version = (os.environ.get("CLAUDE_CODE_VERSION") or "2.1.74").strip()
+        headers.update(
+            {
+                "user-agent": f"claude-code/{version} (external, cli)",
+                "x-app": "cli",
+            }
+        )
+    headers["anthropic-beta"] = ",".join(betas)
+    return headers
 
 
 def _read_claude_file(path: Path) -> tuple[str | None, dict[str, Any]]:

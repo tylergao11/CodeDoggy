@@ -27,7 +27,7 @@ from codedoggy.graph.watcher import WorkspaceWatcher
 logger = logging.getLogger(__name__)
 
 
-def _release_watch_finalizer(
+def _release_graph_finalizer(
     runtime_ref: weakref.ReferenceType[WorkspaceGraphRuntime],
     lease: object,
 ) -> None:
@@ -39,6 +39,10 @@ def _release_watch_finalizer(
         runtime.release_watch(lease)
     except Exception:  # noqa: BLE001
         logger.debug("graph watch finalizer failed", exc_info=True)
+    try:
+        runtime.release_handle(lease)
+    except Exception:  # noqa: BLE001
+        logger.debug("graph handle finalizer failed", exc_info=True)
 
 
 class CodebaseGraph:
@@ -64,9 +68,19 @@ class CodebaseGraph:
         )
         self._registry = self._runtime.registry
         self._lease_token = object()
+        try:
+            self._runtime.acquire_handle(self._lease_token)
+        except RuntimeError:
+            # The last prior Session may have closed between registry lookup
+            # and lease acquisition.  Resolve the fresh generation once.
+            self._runtime, self._runtime_was_new = (
+                get_codebase_index_manager().get_or_create(self.root)
+            )
+            self._registry = self._runtime.registry
+            self._runtime.acquire_handle(self._lease_token)
         self._finalizer = weakref.finalize(
             self,
-            _release_watch_finalizer,
+            _release_graph_finalizer,
             weakref.ref(self._runtime),
             self._lease_token,
         )
@@ -258,6 +272,7 @@ class CodebaseGraph:
         self.stop_watch()
         self._closed = True
         self._finalizer.detach()
+        self._runtime.release_handle(self._lease_token)
 
     @property
     def navigator(self) -> Navigator:

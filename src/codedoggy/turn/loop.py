@@ -10,6 +10,7 @@ from uuid import uuid4
 
 from codedoggy.context.budget import ContextBudget
 from codedoggy.context.compactor import ContextCompactor
+from codedoggy.model.errors import ModelError, ModelStreamCancelled
 from codedoggy.tools.registry import FinalizedToolset
 from codedoggy.orchestration.tool_pipeline import (
     execute_approved_batch,
@@ -41,6 +42,7 @@ def run_agent_loop(
     max_turns: int | None = None,
     system_prompt: str | None = None,
     is_cancelled: Callable[[], bool] | None = None,
+    cancel_event: Any | None = None,
     hooks: LoopHooks | None = None,
     session: Any = None,
     session_id: str | None = None,
@@ -170,6 +172,13 @@ def run_agent_loop(
     MAX_OVERFLOW_RESUBMITS = 2
     final_text: str | None = None
 
+    def _cancel_requested() -> bool:
+        token_is_set = getattr(cancel_event, "is_set", None)
+        return bool(
+            (callable(token_is_set) and token_is_set())
+            or (is_cancelled is not None and is_cancelled())
+        )
+
     def _hctx(round_index: int) -> HookContext:
         goal = getattr(session, "goal", None) if session is not None else None
         return HookContext(
@@ -237,7 +246,7 @@ def run_agent_loop(
         )
 
     while True:
-        if is_cancelled is not None and is_cancelled():
+        if _cancel_requested():
             return _finish(completed=False, cancelled=True, exit_reason="cancelled")
 
         if max_turns is not None and rounds >= max_turns:
@@ -255,8 +264,40 @@ def run_agent_loop(
             messages, extra, on_archive_message=on_archive_message
         )
 
-        # Grok foundation: enforce live context budget before every sample.
+        # Dynamic tool descriptions (skill <available_skills>) re-render each turn.
+        bind = getattr(tools, "bind_list_context", None)
+        if callable(bind):
+            try:
+                bind(cwd=cwd_path, extra=extra)
+            except Exception:  # noqa: BLE001
+                logger.debug("bind_list_context failed", exc_info=True)
+        tool_specs = tools.tool_definitions()
+        # Grok: tools_reserve counts against the window every sample
         if context_compactor is not None:
+            bind = getattr(context_compactor, "bind_sample_tools", None)
+            if callable(bind):
+                try:
+                    bind(tool_specs)
+                except Exception:  # noqa: BLE001
+                    logger.debug("bind_sample_tools failed", exc_info=True)
+        # Project the exact host-side model view before deciding whether the
+        # canonical transcript fits.  Prefix/fenced memory stay ephemeral, but
+        # their tokens still consume the same provider context window.
+        projected_messages = sample_messages_with_memory(messages, prefetch_block)
+        projected_messages = model_sample_messages(
+            projected_messages,
+            user_message_prefix=user_message_prefix,
+        )
+        if context_compactor is not None:
+            bind_overhead = getattr(context_compactor, "bind_sample_overhead", None)
+            if callable(bind_overhead):
+                try:
+                    bind_overhead(messages, projected_messages)
+                except Exception:  # noqa: BLE001
+                    logger.debug("bind_sample_overhead failed", exc_info=True)
+
+            # Grok foundation: enforce the live budget only after all reserves
+            # for this actual sample (dynamic tools + ephemeral blocks) exist.
             cres = context_compactor.ensure(messages)
             messages = cres.messages
             if cres.did_compact:
@@ -275,23 +316,6 @@ def run_agent_loop(
                     cres.chars_after,
                     cres.folded_messages,
                 )
-
-        # Dynamic tool descriptions (skill <available_skills>) re-render each turn.
-        bind = getattr(tools, "bind_list_context", None)
-        if callable(bind):
-            try:
-                bind(cwd=cwd_path, extra=extra)
-            except Exception:  # noqa: BLE001
-                logger.debug("bind_list_context failed", exc_info=True)
-        tool_specs = tools.tool_definitions()
-        # Grok: tools_reserve counts against the window every sample
-        if context_compactor is not None:
-            bind = getattr(context_compactor, "bind_sample_tools", None)
-            if callable(bind):
-                try:
-                    bind(tool_specs)
-                except Exception:  # noqa: BLE001
-                    logger.debug("bind_sample_tools failed", exc_info=True)
         # Hermes seam: API-only inject into current user (no transcript mutate)
         sample_messages = sample_messages_with_memory(messages, prefetch_block)
         sample_messages = model_sample_messages(
@@ -301,9 +325,28 @@ def run_agent_loop(
         sample_attempts += 1
         try:
             sample = _sample_with_host_stream(
-                sampler, sample_messages, tool_specs, extra
+                sampler,
+                sample_messages,
+                tool_specs,
+                extra,
+                is_cancelled=is_cancelled,
+                cancel_event=cancel_event,
+            )
+        except ModelStreamCancelled:
+            return _finish(
+                completed=False,
+                cancelled=True,
+                exit_reason="cancelled",
+                metadata={"sample_attempts": sample_attempts},
             )
         except Exception as e:
+            if _cancel_requested():
+                return _finish(
+                    completed=False,
+                    cancelled=True,
+                    exit_reason="cancelled",
+                    metadata={"sample_attempts": sample_attempts},
+                )
             # Grok compact-and-resubmit on context overflow (not silent end)
             err_s = str(e).lower()
             overflow = any(
@@ -365,7 +408,14 @@ def run_agent_loop(
                     continue
                 except Exception:  # noqa: BLE001
                     logger.exception("compact-and-resubmit failed")
-            logger.exception("sampler failed")
+            # HTTP/provider failures are expected turn outcomes and already
+            # carry a concise user-facing message.  Dumping their traceback to
+            # stderr corrupts the full-screen TUI and looks like an app crash.
+            # Preserve tracebacks for genuinely unexpected programming errors.
+            if isinstance(e, ModelError):
+                logger.warning("sampler failed: %s", e)
+            else:
+                logger.exception("sampler failed")
             return _finish(
                 completed=False,
                 error=f"sampler error: {e}",
@@ -374,6 +424,18 @@ def run_agent_loop(
                     "sample_attempts": sample_attempts,
                     "overflow_resubmits": overflow_resubmits,
                 },
+            )
+
+        # The transport may finish concurrently with cancellation.  Fence the
+        # returned sample before usage accounting, hooks, transcript/archive
+        # writes, or the no-tools success path can observe it.
+        if _cancel_requested():
+            return _finish(
+                completed=False,
+                cancelled=True,
+                text=getattr(sample, "content", None),
+                exit_reason="cancelled",
+                metadata={"sample_attempts": sample_attempts},
             )
 
         sample = _normalize_sample(sample)
@@ -441,9 +503,6 @@ def run_agent_loop(
                     _archive(on_archive_message, messages[-1])
             return _finish(completed=True, text=final_text)
 
-        if is_cancelled is not None and is_cancelled():
-            return _finish(completed=False, cancelled=True, text=sample.content)
-
         # True prefire overlap: start flush LLM *before* tools run so it
         # shares wall-clock with tool I/O; next ensure() joins the result.
         if context_compactor is not None and sample.tool_calls:
@@ -483,11 +542,11 @@ def run_agent_loop(
             mode_state=mode_state,
             pre_tool_hook=_pre_hook,
             hook_ctx=hctx,
-            is_cancelled=is_cancelled,
+            is_cancelled=_cancel_requested,
             interjection_pending=_inj_pending,
         )
 
-        if is_cancelled is not None and is_cancelled():
+        if _cancel_requested():
             _append_cancelled_tool_results(
                 messages,
                 batch_calls,
@@ -508,7 +567,7 @@ def run_agent_loop(
             cwd=cwd_path,
             session_id=session_id,
             extra=extra,
-            is_cancelled=is_cancelled,
+            is_cancelled=_cancel_requested,
             parallel=True,
         )
 
@@ -725,7 +784,18 @@ def _normalize_sample(sample: SampleResult) -> SampleResult:
     for i, tc in enumerate(sample.tool_calls or []):
         call_id = tc.id or f"call_{uuid4().hex[:12]}"
         args = parse_tool_arguments(tc.arguments)
-        calls.append(ToolCall(id=call_id, name=tc.name, arguments=args))
+        calls.append(
+            ToolCall(
+                id=call_id,
+                name=tc.name,
+                arguments=args,
+                provider_data=(
+                    dict(tc.provider_data)
+                    if isinstance(getattr(tc, "provider_data", None), dict)
+                    else None
+                ),
+            )
+        )
     pdata = getattr(sample, "provider_data", None)
     if not isinstance(pdata, dict) and isinstance(sample.raw, dict):
         pdata = sample.raw.get("provider_data")
@@ -775,6 +845,9 @@ def _sample_with_host_stream(
     messages: list[Message],
     tool_specs: list,
     extra: dict[str, Any],
+    *,
+    is_cancelled: Callable[[], bool] | None = None,
+    cancel_event: Any | None = None,
 ) -> SampleResult:
     """Sample; optional host progressive deltas only.
 
@@ -784,15 +857,37 @@ def _sample_with_host_stream(
     """
     on_delta_host = extra.get("on_sample_delta")
     want_stream = bool(extra.get("stream_sample")) or callable(on_delta_host)
-    if not want_stream:
+
+    def _sample() -> SampleResult:
+        cancelable = getattr(sampler, "sample_cancelable", None)
+        if callable(cancelable):
+            return cancelable(
+                messages,
+                tool_specs,
+                cancel_event=cancel_event,
+            )
         return sampler.sample(messages, tool_specs)
 
-    def _on_delta(chunk: str) -> None:
+    if not want_stream:
+        return _sample()
+
+    def _on_delta(chunk: str) -> bool:
+        token_set = getattr(cancel_event, "is_set", None)
+        if (callable(token_set) and token_set()) or (
+            is_cancelled is not None and is_cancelled()
+        ):
+            return False
+        keep_going = True
         if callable(on_delta_host) and chunk:
             try:
-                on_delta_host(chunk)
+                keep_going = on_delta_host(chunk) is not False
             except Exception:  # noqa: BLE001
                 logger.debug("on_sample_delta failed", exc_info=True)
+        if (callable(token_set) and token_set()) or (
+            is_cancelled is not None and is_cancelled()
+        ):
+            return False
+        return keep_going
 
     if hasattr(sampler, "stream") and hasattr(sampler, "sample"):
         prev_stream = getattr(sampler, "stream", False)
@@ -800,7 +895,7 @@ def _sample_with_host_stream(
         try:
             sampler.stream = True
             sampler.on_delta = _on_delta
-            return sampler.sample(messages, tool_specs)
+            return _sample()
         finally:
             try:
                 sampler.stream = prev_stream
@@ -815,7 +910,7 @@ def _sample_with_host_stream(
         except TypeError:
             return stream_fn(messages, tool_specs)
 
-    return sampler.sample(messages, tool_specs)
+    return _sample()
 
 
 def _drain_interjections_into_messages(

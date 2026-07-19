@@ -13,9 +13,17 @@ import urllib.error
 import urllib.request
 from typing import Any
 
+from codedoggy.model.errors import ModelError, ModelStreamCancelled
 from codedoggy.model.profile import ProviderProfile
 from codedoggy.model.profile_registry import get_profile
 from codedoggy.model.reasoning import extract_reasoning_from_message
+from codedoggy.model.stream_cancel import (
+    HTTPErrorSnapshot,
+    cancellable_read,
+    cancellable_readline,
+    run_cancellable_request,
+    snapshot_http_error,
+)
 from codedoggy.model.types import ChatMessage, CompletionResult, ModelConfig
 
 logger = logging.getLogger(__name__)
@@ -23,14 +31,6 @@ logger = logging.getLogger(__name__)
 # Local models (qwen3, etc.) often wrap reasoning; strip before use.
 _THINK_RE = re.compile(r"<think>[\s\S]*?</think>", re.IGNORECASE)
 _THINK_UNCLOSED_RE = re.compile(r"<think>[\s\S]*$", re.IGNORECASE)
-
-
-class ModelError(Exception):
-    """Transport or API failure talking to a model endpoint."""
-
-    def __init__(self, message: str, *, status: int | None = None) -> None:
-        super().__init__(message)
-        self.status = status
 
 
 def _as_dict_messages(
@@ -85,6 +85,7 @@ class OpenAICompatClient:
         temperature: float | None = None,
         max_tokens: int | None = None,
         tools: list[dict[str, Any]] | None = None,
+        cancel_event: Any | None = None,
     ) -> CompletionResult:
         cfg = self._config
         url = f"{cfg.normalized_base_url()}/chat/completions"
@@ -98,14 +99,19 @@ class OpenAICompatClient:
         headers = self._headers(accept="application/json")
         data = json.dumps(body).encode("utf-8")
         req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+        def _request() -> bytes:
+            try:
+                with urllib.request.urlopen(req, timeout=cfg.timeout_s) as resp:
+                    return cancellable_read(resp, cancel_event)
+            except urllib.error.HTTPError as exc:
+                raise snapshot_http_error(exc, cancel_event, max_body_bytes=500) from None
+
         try:
-            with urllib.request.urlopen(req, timeout=cfg.timeout_s) as resp:
-                raw_bytes = resp.read()
-        except urllib.error.HTTPError as e:
-            err_body = e.read().decode("utf-8", errors="replace") if e.fp else ""
+            raw_bytes = run_cancellable_request(_request, cancel_event)
+        except HTTPErrorSnapshot as e:
             raise ModelError(
-                f"HTTP {e.code} from {url}: {err_body[:500]}",
-                status=e.code,
+                f"HTTP {e.status} from {url}: {e.body[:500]}",
+                status=e.status,
             ) from e
         except urllib.error.URLError as e:
             raise ModelError(f"Failed to reach {url}: {e.reason}") from e
@@ -125,6 +131,7 @@ class OpenAICompatClient:
         max_tokens: int | None = None,
         tools: list[dict[str, Any]] | None = None,
         on_delta: Any | None = None,
+        cancel_event: Any | None = None,
     ) -> CompletionResult:
         """SSE streaming completion (host progressive content).
 
@@ -146,26 +153,38 @@ class OpenAICompatClient:
         headers = self._headers(accept="text/event-stream")
         data = json.dumps(body).encode("utf-8")
         req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+        def _request() -> CompletionResult:
+            try:
+                with urllib.request.urlopen(req, timeout=cfg.timeout_s) as resp:
+                    return _consume_sse_completion(
+                        resp,
+                        model=cfg.model,
+                        on_delta=on_delta,
+                        cancel_event=cancel_event,
+                    )
+            except urllib.error.HTTPError as exc:
+                raise snapshot_http_error(
+                    exc,
+                    cancel_event,
+                    read_body=exc.code not in {400, 404, 422},
+                    max_body_bytes=500,
+                ) from None
+
         try:
-            with urllib.request.urlopen(req, timeout=cfg.timeout_s) as resp:
-                return _consume_sse_completion(
-                    resp,
-                    model=cfg.model,
-                    on_delta=on_delta,
-                )
-        except urllib.error.HTTPError as e:
-            if e.code in {400, 404, 422}:
-                logger.debug("stream rejected (%s); falling back to complete", e.code)
+            return run_cancellable_request(_request, cancel_event)
+        except HTTPErrorSnapshot as e:
+            if e.status in {400, 404, 422}:
+                logger.debug("stream rejected (%s); falling back to complete", e.status)
                 return self.complete(
                     messages,
                     temperature=temperature,
                     max_tokens=max_tokens,
                     tools=tools,
+                    cancel_event=cancel_event,
                 )
-            err_body = e.read().decode("utf-8", errors="replace") if e.fp else ""
             raise ModelError(
-                f"HTTP {e.code} from {url}: {err_body[:500]}",
-                status=e.code,
+                f"HTTP {e.status} from {url}: {e.body[:500]}",
+                status=e.status,
             ) from e
         except urllib.error.URLError as e:
             raise ModelError(f"Failed to reach {url}: {e.reason}") from e
@@ -195,6 +214,15 @@ class OpenAICompatClient:
         wire_msgs = _as_dict_messages(messages)
         if self._profile is not None:
             wire_msgs = self._profile.prepare_messages(wire_msgs, model=cfg.model)
+        # ``provider_data`` is CodeDoggy's opaque replay envelope for native
+        # Anthropic/Responses transports.  It is never a Chat Completions
+        # message field; leaking it after an ecosystem switch causes strict
+        # OpenAI-compatible servers to reject the request.
+        for message in wire_msgs:
+            if isinstance(message, dict):
+                message.pop("provider_data", None)
+                message.pop("codex_reasoning_items", None)
+                message.pop("codex_message_items", None)
 
         body: dict[str, Any] = {
             "model": cfg.model,
@@ -281,6 +309,7 @@ def _consume_sse_completion(
     *,
     model: str,
     on_delta: Any | None,
+    cancel_event: Any | None = None,
 ) -> CompletionResult:
     """Parse OpenAI-compatible SSE chat.completion.chunk stream."""
     content_parts: list[str] = []
@@ -290,9 +319,10 @@ def _consume_sse_completion(
     usage: dict[str, Any] = {}
     model_name = model
     raw_chunks: list[dict[str, Any]] = []
+    saw_terminal = False
 
     while True:
-        line = resp.readline()
+        line = cancellable_readline(resp, cancel_event)
         if not line:
             break
         if isinstance(line, bytes):
@@ -304,12 +334,17 @@ def _consume_sse_completion(
             continue
         payload = line[5:].strip()
         if payload == "[DONE]":
+            saw_terminal = True
             break
         try:
             chunk = json.loads(payload)
         except json.JSONDecodeError:
             continue
         raw_chunks.append(chunk)
+        if chunk.get("error") is not None or chunk.get("type") == "error":
+            error = chunk.get("error") or chunk
+            message = error.get("message") if isinstance(error, dict) else str(error)
+            raise ModelError(f"chat completion stream error: {message or error!r}"[:400])
         if chunk.get("model"):
             model_name = str(chunk["model"])
         if isinstance(chunk.get("usage"), dict):
@@ -320,13 +355,17 @@ def _consume_sse_completion(
         ch0 = choices[0] or {}
         if ch0.get("finish_reason"):
             finish_reason = ch0.get("finish_reason")
+            saw_terminal = True
         delta = ch0.get("delta") or {}
         piece = delta.get("content")
         if isinstance(piece, str) and piece:
             content_parts.append(piece)
             if callable(on_delta):
                 try:
-                    on_delta(piece)
+                    if on_delta(piece) is False:
+                        raise ModelStreamCancelled()
+                except ModelStreamCancelled:
+                    raise
                 except Exception:  # noqa: BLE001
                     logger.debug("on_delta failed", exc_info=True)
         for rkey in ("reasoning_content", "reasoning"):
@@ -352,6 +391,8 @@ def _consume_sse_completion(
                     str(slot["function"].get("arguments") or "") + str(fn["arguments"])
                 )
 
+    if not saw_terminal:
+        raise ModelError("chat completion stream ended before a terminal event")
     text = scrub_model_content("".join(content_parts) or None)
     reasoning = "".join(reasoning_parts).strip() or None
     tool_calls = [tool_acc[i] for i in sorted(tool_acc)]

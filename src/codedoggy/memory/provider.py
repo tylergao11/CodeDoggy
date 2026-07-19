@@ -255,6 +255,9 @@ class SessionFtsProvider(BaseMemoryProvider):
                 session_id=None,
                 cwd=cwd or None,
                 roles=list(self.DEFAULT_ROLES),
+                # Failed/cancelled/aborted partial transcripts remain visible
+                # to explicit session_search, but are not learned as memory.
+                completed_only=True,
             )
         except Exception:
             return ""

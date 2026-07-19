@@ -47,6 +47,7 @@ class WizardAction:
     kind: Literal[
         "none",
         "start_login",
+        "cancel_login",
         "reload_client",
         "close",
         "focus_input",
@@ -106,7 +107,7 @@ class AuthWizard:
             self._build_model()
         elif self.step == WizardStep.WAITING:
             self.items = [
-                MenuItem("cancel", "取消等待", "Esc", enabled=not self.busy, style="danger"),
+                MenuItem("cancel", "取消等待", "Esc", enabled=True, style="danger"),
             ]
         elif self.step == WizardStep.PASTE:
             self.items = [
@@ -127,6 +128,13 @@ class AuthWizard:
             cur = f"当前 {self.active_provider or '—'}/{self.active_model or '—'}"
         self.subtitle = cur or "Provider · Model · 登录 · ↑↓ Enter · Esc"
         items: list[MenuItem] = []
+        active_provider = self.active_provider.strip().lower()
+
+        def status_style(provider: str, *, available: bool) -> str:
+            if provider == active_provider:
+                return "active"
+            return "logged" if available else "offline"
+
         for pid, label, hint in (
             ("grok", "Grok (xAI)", "浏览器 device-code · 订阅优先"),
             ("claude", "Claude", "打开网页 · 需 token/凭证文件"),
@@ -140,7 +148,7 @@ class AuthWizard:
                     pid,
                     f"{label}  {badge}{active}",
                     st.detail or hint,
-                    style="ok" if st.logged_in else "accent",
+                    style=status_style(pid, available=st.logged_in),
                 )
             )
         for pid in ("deepseek", "openai", "ollama", "custom"):
@@ -157,7 +165,10 @@ class AuthWizard:
                     pid,
                     f"{prof.display_name or pid}  {badge}{active}",
                     "API Key 路径" if pid != "ollama" else "本机 Ollama",
-                    style="ok" if (st.logged_in or pid == "ollama") else "muted",
+                    style=status_style(
+                        pid,
+                        available=st.logged_in or pid == "ollama",
+                    ),
                 )
             )
         items.append(MenuItem("refresh", "刷新状态", "重新探测本机凭证", style="muted"))
@@ -289,9 +300,13 @@ class AuthWizard:
             self.cursor = index
 
     def activate(self) -> WizardAction:
-        if not self.items or self.busy:
+        if not self.items:
             return WizardAction()
         item = self.items[self.cursor]
+        if self.busy and not (
+            self.step is WizardStep.WAITING and item.id == "cancel"
+        ):
+            return WizardAction()
         if not item.enabled:
             return WizardAction()
 
@@ -383,7 +398,11 @@ class AuthWizard:
                 self.step = WizardStep.PROVIDER
                 self.cursor = 0
                 self._rebuild()
-                return WizardAction(message="已取消等待", feedback_kind="warning")
+                return WizardAction(
+                    kind="cancel_login",
+                    message="已取消等待",
+                    feedback_kind="warning",
+                )
 
         if self.step == WizardStep.PASTE:
             if item.id == "back":
@@ -415,6 +434,8 @@ class AuthWizard:
 
     def _submit_paste(self) -> WizardAction:
         token = self.paste_buffer.strip()
+        # Secrets must not remain on the wizard object after dispatch.
+        self.paste_buffer = ""
         if not token:
             self.body_note = "输入为空"
             return WizardAction(message="请输入非空内容", feedback_kind="warning")
@@ -496,6 +517,16 @@ class AuthWizard:
         )
 
     def go_back(self) -> WizardAction:
+        if self.busy and self.step is WizardStep.WAITING:
+            self.busy = False
+            self.step = WizardStep.PROVIDER
+            self.cursor = 0
+            self._rebuild()
+            return WizardAction(
+                kind="cancel_login",
+                message="已取消等待",
+                feedback_kind="warning",
+            )
         if self.busy:
             return WizardAction()
         if self.step == WizardStep.HOME:
@@ -550,9 +581,9 @@ def hud_snapshot(current_provider: str | None = None) -> dict[str, Any]:
     }
 
 
-def run_browser_login(provider: str) -> AuthStatus:
+def run_browser_login(provider: str, *, cancel_event: Any | None = None) -> AuthStatus:
     """Blocking browser login — call from worker thread."""
-    return begin_login(provider)
+    return begin_login(provider, cancel_event=cancel_event)
 
 
 def reload_chat_client(provider: str | None = None) -> Any:

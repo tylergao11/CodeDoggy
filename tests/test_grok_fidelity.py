@@ -176,9 +176,15 @@ def test_image_gen_reports_not_supported_without_api_key(
         "XAI_API_KEY",
         "CODEDOGGY_API_KEY",
         "OPENAI_API_KEY",
+        "CODEDOGGY_PROVIDER",
+        "CODEDOGGY_MODEL_PROVIDER",
     ):
         monkeypatch.delenv(k, raising=False)
     monkeypatch.setenv("CODEDOGGY_IMAGINE_ENABLED", "1")
+    monkeypatch.setattr(
+        "codedoggy.tools.util.imagine_api.resolve_provider_token",
+        lambda *_a, **_k: (None, ""),
+    )
     tools = ToolRegistryBuilder.new().finalize()
     ctx = ToolCallContext(cwd=tmp_path)
     with pytest.raises(ToolError) as ei:

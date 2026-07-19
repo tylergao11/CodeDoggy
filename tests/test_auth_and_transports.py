@@ -142,6 +142,8 @@ def test_grok_oauth_beats_api_key(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
     assert cred is not None
     assert cred.token == "oauth-session-token"
     assert cred.kind == AUTH_OAUTH
+    assert cred.headers["x-grok-client-version"] == "0.2.102"
+    assert cred.headers["x-grok-client-identifier"] == "grok-shell"
 
 
 def test_grok_force_api_key(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

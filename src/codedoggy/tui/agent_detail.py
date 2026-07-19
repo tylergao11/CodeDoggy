@@ -10,10 +10,13 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass, replace
+from collections.abc import Callable
 from typing import Any, Iterable, Literal
 
 from prompt_toolkit.formatted_text import StyleAndTextTuples
 from prompt_toolkit.utils import get_cwidth
+
+from codedoggy.tui.open_path import paths_from_detail_record
 
 
 DetailCategory = Literal["message", "tool", "file", "test"]
@@ -65,6 +68,8 @@ DETAIL_STYLE_RULES = {
     "detail.success": "bg:#071318 #16dfe8",
     "detail.error": "bg:#071318 #ff2d9a",
     "detail.warning": "bg:#071318 #ffd43b",
+    "detail.link": "bg:#0b0b0d #16dfe8 bold underline",
+    "detail.link.hint": "bg:#0b0b0d #ff9a3c bold",
 }
 
 
@@ -285,8 +290,13 @@ def render_detail_body(
     width: int,
     *,
     active_filter: DetailFilter = "all",
+    path_mouse: Callable[[str], Any] | None = None,
 ) -> StyleAndTextTuples:
-    """Render every selected record without summarizing or truncating bodies."""
+    """Render every selected record without summarizing or truncating bodies.
+
+    ``path_mouse(path)`` optional: returns a prompt_toolkit mouse handler so
+    image_gen paths open in the OS viewer on click (Grok-style link affordance).
+    """
 
     width = max(12, width)
     records = filter_detail_records(snapshot.records, active_filter)
@@ -303,6 +313,24 @@ def render_detail_body(
                 ]
             )
         fragments.extend(_render_record(record, width))
+        if path_mouse is not None:
+            for image_path in paths_from_detail_record(record):
+                short = image_path
+                try:
+                    from pathlib import Path as _P
+
+                    short = _P(image_path).name or image_path
+                except Exception:  # noqa: BLE001
+                    pass
+                label = f"  ╭ ∪ 点击打开 {short} ╮"
+                label = _truncate_display(label, width)
+                handler = path_mouse(image_path)
+                if handler is not None:
+                    fragments.append(("class:detail.link.hint", label, handler))
+                    fragments.append(("", "\n"))
+                    hint = _truncate_display(f"     {image_path}", width)
+                    fragments.append(("class:detail.link", hint, handler))
+                    fragments.append(("", "\n"))
     return fragments
 
 

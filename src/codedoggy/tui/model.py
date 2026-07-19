@@ -127,5 +127,44 @@ class TaskLedger:
             if description is not None:
                 agent.description = description.strip()
 
+    def update_live_agent(
+        self,
+        task_id: str,
+        agent_id: str,
+        *,
+        label: str,
+        status: str,
+        output: str | None = None,
+        description: str | None = None,
+    ) -> bool:
+        """Apply a non-terminal callback only while its task/agent is live.
+
+        Model stream owners are intentionally abandonable on cancellation.  A
+        callback already in flight may therefore arrive after the turn commits
+        its terminal state.  This atomic ledger fence prevents that old write
+        from reviving a completed/failed/cancelled card as ``running``.
+        """
+        with self._lock:
+            task = self._find_task(task_id)
+            if task is None or task.status in {"completed", "failed", "cancelled"}:
+                return False
+            agent = next((item for item in task.agents if item.id == agent_id), None)
+            if agent is not None and agent.status in {
+                "completed",
+                "failed",
+                "cancelled",
+            }:
+                return False
+            if agent is None:
+                agent = AgentView(id=agent_id, label=label.strip().upper() or "AGENT")
+                task.agents.append(agent)
+            agent.label = label.strip().upper() or agent.label
+            agent.status = status
+            if output is not None:
+                agent.output = output.strip()
+            if description is not None:
+                agent.description = description.strip()
+            return True
+
     def _find_task(self, task_id: str) -> TaskView | None:
         return next((item for item in self._tasks if item.id == task_id), None)

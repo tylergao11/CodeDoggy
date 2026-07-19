@@ -81,6 +81,7 @@ class RuntimeKernel:
     _MANAGED_TOOL_EXTRA_KEYS: frozenset[str] = frozenset(
         {
             "kernel",
+            "connection",
             "memory_store",
             "session_store",
             "policy",
@@ -128,6 +129,9 @@ class RuntimeKernel:
         """
         prev = dict(self.tool_extra or {})
         extra: dict[str, Any] = {"kernel": self}
+        # Media / search extras follow ActiveConnection (same login as MAIN chat).
+        if self.connection is not None:
+            extra["connection"] = self.connection
         if self.memory is not None:
             extra["memory_store"] = self.memory
         if self.session_store is not None:
@@ -281,6 +285,23 @@ class RuntimeKernel:
                 clear = getattr(self.turn_runner, "clear_live_history", None)
                 if callable(clear):
                     clear()
+        # A new session is a context lifetime boundary, not only a transcript
+        # id change.  Otherwise iterative summary/checkpoint state can inject
+        # the previous session into the first fold or rewind of the new one.
+        seen_contexts: set[int] = set()
+        for context in (
+            self.context,
+            getattr(self.turn_runner, "context_compactor", None),
+        ):
+            if context is None or id(context) in seen_contexts:
+                continue
+            seen_contexts.add(id(context))
+            reset = getattr(context, "on_session_end", None)
+            if callable(reset):
+                try:
+                    reset()
+                except Exception:  # noqa: BLE001
+                    logger.exception("context reset at session boundary failed")
         # Archive boundary on store if present
         if self.session_store is not None:
             try:
@@ -346,8 +367,12 @@ class RuntimeKernel:
         if self.session_store is None or self.turn_runner is None:
             return 0
         try:
-            get_tail = getattr(self.session_store, "get_messages_tail", None)
-            if callable(get_tail):
+            get_snapshot = getattr(self.session_store, "get_context_snapshot", None)
+            rows = get_snapshot(self.session_id) if callable(get_snapshot) else []
+            if rows:
+                pass
+            elif callable(getattr(self.session_store, "get_messages_tail", None)):
+                get_tail = self.session_store.get_messages_tail
                 rows = get_tail(self.session_id, limit=limit)
             else:
                 # Fallback: load all then slice tail (small stores only)
@@ -366,7 +391,7 @@ class RuntimeKernel:
         messages = sanitize_tool_pairs(messages)
         self.turn_runner.live_messages = messages
         logger.info(
-            "kernel hydrated session_id=%s messages=%s (tail)",
+            "kernel hydrated session_id=%s messages=%s (canonical-or-tail)",
             self.session_id,
             len(messages),
         )
@@ -399,7 +424,7 @@ class RuntimeKernel:
                     candidates = {
                         "wait": True,
                         "cancel_running": True,
-                        "timeout_s": None,
+                        "timeout_s": 5.0,
                     }
                     try:
                         params = inspect.signature(shutdown).parameters
@@ -428,6 +453,16 @@ class RuntimeKernel:
                     close_mcp()
                 except Exception:  # noqa: BLE001
                     logger.exception("MCP runtime shutdown failed")
+        # Stop background shell/process producers before persisting Graph or
+        # tearing down the memory/context consumers they may still reference.
+        tm = self.task_manager
+        if tm is not None:
+            close_tm = getattr(tm, "close", None)
+            if callable(close_tm):
+                try:
+                    close_tm()
+                except Exception:  # noqa: BLE001
+                    logger.exception("task_manager close failed")
         # Drain prefire / context.  The runner normally references the same
         # compactor as ``self.context``; call each identity once.
         seen_contexts: set[int] = set()
@@ -489,15 +524,6 @@ class RuntimeKernel:
                         stop()
                     except Exception:  # noqa: BLE001
                         pass
-        # Background shell tasks
-        tm = self.task_manager
-        if tm is not None:
-            close_tm = getattr(tm, "close", None)
-            if callable(close_tm):
-                try:
-                    close_tm()
-                except Exception:  # noqa: BLE001
-                    logger.exception("task_manager close failed")
         # Session archive SQLite
         ss = self.session_store
         if ss is not None:
@@ -551,6 +577,11 @@ def _row_to_message(row: dict[str, Any]) -> Message:
                     id=str(tc.get("id") or ""),
                     name=str(tc.get("name") or ""),
                     arguments=args,
+                    provider_data=(
+                        dict(tc["provider_data"])
+                        if isinstance(tc.get("provider_data"), dict)
+                        else None
+                    ),
                 )
             )
     return Message(
@@ -559,4 +590,10 @@ def _row_to_message(row: dict[str, Any]) -> Message:
         name=row.get("tool_name") or row.get("name"),
         tool_call_id=row.get("tool_call_id"),
         tool_calls=tool_calls,
+        reasoning_content=row.get("reasoning_content"),
+        provider_data=(
+            dict(row["provider_data"])
+            if isinstance(row.get("provider_data"), dict)
+            else None
+        ),
     )

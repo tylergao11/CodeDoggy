@@ -22,10 +22,15 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
 from codedoggy.model.codex_event_projector import CodexEventProjector
+from codedoggy.model.errors import ModelStreamCancelled
 from codedoggy.model.openai_compat import ModelError
 from codedoggy.model.profile import ProviderProfile
 from codedoggy.model.profile_registry import get_profile
 from codedoggy.model.redact import redact_sensitive_text
+from codedoggy.model.stream_cancel import (
+    cancellation_requested,
+    run_cancellable_request,
+)
 from codedoggy.model.types import ChatMessage, CompletionResult, ModelConfig
 
 logger = logging.getLogger(__name__)
@@ -91,6 +96,7 @@ class TurnResult:
     model_context_window: Optional[int] = None
     compacted: bool = False
     should_retire: bool = False
+    completed: bool = False
 
 
 @dataclass
@@ -567,6 +573,7 @@ class CodexAppServerSession:
         notification_poll_timeout: float = 0.25,
         post_tool_quiet_timeout: float = 90.0,
         model: str | None = None,
+        cancel_event: Any | None = None,
     ) -> TurnResult:
         result = TurnResult()
         try:
@@ -619,7 +626,7 @@ class CodexAppServerSession:
         last_tool_completion_at: float | None = None
 
         while time.monotonic() < deadline and not turn_complete:
-            if self._interrupt_event.is_set():
+            if self._interrupt_event.is_set() or cancellation_requested(cancel_event):
                 self._issue_interrupt(result.turn_id)
                 result.interrupted = True
                 break
@@ -718,6 +725,8 @@ class CodexAppServerSession:
                 turn_complete = True
                 turn_obj = (note.get("params") or {}).get("turn") or {}
                 turn_status = turn_obj.get("status")
+                if turn_status in {None, "completed"}:
+                    result.completed = True
                 if turn_status and turn_status not in {
                     "completed",
                     "interrupted",
@@ -739,18 +748,6 @@ class CodexAppServerSession:
                         )
                 if turn_status == "interrupted":
                     result.interrupted = True
-
-        if (
-            not turn_complete
-            and not result.interrupted
-            and result.final_text
-            and result.error is None
-        ):
-            logger.warning(
-                "codex app-server turn reached deadline after assistant "
-                "text but before turn/completed; accepting final text"
-            )
-            turn_complete = True
 
         if not turn_complete and not result.interrupted:
             self._issue_interrupt(result.turn_id)
@@ -878,7 +875,20 @@ class CodexAppServerClient:
         temperature: float | None = None,
         max_tokens: int | None = None,
         tools: list[dict[str, Any]] | None = None,
+        cancel_event: Any | None = None,
     ) -> CompletionResult:
+        return run_cancellable_request(
+            lambda: self._complete_owned(messages, cancel_event=cancel_event),
+            cancel_event,
+        )
+
+    def _complete_owned(
+        self,
+        messages: list[ChatMessage] | list[dict[str, Any]],
+        *,
+        cancel_event: Any | None,
+    ) -> CompletionResult:
+        """Own app-server process + turn on the abandonable request worker."""
         if not shutil.which(self._codex_bin):
             raise ModelError(
                 f"codex binary not found ({self._codex_bin!r}). "
@@ -895,9 +905,18 @@ class CodexAppServerClient:
                 user_text,
                 turn_timeout=float(self._config.timeout_s or 120),
                 model=self._config.model,
+                cancel_event=cancel_event,
             )
-            if turn.error and not turn.final_text:
+            if cancellation_requested(cancel_event):
+                raise ModelStreamCancelled()
+            if turn.error:
                 raise ModelError(f"codex app-server failed: {turn.error}")
+            if turn.interrupted:
+                raise ModelError("codex app-server turn was interrupted")
+            if not turn.completed:
+                raise ModelError(
+                    "codex app-server ended without a successful turn/completed event"
+                )
             usage = {}
             if turn.token_usage_last:
                 u = turn.token_usage_last
@@ -916,7 +935,7 @@ class CodexAppServerClient:
             return CompletionResult(
                 content=turn.final_text or None,
                 model=self._config.model,
-                finish_reason="stop" if not turn.interrupted else "interrupted",
+                finish_reason="stop",
                 tool_calls=[],
                 raw={
                     "codex_app_server": True,
@@ -927,9 +946,12 @@ class CodexAppServerClient:
                     "error": turn.error,
                     "should_retire": turn.should_retire,
                     "compacted": turn.compacted,
+                    "completed": turn.completed,
                 },
                 usage=usage,
             )
+        except ModelStreamCancelled:
+            raise
         except (CodexAppServerError, TimeoutError, OSError) as exc:
             raise ModelError(f"codex app-server failed: {exc}") from exc
         finally:

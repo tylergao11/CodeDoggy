@@ -39,6 +39,15 @@ from codedoggy.tools.grok_build.web_search import (
     extract_output_text,
     format_prompt_output,
 )
+from codedoggy.tools.util.active_auth import (
+    connection_fields,
+    connection_from_extra,
+    is_xai_endpoint,
+    resolve_base_for_provider,
+    resolve_provider_token,
+    search_api_family,
+    unsupported_search_reason,
+)
 
 DEFAULT_TIMEOUT_S = 120.0
 
@@ -74,6 +83,7 @@ class WebSearchConfig:
     reason_disabled: str = ""
     # Honest CodeDoggy-only override (not Grok): GET backend returning text/JSON
     custom_search_url: str | None = None
+    provider: str = ""
 
     def is_enabled(self) -> bool:
         return self.enabled
@@ -90,6 +100,7 @@ class WebSearchConfig:
                 timeout_s=self.timeout_s,
                 reason_disabled=self.reason_disabled,
                 custom_search_url=self.custom_search_url,
+                provider=self.provider,
             )
         return WebSearchConfig(
             enabled=True,
@@ -100,6 +111,115 @@ class WebSearchConfig:
             timeout_s=self.timeout_s,
             reason_disabled="",
             custom_search_url=self.custom_search_url,
+            provider=self.provider,
+        )
+
+    @classmethod
+    def resolve(cls, extra: dict[str, Any] | None = None) -> WebSearchConfig:
+        """Prefer ActiveConnection; fall back to env for headless/tests."""
+        bag = extra or {}
+        override = bag.get("web_search_config")
+        if isinstance(override, WebSearchConfig):
+            return override
+        conn = connection_from_extra(bag)
+        if conn is not None:
+            return cls.from_connection(conn)
+        return cls.from_env()
+
+    @classmethod
+    def from_connection(cls, connection: Any) -> WebSearchConfig:
+        """Bind web search to the same login/API the user selected for chat."""
+        custom = os.environ.get("CODEDOGGY_WEB_SEARCH_URL", "").strip() or None
+        flag = os.environ.get("CODEDOGGY_WEB_SEARCH_ENABLED", "1").strip().lower()
+        if flag in {"0", "false", "off", "no"}:
+            return cls(
+                enabled=False,
+                base_url="",
+                api_key=None,
+                model=DEFAULT_WEB_SEARCH_MODEL,
+                reason_disabled="CODEDOGGY_WEB_SEARCH_ENABLED is off",
+                custom_search_url=custom,
+            )
+
+        provider, conn_base, chat_model = connection_fields(connection)
+        timeout = _web_search_timeout()
+        # Dedicated media/search base only — never steal XAI_BASE_URL from env.
+        override_base = (
+            os.environ.get("CODEDOGGY_WEB_SEARCH_BASE_URL") or ""
+        ).strip().rstrip("/")
+        base = override_base or resolve_base_for_provider(provider, conn_base)
+        model = _web_search_model(base_url=base, chat_model=chat_model)
+
+        if custom and not provider:
+            return cls(
+                enabled=True,
+                base_url=base or "",
+                api_key=None,
+                model=model,
+                timeout_s=timeout,
+                custom_search_url=custom,
+            )
+
+        key, key_source = resolve_provider_token(provider) if provider else (None, "")
+        if custom and not key:
+            return cls(
+                enabled=True,
+                base_url=base or "",
+                api_key=None,
+                model=model,
+                timeout_s=timeout,
+                custom_search_url=custom,
+                provider=provider,
+            )
+        if not key:
+            return cls(
+                enabled=False,
+                base_url=base or "",
+                api_key=None,
+                model=model,
+                timeout_s=timeout,
+                custom_search_url=custom,
+                provider=provider,
+                reason_disabled=(
+                    f"Web search follows your active connection ({provider or 'none'}), "
+                    "but that login has no usable credential. Re-auth via Ctrl+L, "
+                    "or set CODEDOGGY_WEB_SEARCH_URL for a custom GET backend."
+                ),
+            )
+        if not base and not custom:
+            return cls(
+                enabled=False,
+                base_url="",
+                api_key=None,
+                model=model,
+                timeout_s=timeout,
+                custom_search_url=custom,
+                provider=provider,
+                reason_disabled=(
+                    f"Web search follows connection ({provider}) but has no base_url."
+                ),
+            )
+        family = search_api_family(base, provider=provider, custom_url=custom)
+        if family == "unsupported":
+            return cls(
+                enabled=False,
+                base_url=base or "",
+                api_key=None,
+                model=model,
+                timeout_s=timeout,
+                custom_search_url=custom,
+                provider=provider,
+                reason_disabled=unsupported_search_reason(provider, base),
+            )
+        return cls(
+            enabled=True,
+            base_url=base,
+            api_key=key,
+            model=model,
+            timeout_s=timeout,
+            custom_search_url=custom,
+            provider=provider,
+            reason_disabled=f"auth={key_source} provider={provider}",
         )
 
     @classmethod
@@ -109,62 +229,72 @@ class WebSearchConfig:
         if flag in {"0", "false", "off", "no"}:
             return cls(
                 enabled=False,
-                base_url=DEFAULT_BASE_URL,
+                base_url="",
                 api_key=None,
                 model=DEFAULT_WEB_SEARCH_MODEL,
                 reason_disabled="CODEDOGGY_WEB_SEARCH_ENABLED is off",
                 custom_search_url=custom,
             )
-        key = (
-            os.environ.get("CODEDOGGY_WEB_SEARCH_API_KEY")
-            or os.environ.get("XAI_API_KEY")
-            or os.environ.get("CODEDOGGY_API_KEY")
-            or os.environ.get("OPENAI_API_KEY")
+        provider = (
+            os.environ.get("CODEDOGGY_PROVIDER")
+            or os.environ.get("CODEDOGGY_MODEL_PROVIDER")
             or ""
-        ).strip() or None
+        ).strip().lower()
+        # Dedicated search key only, then the active provider's own credential.
+        key = (os.environ.get("CODEDOGGY_WEB_SEARCH_API_KEY") or "").strip() or None
+        key_source = "env:CODEDOGGY_WEB_SEARCH_API_KEY" if key else ""
+        if not key and provider:
+            key, key_source = resolve_provider_token(provider)
         base = (
-            os.environ.get("CODEDOGGY_WEB_SEARCH_BASE_URL")
-            or os.environ.get("XAI_BASE_URL")
-            or DEFAULT_BASE_URL
+            os.environ.get("CODEDOGGY_WEB_SEARCH_BASE_URL") or ""
         ).strip().rstrip("/")
-        model = (
-            os.environ.get("CODEDOGGY_WEB_SEARCH_MODEL")
-            or os.environ.get("GROK_WEB_SEARCH_MODEL")
-            or DEFAULT_WEB_SEARCH_MODEL
-        ).strip() or DEFAULT_WEB_SEARCH_MODEL
-        timeout = DEFAULT_TIMEOUT_S
-        raw_t = os.environ.get("CODEDOGGY_WEB_SEARCH_TIMEOUT_S", "").strip()
-        if raw_t:
-            try:
-                timeout = float(raw_t)
-            except ValueError:
-                pass
+        if not base and provider:
+            base = resolve_base_for_provider(provider, "")
+        if not base and key and not provider:
+            base = DEFAULT_BASE_URL
+        model = _web_search_model(base_url=base, chat_model="")
+        timeout = _web_search_timeout()
 
         # Custom URL is a real HTTP backend; allow without Responses key.
         if custom and not key:
             return cls(
                 enabled=True,
-                base_url=base,
+                base_url=base or "",
                 api_key=None,
                 model=model,
                 timeout_s=timeout,
                 custom_search_url=custom,
+                provider=provider,
             )
 
         if not key:
             return cls(
                 enabled=False,
-                base_url=base,
+                base_url=base or "",
                 api_key=None,
                 model=model,
                 timeout_s=timeout,
                 custom_search_url=custom,
+                provider=provider,
                 reason_disabled=(
-                    "Web search is not supported: no API key configured. "
-                    "Set CODEDOGGY_WEB_SEARCH_API_KEY (or XAI_API_KEY / "
-                    "CODEDOGGY_API_KEY / OPENAI_API_KEY) for the Responses API "
-                    f"web_search tool (default base {DEFAULT_BASE_URL}), "
+                    "Web search is not supported: no API key or login for the active "
+                    "provider. Log in via Ctrl+L (same connection as chat) or set "
+                    "CODEDOGGY_WEB_SEARCH_API_KEY, or set CODEDOGGY_PROVIDER and log in, "
                     "or set CODEDOGGY_WEB_SEARCH_URL for a custom GET backend."
+                ),
+            )
+        if not base and not custom:
+            return cls(
+                enabled=False,
+                base_url="",
+                api_key=None,
+                model=model,
+                timeout_s=timeout,
+                custom_search_url=custom,
+                provider=provider,
+                reason_disabled=(
+                    "Web search has a credential but no base_url. "
+                    "Set CODEDOGGY_WEB_SEARCH_BASE_URL or log in with a connection."
                 ),
             )
         return cls(
@@ -174,7 +304,37 @@ class WebSearchConfig:
             model=model,
             timeout_s=timeout,
             custom_search_url=custom,
+            provider=provider,
+            reason_disabled=f"auth={key_source}" if key_source else "",
         )
+
+
+def _web_search_timeout() -> float:
+    timeout = DEFAULT_TIMEOUT_S
+    raw_t = os.environ.get("CODEDOGGY_WEB_SEARCH_TIMEOUT_S", "").strip()
+    if raw_t:
+        try:
+            timeout = float(raw_t)
+        except ValueError:
+            pass
+    return timeout
+
+
+def _web_search_model(*, base_url: str, chat_model: str) -> str:
+    """Env override → connection chat model → xAI default only on xAI hosts."""
+    explicit = (
+        os.environ.get("CODEDOGGY_WEB_SEARCH_MODEL")
+        or os.environ.get("GROK_WEB_SEARCH_MODEL")
+        or ""
+    ).strip()
+    if explicit:
+        return explicit
+    if chat_model.strip():
+        return chat_model.strip()
+    if is_xai_endpoint(base_url) or not base_url:
+        return DEFAULT_WEB_SEARCH_MODEL
+    # Non-xAI OpenAI-shaped Responses hosts: use whatever the connection already uses.
+    return chat_model.strip() or DEFAULT_WEB_SEARCH_MODEL
 
 
 @dataclass

@@ -10,12 +10,13 @@ Not a full UI rewind product — a harness API:
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 from pathlib import Path
 from typing import Any
 
-from codedoggy.turn.types import Message, Role
+from codedoggy.turn.types import Message, Role, ToolCall
 
 logger = logging.getLogger(__name__)
 
@@ -35,19 +36,29 @@ def parse_segment_file(path: Path | str) -> list[Message]:
     messages: list[Message] = []
     current_role: Role | None = None
     name: str | None = None
+    tool_call_id: str | None = None
+    tool_calls: list[ToolCall] | None = None
     buf: list[str] = []
 
     def flush() -> None:
-        nonlocal current_role, name, buf
+        nonlocal current_role, name, tool_call_id, tool_calls, buf
         if current_role is None:
             buf = []
             return
         content = "\n".join(buf).strip()
         messages.append(
-            Message(role=current_role, content=content or None, name=name)
+            Message(
+                role=current_role,
+                content=content or None,
+                name=name,
+                tool_call_id=tool_call_id,
+                tool_calls=tool_calls,
+            )
         )
         current_role = None
         name = None
+        tool_call_id = None
+        tool_calls = None
         buf = []
 
     for line in text.splitlines():
@@ -61,6 +72,29 @@ def parse_segment_file(path: Path | str) -> list[Message]:
             continue
         if line.startswith("name:") and current_role is not None and not buf:
             name = line.split(":", 1)[1].strip() or None
+            continue
+        if line.startswith("tool_call_id:") and current_role is not None and not buf:
+            tool_call_id = line.split(":", 1)[1].strip() or None
+            continue
+        if line.startswith("tool_calls_json:") and current_role is not None and not buf:
+            try:
+                raw_calls = json.loads(line.split(":", 1)[1].strip())
+                tool_calls = [
+                    ToolCall(
+                        id=str(item.get("id") or ""),
+                        name=str(item.get("name") or ""),
+                        arguments=item.get("arguments") or {},
+                        provider_data=(
+                            dict(item["provider_data"])
+                            if isinstance(item.get("provider_data"), dict)
+                            else None
+                        ),
+                    )
+                    for item in raw_calls
+                    if isinstance(item, dict)
+                ]
+            except (json.JSONDecodeError, TypeError, ValueError):
+                tool_calls = None
             continue
         if line.startswith("- tool_call") or line.startswith("time:") or line.startswith(
             "messages:"

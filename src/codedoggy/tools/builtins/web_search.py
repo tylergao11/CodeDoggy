@@ -107,7 +107,10 @@ class WebSearchTool(Tool):
             return _coerce_client_result(query, raw, allowed_domains)
 
         try:
-            result = api_search(query, allowed_domains=allowed_domains)
+            from codedoggy.tools.util.web_search_api import WebSearchConfig
+
+            cfg = WebSearchConfig.resolve(ctx.extra)
+            result = api_search(query, allowed_domains=allowed_domains, config=cfg)
         except WebSearchNotSupported as e:
             raise ToolError(e.message, code=e.code) from e
         except WebSearchError as e:

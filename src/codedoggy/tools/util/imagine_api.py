@@ -1,22 +1,27 @@
-"""xAI Imagine API client (tool-layer).
+"""Image generation HTTP client (tool-layer).
 
 Ported from:
   crates/codegen/xai-grok-tools/src/implementations/grok_build/image_gen/mod.rs
   crates/codegen/xai-grok-tools/src/implementations/grok_build/image_edit/mod.rs
 
-Grok image_gen / image_edit use the real xAI HTTP API:
+Wire:
   POST {base_url}/images/generations
   POST {base_url}/images/edits
 
-Default base: https://api.x.ai/v1
-Default model: grok-imagine-image-quality
+Auth product rule
+-----------------
+Config follows the session **ActiveConnection** (Ctrl+L / login wizard pick).
+Tools never steal another provider's env key or OAuth session.
 
-Config (env, first wins for key):
-  CODEDOGGY_IMAGINE_API_KEY | XAI_API_KEY | CODEDOGGY_API_KEY | OPENAI_API_KEY
-  CODEDOGGY_IMAGINE_BASE_URL | XAI_BASE_URL  (default https://api.x.ai/v1)
-  CODEDOGGY_IMAGINE_MODEL     (default grok-imagine-image-quality)
-  CODEDOGGY_IMAGINE_ENABLED   (0/false to force disable)
-  CODEDOGGY_IMAGINE_TIMEOUT_S (default 300)
+Resolution order for ``ImagineConfig.resolve(extra)``:
+  1. ``extra['imagine_config']`` (test/host override)
+  2. ``extra['connection']`` / ``kernel.connection`` → ``from_connection``
+  3. ``from_env`` (CLI / unit tests without a session)
+
+Payload family (endpoint-derived via ``image_api_family``):
+  - xai     → Grok Imagine fields (aspect_ratio, resolution)
+  - openai  → OpenAI Images fields (size)
+  - unsupported → disabled with a clear reason (no silent Grok fallback)
 """
 
 from __future__ import annotations
@@ -30,11 +35,36 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Any
 
-# Grok: XAI_IMAGINE_MODEL
-DEFAULT_BASE = "https://api.x.ai/v1"
-DEFAULT_MODEL = "grok-imagine-image-quality"
-# Grok: IMAGE_GEN_TIMEOUT_SECS = 300
+from codedoggy.tools.util.active_auth import (
+    ImageApiFamily,
+    connection_fields,
+    connection_from_extra,
+    image_api_family,
+    is_xai_endpoint,
+    resolve_base_for_provider,
+    resolve_provider_token,
+    unsupported_image_reason,
+)
+
+DEFAULT_XAI_BASE = "https://api.x.ai/v1"
+DEFAULT_XAI_IMAGE_MODEL = "grok-imagine-image-quality"
+DEFAULT_OPENAI_COMPAT_IMAGE_MODEL = "gpt-image-1"
+# Back-compat names used by tests / older imports
+DEFAULT_BASE = DEFAULT_XAI_BASE
+DEFAULT_MODEL = DEFAULT_XAI_IMAGE_MODEL
 DEFAULT_TIMEOUT_S = 300.0
+
+# OpenAI Images size map from aspect_ratio hints.
+_ASPECT_TO_OPENAI_SIZE: dict[str, str] = {
+    "auto": "1024x1024",
+    "1:1": "1024x1024",
+    "16:9": "1792x1024",
+    "9:16": "1024x1792",
+    "3:2": "1536x1024",
+    "2:3": "1024x1536",
+    "4:3": "1536x1024",
+    "3:4": "1024x1536",
+}
 
 
 class ImagineNotSupported(Exception):
@@ -61,53 +91,177 @@ class ImagineConfig:
     model: str
     timeout_s: float = DEFAULT_TIMEOUT_S
     reason_disabled: str = ""
+    provider: str = ""
+    family: ImageApiFamily = "unsupported"
 
     @classmethod
-    def from_env(cls) -> ImagineConfig:
-        flag = os.environ.get("CODEDOGGY_IMAGINE_ENABLED", "1").strip().lower()
-        if flag in {"0", "false", "off", "no"}:
+    def resolve(cls, extra: dict[str, Any] | None = None) -> ImagineConfig:
+        """Prefer session connection; fall back to env for headless/tests."""
+        bag = extra or {}
+        override = bag.get("imagine_config")
+        if isinstance(override, ImagineConfig):
+            return override
+        conn = connection_from_extra(bag)
+        if conn is not None:
+            return cls.from_connection(conn)
+        return cls.from_env()
+
+    @classmethod
+    def from_connection(cls, connection: Any) -> ImagineConfig:
+        """Bind image API to the user's selected login/API connection only."""
+        if _flag_off("CODEDOGGY_IMAGINE_ENABLED"):
+            return cls._disabled("CODEDOGGY_IMAGINE_ENABLED is off")
+
+        provider, conn_base, _chat_model = connection_fields(connection)
+        if not provider:
+            return cls._disabled(
+                "Image generation has no active connection. "
+                "Log in via Ctrl+L and select a provider first."
+            )
+
+        base = resolve_base_for_provider(provider, conn_base)
+        # Explicit media base only — never XAI_BASE_URL (chat profile env).
+        media_base = (os.environ.get("CODEDOGGY_IMAGINE_BASE_URL") or "").strip().rstrip("/")
+        if media_base:
+            base = media_base
+
+        if not base:
             return cls(
                 enabled=False,
-                base_url=DEFAULT_BASE,
+                base_url="",
                 api_key=None,
-                model=DEFAULT_MODEL,
-                reason_disabled="CODEDOGGY_IMAGINE_ENABLED is off",
+                model="",
+                timeout_s=_timeout_from_env(),
+                provider=provider,
+                family="unsupported",
+                reason_disabled=(
+                    f"Image generation follows connection ({provider}) but has no "
+                    f"base_url. Set the provider endpoint or CODEDOGGY_IMAGINE_BASE_URL."
+                ),
             )
-        key = (
-            os.environ.get("CODEDOGGY_IMAGINE_API_KEY")
-            or os.environ.get("XAI_API_KEY")
-            or os.environ.get("CODEDOGGY_API_KEY")
-            or os.environ.get("OPENAI_API_KEY")
-            or ""
-        ).strip() or None
-        base = (
-            os.environ.get("CODEDOGGY_IMAGINE_BASE_URL")
-            or os.environ.get("XAI_BASE_URL")
-            or DEFAULT_BASE
-        ).strip().rstrip("/")
-        model = (
-            os.environ.get("CODEDOGGY_IMAGINE_MODEL") or DEFAULT_MODEL
-        ).strip() or DEFAULT_MODEL
-        timeout = DEFAULT_TIMEOUT_S
-        raw_t = os.environ.get("CODEDOGGY_IMAGINE_TIMEOUT_S", "").strip()
-        if raw_t:
-            try:
-                timeout = float(raw_t)
-            except ValueError:
-                pass
+
+        family = image_api_family(base, provider=provider)
+        model = _image_model_for_family(family, base)
+        if family == "unsupported":
+            return cls(
+                enabled=False,
+                base_url=base,
+                api_key=None,
+                model=model,
+                timeout_s=_timeout_from_env(),
+                provider=provider,
+                family=family,
+                reason_disabled=unsupported_image_reason(provider, base),
+            )
+
+        key, key_source = resolve_provider_token(provider)
         if not key:
             return cls(
                 enabled=False,
                 base_url=base,
                 api_key=None,
                 model=model,
-                timeout_s=timeout,
+                timeout_s=_timeout_from_env(),
+                provider=provider,
+                family=family,
                 reason_disabled=(
-                    "Image generation is not supported: no API key configured. "
-                    "Set CODEDOGGY_IMAGINE_API_KEY (or XAI_API_KEY / CODEDOGGY_API_KEY / "
-                    "OPENAI_API_KEY) and optionally CODEDOGGY_IMAGINE_BASE_URL "
-                    f"(default {DEFAULT_BASE})."
+                    f"Image generation follows your active connection ({provider}), "
+                    f"but that login has no usable credential. Re-auth via Ctrl+L "
+                    f"or set the API key for {provider}."
                 ),
+            )
+
+        return cls(
+            enabled=True,
+            base_url=base,
+            api_key=key,
+            model=model,
+            timeout_s=_timeout_from_env(),
+            provider=provider,
+            family=family,
+            reason_disabled=f"auth={key_source} provider={provider} family={family}",
+        )
+
+    @classmethod
+    def from_env(cls) -> ImagineConfig:
+        """Headless / test path when no session connection is injected.
+
+        Credential order (never steals another provider's key when provider is set):
+          1. CODEDOGGY_IMAGINE_API_KEY (dedicated media override)
+          2. resolve_credential(CODEDOGGY_PROVIDER) when provider is set
+        """
+        if _flag_off("CODEDOGGY_IMAGINE_ENABLED"):
+            return cls._disabled("CODEDOGGY_IMAGINE_ENABLED is off")
+
+        provider = (
+            os.environ.get("CODEDOGGY_PROVIDER")
+            or os.environ.get("CODEDOGGY_MODEL_PROVIDER")
+            or ""
+        ).strip().lower()
+
+        key = (os.environ.get("CODEDOGGY_IMAGINE_API_KEY") or "").strip() or None
+        key_source = "env:CODEDOGGY_IMAGINE_API_KEY" if key else ""
+        if not key and provider:
+            key, key_source = resolve_provider_token(provider)
+
+        base = (os.environ.get("CODEDOGGY_IMAGINE_BASE_URL") or "").strip().rstrip("/")
+        if not base and provider:
+            base = resolve_base_for_provider(provider, "")
+        # Headless tests often set only the dedicated media key + optional base.
+        if not base and key and not provider:
+            base = DEFAULT_XAI_BASE
+
+        family: ImageApiFamily = (
+            image_api_family(base, provider=provider) if base else "unsupported"
+        )
+        # Dedicated IMAGINE key + base always treated as intentional media call.
+        if key and base and key_source.startswith("env:CODEDOGGY_IMAGINE"):
+            if family == "unsupported":
+                family = "xai" if is_xai_endpoint(base) else "openai"
+
+        model = _image_model_for_family(family, base)
+        timeout = _timeout_from_env()
+
+        if not key:
+            return cls(
+                enabled=False,
+                base_url=base or "",
+                api_key=None,
+                model=model,
+                timeout_s=timeout,
+                provider=provider,
+                family=family,
+                reason_disabled=(
+                    "Image generation is not supported: no API key or login for the "
+                    "active provider. Log in via Ctrl+L (same connection as chat) or "
+                    "set CODEDOGGY_IMAGINE_API_KEY, or set CODEDOGGY_PROVIDER and log in."
+                ),
+            )
+        if not base:
+            return cls(
+                enabled=False,
+                base_url="",
+                api_key=None,
+                model=model,
+                timeout_s=timeout,
+                provider=provider,
+                family="unsupported",
+                reason_disabled=(
+                    "Image generation has a credential but no base_url. "
+                    "Set CODEDOGGY_IMAGINE_BASE_URL or log in so the connection "
+                    "supplies the provider endpoint."
+                ),
+            )
+        if family == "unsupported":
+            return cls(
+                enabled=False,
+                base_url=base,
+                api_key=None,
+                model=model,
+                timeout_s=timeout,
+                provider=provider,
+                family=family,
+                reason_disabled=unsupported_image_reason(provider, base),
             )
         return cls(
             enabled=True,
@@ -115,7 +269,52 @@ class ImagineConfig:
             api_key=key,
             model=model,
             timeout_s=timeout,
+            provider=provider,
+            family=family,
+            reason_disabled=f"auth={key_source}" if key_source else "",
         )
+
+    @classmethod
+    def _disabled(cls, reason: str) -> ImagineConfig:
+        return cls(
+            enabled=False,
+            base_url="",
+            api_key=None,
+            model=DEFAULT_XAI_IMAGE_MODEL,
+            reason_disabled=reason,
+            family="unsupported",
+        )
+
+
+def _flag_off(name: str) -> bool:
+    return os.environ.get(name, "1").strip().lower() in {"0", "false", "off", "no"}
+
+
+def _timeout_from_env() -> float:
+    timeout = DEFAULT_TIMEOUT_S
+    raw_t = os.environ.get("CODEDOGGY_IMAGINE_TIMEOUT_S", "").strip()
+    if raw_t:
+        try:
+            timeout = float(raw_t)
+        except ValueError:
+            pass
+    return timeout
+
+
+def _image_model_for_family(family: ImageApiFamily, base_url: str) -> str:
+    explicit = (os.environ.get("CODEDOGGY_IMAGINE_MODEL") or "").strip()
+    if explicit:
+        return explicit
+    if family == "xai" or is_xai_endpoint(base_url):
+        return DEFAULT_XAI_IMAGE_MODEL
+    if family == "openai":
+        return DEFAULT_OPENAI_COMPAT_IMAGE_MODEL
+    return DEFAULT_XAI_IMAGE_MODEL
+
+
+def _openai_size(aspect_ratio: str) -> str:
+    key = (aspect_ratio or "auto").strip()
+    return _ASPECT_TO_OPENAI_SIZE.get(key, "1024x1024")
 
 
 def generate_image(
@@ -124,26 +323,34 @@ def generate_image(
     aspect_ratio: str = "auto",
     config: ImagineConfig | None = None,
 ) -> bytes:
-    """Call POST /images/generations; return raw image bytes.
-
-    Grok payload (ImageGenClient::generate):
-      model, prompt, n=1, aspect_ratio, resolution="1k", response_format="b64_json"
-    """
+    """Call POST /images/generations; return raw image bytes."""
     cfg = config or ImagineConfig.from_env()
     if not cfg.enabled:
         raise ImagineNotSupported(
             cfg.reason_disabled or "Image generation is not supported on this API."
         )
     url = f"{cfg.base_url.rstrip('/')}/images/generations"
-    # Match Grok exactly — always send aspect_ratio (default "auto").
-    payload: dict[str, Any] = {
-        "model": cfg.model,
-        "prompt": prompt,
-        "n": 1,
-        "aspect_ratio": aspect_ratio or "auto",
-        "resolution": "1k",
-        "response_format": "b64_json",
-    }
+    family = cfg.family if cfg.family != "unsupported" else image_api_family(
+        cfg.base_url, provider=cfg.provider
+    )
+    if family == "xai":
+        payload: dict[str, Any] = {
+            "model": cfg.model,
+            "prompt": prompt,
+            "n": 1,
+            "aspect_ratio": aspect_ratio or "auto",
+            "resolution": "1k",
+            "response_format": "b64_json",
+        }
+    else:
+        # OpenAI Images / OpenAI-compat proxies
+        payload = {
+            "model": cfg.model,
+            "prompt": prompt,
+            "n": 1,
+            "size": _openai_size(aspect_ratio or "auto"),
+            "response_format": "b64_json",
+        }
 
     body = _post_json(url, payload, api_key=cfg.api_key or "", timeout_s=cfg.timeout_s)
     return _extract_b64_image(body, empty_msg="Image generation returned no image data.")
@@ -156,13 +363,7 @@ def edit_image(
     aspect_ratio: str = "auto",
     config: ImagineConfig | None = None,
 ) -> bytes:
-    """Call POST /images/edits; return raw image bytes.
-
-    Grok payload (image_edit::run):
-      model, prompt, n=1, resolution="1k", response_format="b64_json"
-      single ref  → "image":  {"url": data_url}
-      multi refs  → "images": [{"url": ...}, ...] + aspect_ratio
-    """
+    """Call POST /images/edits; return raw image bytes."""
     cfg = config or ImagineConfig.from_env()
     if not cfg.enabled:
         raise ImagineNotSupported(
@@ -176,23 +377,34 @@ def edit_image(
         )
 
     url = f"{cfg.base_url.rstrip('/')}/images/edits"
-    # Grok image_edit hard-codes XAI_IMAGINE_MODEL (quality); CodeDoggy uses
-    # the same default, overridable via CODEDOGGY_IMAGINE_MODEL.
-    payload: dict[str, Any] = {
-        "model": cfg.model or DEFAULT_MODEL,
-        "prompt": prompt,
-        "n": 1,
-        "resolution": "1k",
-        "response_format": "b64_json",
-    }
+    family = cfg.family if cfg.family != "unsupported" else image_api_family(
+        cfg.base_url, provider=cfg.provider
+    )
 
-    imgs = [{"url": u} for u in image_data_urls]
-    if len(imgs) == 1:
-        # Single-image edits: API auto-detects aspect ratio; do not send field.
-        payload["image"] = imgs[0]
+    if family == "xai":
+        payload: dict[str, Any] = {
+            "model": cfg.model or DEFAULT_XAI_IMAGE_MODEL,
+            "prompt": prompt,
+            "n": 1,
+            "resolution": "1k",
+            "response_format": "b64_json",
+        }
+        imgs = [{"url": u} for u in image_data_urls]
+        if len(imgs) == 1:
+            payload["image"] = imgs[0]
+        else:
+            payload["images"] = imgs
+            payload["aspect_ratio"] = aspect_ratio or "auto"
     else:
-        payload["images"] = imgs
-        payload["aspect_ratio"] = aspect_ratio or "auto"
+        # OpenAI edits: single image as data URL field; multi-image is xAI-only shape.
+        payload = {
+            "model": cfg.model or DEFAULT_OPENAI_COMPAT_IMAGE_MODEL,
+            "prompt": prompt,
+            "n": 1,
+            "size": _openai_size(aspect_ratio or "auto"),
+            "response_format": "b64_json",
+            "image": image_data_urls[0],
+        }
 
     body = _post_json(url, payload, api_key=cfg.api_key or "", timeout_s=cfg.timeout_s)
     return _extract_b64_image(body, empty_msg="Image edit returned no image data.")
@@ -227,7 +439,6 @@ def _post_json(
             err_body = e.read().decode("utf-8", errors="replace")[:200]
         except Exception:  # noqa: BLE001
             pass
-        # Assignment: not_supported on 404/501 (also 405 Method Not Allowed).
         if e.code in {404, 405, 501}:
             raise ImagineNotSupported(
                 f"Image generation is not supported by this API endpoint "
@@ -236,10 +447,10 @@ def _post_json(
             ) from e
         if e.code in {401, 403}:
             raise ImagineError(
-                f"Image API auth failed (HTTP {e.code}). Check API key. {err_body}",
+                f"Image API auth failed (HTTP {e.code}). "
+                f"Check the credential for the active connection. {err_body}",
                 code="auth_failed",
             ) from e
-        # Grok: code "http_failure" with status for other non-success.
         raise ImagineError(
             f"Image generation failed with HTTP {e.code}: {err_body or e.reason}",
             code="http_failure",
@@ -263,7 +474,7 @@ def _post_json(
 
 
 def _extract_b64_image(body: dict[str, Any], *, empty_msg: str) -> bytes:
-    """Grok ImageGenResponse: data[0].b64_json (+ a few lenient variants)."""
+    """Grok/OpenAI ImageGenResponse: data[0].b64_json (+ lenient variants)."""
     data = body.get("data")
     b64 = ""
     if isinstance(data, list) and data:

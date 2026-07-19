@@ -117,12 +117,30 @@ def test_hud_projection_uses_connection_not_env(
 
 def test_suggested_models_include_default() -> None:
     from codedoggy.model.catalog import suggested_models
+    from codedoggy.model.profile_registry import get_profile
+
+    assert get_profile("grok").default_model == "grok-4.5"
+    assert get_profile("claude").default_model == "claude-opus-4-5"
+    assert get_profile("codex").default_model == "gpt-5.6-sol"
+    assert get_profile("deepseek").default_model == "deepseek-reasoner"
+    assert get_profile("openai").default_model == "gpt-5.6-sol"
 
     grok = suggested_models("grok")
-    assert grok[0] == "grok-3"
-    assert "grok-3-mini" in grok
+    assert grok[0] == "grok-4.5"
+    assert "grok-3" in grok
     ollama = suggested_models("ollama")
     assert "qwen3:8b" in ollama
+
+
+def test_reasoning_defaults_to_high(monkeypatch: pytest.MonkeyPatch) -> None:
+    from codedoggy.model.registry import model_config_from_env
+
+    monkeypatch.delenv("CODEDOGGY_REASONING_EFFORT", raising=False)
+    monkeypatch.delenv("CODEDOGGY_REASONING_ENABLED", raising=False)
+    monkeypatch.setenv("CODEDOGGY_PROVIDER", "ollama")
+    cfg = model_config_from_env()
+    assert cfg.extra.get("reasoning", {}).get("effort") == "high"
+    assert cfg.extra.get("reasoning", {}).get("enabled") is True
 
 
 def test_apply_model_keeps_provider(monkeypatch: pytest.MonkeyPatch) -> None:

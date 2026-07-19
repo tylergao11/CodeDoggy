@@ -85,17 +85,141 @@ def test_config_missing_key_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
         "XAI_API_KEY",
         "CODEDOGGY_API_KEY",
         "OPENAI_API_KEY",
+        "CODEDOGGY_PROVIDER",
+        "CODEDOGGY_MODEL_PROVIDER",
     ):
         monkeypatch.delenv(k, raising=False)
+    monkeypatch.setattr(
+        "codedoggy.tools.util.active_auth.resolve_provider_token",
+        lambda *_a, **_k: (None, ""),
+    )
+    monkeypatch.setattr(
+        "codedoggy.tools.util.imagine_api.resolve_provider_token",
+        lambda *_a, **_k: (None, ""),
+    )
     cfg = ImagineConfig.from_env()
     assert not cfg.enabled
-    assert "API key" in cfg.reason_disabled
-    assert cfg.base_url == DEFAULT_BASE or cfg.base_url.endswith("/v1")
+    assert "API key" in cfg.reason_disabled or "login" in cfg.reason_disabled.lower()
+    # No silent xAI base when disabled without a connection/provider.
+    assert cfg.api_key is None
+
+
+def test_config_uses_active_connection_credential(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Image auth must follow the selected connection — not a hard-coded Grok probe."""
+    for k in (
+        "CODEDOGGY_IMAGINE_API_KEY",
+        "XAI_API_KEY",
+        "CODEDOGGY_API_KEY",
+        "OPENAI_API_KEY",
+        "CODEDOGGY_IMAGINE_BASE_URL",
+        "XAI_BASE_URL",
+    ):
+        monkeypatch.delenv(k, raising=False)
+
+    class _Snap:
+        provider = "grok"
+        base_url = "https://api.x.ai/v1"
+
+    class _Svc:
+        def snapshot(self):
+            return _Snap()
+
+    monkeypatch.setattr(
+        "codedoggy.tools.util.imagine_api.resolve_provider_token",
+        lambda provider, **_k: (
+            ("oauth-session-token", "file:~/.grok/auth.json")
+            if provider == "grok"
+            else (None, "")
+        ),
+    )
+    cfg = ImagineConfig.from_connection(_Svc())
+    assert cfg.enabled is True
+    assert cfg.api_key == "oauth-session-token"
+    assert cfg.provider == "grok"
+    assert cfg.base_url == "https://api.x.ai/v1"
+
+
+def test_config_follows_claude_connection_not_grok_oauth(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Claude connection must not steal Grok; Anthropic has no images API → clear off."""
+    for k in (
+        "CODEDOGGY_IMAGINE_API_KEY",
+        "XAI_API_KEY",
+        "CODEDOGGY_API_KEY",
+        "OPENAI_API_KEY",
+        "CODEDOGGY_IMAGINE_BASE_URL",
+        "CODEDOGGY_IMAGINE_MODEL",
+    ):
+        monkeypatch.delenv(k, raising=False)
+
+    class _Snap:
+        provider = "claude"
+        base_url = "https://api.anthropic.com"
+        model = "claude-opus-4-5"
+
+    class _Svc:
+        def snapshot(self):
+            return _Snap()
+
+    def _token(provider: str, **_k):
+        if provider == "claude":
+            return "claude-oauth-token", "claude_oauth"
+        if provider in {"grok", "xai"}:
+            return "grok-should-not-be-used", "file:~/.grok/auth.json"
+        return None, ""
+
+    monkeypatch.setattr(
+        "codedoggy.tools.util.imagine_api.resolve_provider_token",
+        _token,
+    )
+    cfg = ImagineConfig.from_connection(_Svc())
+    assert cfg.enabled is False
+    assert cfg.provider == "claude"
+    assert cfg.api_key is None  # never attach Grok token
+    assert "anthropic.com" in cfg.base_url
+    assert "x.ai" not in cfg.base_url
+    assert "not expose" in cfg.reason_disabled.lower() or "images" in cfg.reason_disabled.lower()
+
+
+def test_config_openai_api_connection(monkeypatch: pytest.MonkeyPatch) -> None:
+    for k in (
+        "CODEDOGGY_IMAGINE_API_KEY",
+        "XAI_API_KEY",
+        "CODEDOGGY_API_KEY",
+        "OPENAI_API_KEY",
+        "CODEDOGGY_IMAGINE_MODEL",
+    ):
+        monkeypatch.delenv(k, raising=False)
+
+    class _Snap:
+        provider = "openai"
+        base_url = "https://api.openai.com/v1"
+
+    class _Svc:
+        def snapshot(self):
+            return _Snap()
+
+    monkeypatch.setattr(
+        "codedoggy.tools.util.imagine_api.resolve_provider_token",
+        lambda provider, **_k: ("sk-openai", "env") if provider == "openai" else (None, ""),
+    )
+    cfg = ImagineConfig.from_connection(_Svc())
+    assert cfg.enabled is True
+    assert cfg.api_key == "sk-openai"
+    assert cfg.provider == "openai"
+    assert cfg.base_url == "https://api.openai.com/v1"
+    assert cfg.model == "gpt-image-1"
+    assert cfg.family == "openai"
 
 
 def test_config_default_model(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("CODEDOGGY_IMAGINE_API_KEY", "sk-x")
     monkeypatch.delenv("CODEDOGGY_IMAGINE_MODEL", raising=False)
+    monkeypatch.delenv("CODEDOGGY_PROVIDER", raising=False)
+    monkeypatch.delenv("CODEDOGGY_MODEL_PROVIDER", raising=False)
     cfg = ImagineConfig.from_env()
     assert cfg.model == DEFAULT_MODEL
     assert DEFAULT_MODEL == "grok-imagine-image-quality"
@@ -130,6 +254,36 @@ def test_generate_payload_shape(monkeypatch: pytest.MonkeyPatch) -> None:
         "authorization" in k.lower() for k in captured["headers"]
     )
     assert raw[:3] == b"\xff\xd8\xff" or len(raw) > 0
+
+
+def test_generate_openai_payload_uses_size_not_aspect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("CODEDOGGY_IMAGINE_MODEL", raising=False)
+    captured: dict[str, Any] = {}
+
+    def fake_urlopen(req: Any, timeout: float = 0, context: Any = None) -> _FakeHTTPResponse:
+        captured["url"] = req.full_url
+        captured["body"] = json.loads(req.data.decode("utf-8"))
+        return _FakeHTTPResponse(_b64_response())
+
+    cfg = ImagineConfig(
+        enabled=True,
+        base_url="https://api.openai.com/v1",
+        api_key="sk-oai",
+        model="gpt-image-1",
+        provider="openai",
+        family="openai",
+    )
+    with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+        generate_image("a cat", aspect_ratio="16:9", config=cfg)
+
+    assert captured["url"] == "https://api.openai.com/v1/images/generations"
+    body = captured["body"]
+    assert body["size"] == "1792x1024"
+    assert "aspect_ratio" not in body
+    assert "resolution" not in body
+    assert body["response_format"] == "b64_json"
 
 
 def test_generate_404_is_not_supported(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -281,12 +435,63 @@ def test_image_gen_tool_not_supported_without_key(
         "XAI_API_KEY",
         "CODEDOGGY_API_KEY",
         "OPENAI_API_KEY",
+        "CODEDOGGY_PROVIDER",
+        "CODEDOGGY_MODEL_PROVIDER",
     ):
         monkeypatch.delenv(k, raising=False)
+    monkeypatch.setattr(
+        "codedoggy.tools.util.imagine_api.resolve_provider_token",
+        lambda *_a, **_k: (None, ""),
+    )
     tools = ToolRegistryBuilder.new().finalize()
     with pytest.raises(ToolError) as ei:
         tools.call("image_gen", {"prompt": "cube"}, ToolCallContext(cwd=tmp_path))
     assert ei.value.code == "not_supported"
+
+
+def test_image_gen_tool_uses_connection_in_extra(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    for k in (
+        "CODEDOGGY_IMAGINE_API_KEY",
+        "XAI_API_KEY",
+        "CODEDOGGY_API_KEY",
+        "OPENAI_API_KEY",
+    ):
+        monkeypatch.delenv(k, raising=False)
+
+    class _Snap:
+        provider = "grok"
+        base_url = "https://api.x.ai/v1"
+
+    class _Svc:
+        def snapshot(self):
+            return _Snap()
+
+    monkeypatch.setattr(
+        "codedoggy.tools.util.imagine_api.resolve_provider_token",
+        lambda provider, **_k: ("tok", "oauth") if provider == "grok" else (None, ""),
+    )
+    captured: dict[str, Any] = {}
+
+    def fake_urlopen(req: Any, timeout: float = 0, context: Any = None) -> _FakeHTTPResponse:
+        captured["url"] = req.full_url
+        captured["auth"] = dict(req.header_items()).get("Authorization") or dict(
+            req.header_items()
+        ).get("authorization")
+        # header_items may be title-case
+        headers = {k.lower(): v for k, v in req.header_items()}
+        captured["auth"] = headers.get("authorization")
+        return _FakeHTTPResponse(_b64_response())
+
+    tools = ToolRegistryBuilder.new().finalize()
+    ctx = ToolCallContext(cwd=tmp_path, extra={"connection": _Svc()})
+    with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+        out = tools.call("image_gen", {"prompt": "cube"}, ctx)
+    data = json.loads(out)
+    assert data["filename"] == "1.jpg"
+    assert captured["url"] == "https://api.x.ai/v1/images/generations"
+    assert captured["auth"] == "Bearer tok"
 
 
 # ── attachment tokens / refs ────────────────────────────────────────────

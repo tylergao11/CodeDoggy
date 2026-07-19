@@ -30,6 +30,10 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Any
 
+from codedoggy.tools.util.active_auth import (
+    unsupported_video_reason,
+    video_api_family,
+)
 from codedoggy.tools.util.imagine_api import ImagineConfig, ImagineError, ImagineNotSupported
 
 # --- constants from video_gen/mod.rs ---
@@ -59,32 +63,76 @@ class VideoConfig:
     api_key: str | None
     model: str
     reason_disabled: str = ""
+    provider: str = ""
 
     @classmethod
-    def from_env(cls) -> VideoConfig:
-        flag = os.environ.get("CODEDOGGY_VIDEO_ENABLED", "1").strip().lower()
-        if flag in {"0", "false", "off", "no"}:
+    def resolve(cls, extra: dict[str, Any] | None = None) -> VideoConfig:
+        """Follow ActiveConnection via ImagineConfig (same login as chat/images)."""
+        bag = extra or {}
+        override = bag.get("video_config")
+        if isinstance(override, VideoConfig):
+            return override
+        if _video_flag_off():
             return cls(
                 enabled=False,
-                base_url="https://api.x.ai/v1",
+                base_url="",
                 api_key=None,
                 model=XAI_VIDEO_BASE_MODEL,
                 reason_disabled="CODEDOGGY_VIDEO_ENABLED is off",
             )
-        img = ImagineConfig.from_env()
+        return cls._from_imagine(ImagineConfig.resolve(bag))
+
+    @classmethod
+    def from_connection(cls, connection: Any) -> VideoConfig:
+        if _video_flag_off():
+            return cls(
+                enabled=False,
+                base_url="",
+                api_key=None,
+                model=XAI_VIDEO_BASE_MODEL,
+                reason_disabled="CODEDOGGY_VIDEO_ENABLED is off",
+            )
+        return cls._from_imagine(ImagineConfig.from_connection(connection))
+
+    @classmethod
+    def from_env(cls) -> VideoConfig:
+        if _video_flag_off():
+            return cls(
+                enabled=False,
+                base_url="",
+                api_key=None,
+                model=XAI_VIDEO_BASE_MODEL,
+                reason_disabled="CODEDOGGY_VIDEO_ENABLED is off",
+            )
+        return cls._from_imagine(ImagineConfig.from_env())
+
+    @classmethod
+    def _from_imagine(cls, img: ImagineConfig) -> VideoConfig:
         if not img.enabled or not img.api_key:
             return cls(
                 enabled=False,
-                base_url=img.base_url,
+                base_url=img.base_url or "",
                 api_key=None,
                 model=XAI_VIDEO_BASE_MODEL,
+                provider=img.provider,
                 reason_disabled=(
                     img.reason_disabled
-                    or "Video generation is not supported: no API key configured. "
-                    "Set CODEDOGGY_IMAGINE_API_KEY / XAI_API_KEY / CODEDOGGY_API_KEY."
+                    or "Video generation is not supported: no credential on the "
+                    "active connection. Log in via Ctrl+L (same as chat) or set "
+                    "CODEDOGGY_IMAGINE_API_KEY."
                 ),
             )
-        # Optional override for ops; tools still pick quality vs base models.
+        # Only xAI /videos/* is implemented. Follow connection credentials but
+        # refuse early on other endpoints (never steal a Grok session).
+        if video_api_family(img.base_url) != "xai":
+            return cls(
+                enabled=False,
+                base_url=img.base_url or "",
+                api_key=None,
+                model=XAI_VIDEO_BASE_MODEL,
+                provider=img.provider,
+                reason_disabled=unsupported_video_reason(img.provider, img.base_url),
+            )
         model = (
             os.environ.get("CODEDOGGY_VIDEO_MODEL") or XAI_VIDEO_BASE_MODEL
         ).strip() or XAI_VIDEO_BASE_MODEL
@@ -93,7 +141,17 @@ class VideoConfig:
             base_url=img.base_url,
             api_key=img.api_key,
             model=model,
+            provider=img.provider,
         )
+
+
+def _video_flag_off() -> bool:
+    return os.environ.get("CODEDOGGY_VIDEO_ENABLED", "1").strip().lower() in {
+        "0",
+        "false",
+        "off",
+        "no",
+    }
 
 
 def validate_one_of(field: str, value: str, allowed: tuple[str, ...] | list[str]) -> None:

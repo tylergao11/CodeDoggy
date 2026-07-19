@@ -126,6 +126,22 @@ def hud_projection(session: Any) -> dict[str, Any]:
         cur = ""
         current_ok = False
     any_in = any(r["logged_in"] for r in rows)
+    kernel = getattr(getattr(session, "extensions", None), "kernel", None)
+    runtime = getattr(kernel, "mcp_runtime", None)
+    statuses = list(getattr(runtime, "statuses", []) or []) if runtime is not None else []
+    mcp_ready = sum(
+        1 for item in statuses
+        if isinstance(item, dict) and item.get("status") == "ready"
+    )
+    mcp_bad = sum(
+        1 for item in statuses
+        if isinstance(item, dict)
+        and item.get("status") in {"unavailable", "needs_auth"}
+    )
+    mcp_connecting = sum(
+        1 for item in statuses
+        if isinstance(item, dict) and item.get("status") == "initializing"
+    )
     return {
         "provider": cur,
         "model": snap.model if snap is not None else "",
@@ -134,6 +150,14 @@ def hud_projection(session: Any) -> dict[str, Any]:
         "current_ok": current_ok,
         "generation": snap.generation if snap is not None else 0,
         "label": snap.label if snap is not None else "",
+        "mcp": {
+            "ready": mcp_ready,
+            "bad": mcp_bad,
+            "connecting": mcp_connecting,
+            "configured": bool(getattr(runtime, "servers", []) or statuses)
+            if runtime is not None
+            else False,
+        },
     }
 
 

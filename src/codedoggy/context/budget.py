@@ -50,6 +50,8 @@ class ContextBudget:
 
     # Live tool-schema reserve (set each sample from tool definitions).
     tools_reserve: int = 0
+    # Model-facing user-info / memory-fence overhead not stored in live history.
+    ephemeral_reserve: int = 0
 
     last_prompt_tokens: int | None = None
     last_completion_tokens: int | None = None
@@ -80,7 +82,8 @@ class ContextBudget:
             1,
             int(self.context_window)
             - int(self.completion_reserve)
-            - int(self.tools_reserve),
+            - int(self.tools_reserve)
+            - int(self.ephemeral_reserve),
         )
 
     @property
@@ -214,6 +217,7 @@ def budget_status(messages: list[Message], budget: ContextBudget) -> dict[str, o
         "context_window": budget.context_window,
         "usable_window": budget.usable_window,
         "tools_reserve": budget.tools_reserve,
+        "ephemeral_reserve": budget.ephemeral_reserve,
         "completion_reserve": budget.completion_reserve,
         "backend": tokenizer_backend(),
         "last_prompt_tokens": budget.last_prompt_tokens,

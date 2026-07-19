@@ -8,8 +8,9 @@ Uses:
   POST {base}/images/generations
   POST {base}/images/edits
 
-Config from environment (see ``codedoggy.tools.util.imagine_api``).
-Missing API key or 404/501 from the endpoint → ToolError code ``not_supported``.
+Config follows the session ActiveConnection (same login as chat). See
+``codedoggy.tools.util.imagine_api.ImagineConfig.resolve``.
+Missing credential or 404/501 from the endpoint → ToolError code ``not_supported``.
 
 Optional test override: extra['image_gen_client'] with generate/edit methods.
 Optional attachment registry: extra['attached_images'] as {1: path, ...} or
@@ -35,6 +36,7 @@ from codedoggy.tools.runtime import (
     ToolId,
 )
 from codedoggy.tools.util.imagine_api import (
+    ImagineConfig,
     ImagineError,
     ImagineNotSupported,
     edit_image,
@@ -124,8 +126,9 @@ class ImageGenTool(Tool):
                 raise ToolError(f"image_gen failed: {e}", code="image_gen_error") from e
             return _save_and_report(ctx, result, action="Image generated")
 
+        cfg = ImagineConfig.resolve(ctx.extra)
         try:
-            raw = generate_image(prompt.strip(), aspect_ratio=aspect)
+            raw = generate_image(prompt.strip(), aspect_ratio=aspect, config=cfg)
         except ImagineNotSupported as e:
             raise ToolError(e.message, code=e.code) from e
         except ImagineError as e:
@@ -225,8 +228,11 @@ class ImageEditTool(Tool):
                 f"failed to load reference image: {e}", code="invalid_arguments"
             ) from e
 
+        cfg = ImagineConfig.resolve(ctx.extra)
         try:
-            raw = edit_image(prompt.strip(), data_urls, aspect_ratio=aspect)
+            raw = edit_image(
+                prompt.strip(), data_urls, aspect_ratio=aspect, config=cfg
+            )
         except ImagineNotSupported as e:
             raise ToolError(e.message, code=e.code) from e
         except ImagineError as e:

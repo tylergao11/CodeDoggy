@@ -82,4 +82,6 @@ def _copy_msg(m: Message, content: str) -> Message:
         tool_calls=m.tool_calls,
         tool_call_id=m.tool_call_id,
         name=m.name,
+        reasoning_content=m.reasoning_content,
+        provider_data=dict(m.provider_data) if m.provider_data else None,
     )

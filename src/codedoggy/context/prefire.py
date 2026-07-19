@@ -18,21 +18,29 @@ from __future__ import annotations
 
 import logging
 import threading
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future, TimeoutError as FutureTimeoutError
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
 logger = logging.getLogger(__name__)
 
-_executor: ThreadPoolExecutor | None = None
+_executor: Any | None = None
 _executor_lock = threading.Lock()
 
 
-def _pool() -> ThreadPoolExecutor:
+def _pool() -> Any:
     global _executor
     with _executor_lock:
         if _executor is None:
-            _executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="cd-prefire")
+            # A timed-out provider request must not keep the CLI process alive
+            # during interpreter shutdown.  The work itself is side-effect free
+            # (the owning compactor commits results only after join).
+            from codedoggy.memory.daemon_pool import DaemonThreadPoolExecutor
+
+            _executor = DaemonThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix="cd-prefire",
+            )
         return _executor
 
 
@@ -69,15 +77,25 @@ class PrefireController:
             fut = self._future
         if fut is None:
             return None
+        completed = False
         try:
-            return fut.result(timeout=timeout_s)
+            result = fut.result(timeout=timeout_s)
+            completed = True
+            return result
+        except FutureTimeoutError:
+            # Keep ownership of the still-running future.  Clearing it here
+            # made is_running() lie and allowed a second flush to start.
+            logger.warning("prefire join timed out after %.2fs", timeout_s)
+            return None
         except Exception as e:  # noqa: BLE001
+            completed = True
             logger.warning("prefire join failed: %s", e)
             return None
         finally:
-            with self._lock:
-                if self._future is fut:
-                    self._future = None
+            if completed:
+                with self._lock:
+                    if self._future is fut:
+                        self._future = None
 
     def try_join(self) -> Any | None:
         """Non-blocking: return result only if already done."""
@@ -100,20 +118,32 @@ class PrefireController:
             fut = self._future
             return fut is not None and not fut.done()
 
-    def cancel_pending(self) -> None:
+    def cancel_pending(self, *, timeout_s: float = 5.0) -> bool:
         with self._lock:
             fut = self._future
+        if fut is None:
+            return True
         if fut is not None:
-            fut.cancel()
+            cancelled = fut.cancel()
+            if not cancelled and not fut.done() and timeout_s <= 0:
+                # Running futures cannot be force-cancelled.  The daemon job
+                # is generation-only, so a failed/cancelled turn may abandon
+                # it immediately and reject it later via the turn epoch.
+                return False
             # Wait briefly so worker exits before session teardown
             try:
-                fut.result(timeout=5.0)
+                fut.result(timeout=max(0.0, float(timeout_s)))
+            except FutureTimeoutError:
+                # Worker is daemonized and prefire jobs are side-effect free;
+                # retain the Future so callers still observe it as running.
+                return False
             except Exception:  # noqa: BLE001
                 pass
         with self._lock:
             if self._future is fut:
                 self._future = None
+        return True
 
-    def clear(self) -> None:
+    def clear(self) -> bool:
         """Cancel and wait — safe for session close."""
-        self.cancel_pending()
+        return self.cancel_pending()

@@ -174,7 +174,7 @@ def apply_auth_to_config(
     return ModelConfig(
         provider=config.provider,
         model=config.model,
-        base_url=config.base_url,
+        base_url=cred.base_url or config.base_url,
         api_key=cred.token,
         temperature=config.temperature,
         max_tokens=config.max_tokens,
@@ -198,7 +198,7 @@ def auth_status(provider: str) -> AuthStatus:
     return auth.status()
 
 
-def begin_login(provider: str) -> AuthStatus:
+def begin_login(provider: str, *, cancel_event: object | None = None) -> AuthStatus:
     _bootstrap()
     auth = get_auth_provider(provider)
     if auth is None:
@@ -208,7 +208,7 @@ def begin_login(provider: str) -> AuthStatus:
             logged_in=False,
             detail="no login flow — use API key",
         )
-    return auth.begin_login()
+    return auth.begin_login(cancel_event=cancel_event)
 
 
 __all__ = [

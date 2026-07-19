@@ -60,11 +60,15 @@ class DeepSeekProfile(ProviderProfile):
         if not enabled:
             return extra_body, top_level
         if isinstance(reasoning_config, dict):
-            effort = (reasoning_config.get("effort") or "").strip().lower()
+            effort = (reasoning_config.get("effort") or "high").strip().lower()
             if effort in {"xhigh", "max", "ultra"}:
                 top_level["reasoning_effort"] = "max"
             elif effort in {"low", "medium", "high"}:
                 top_level["reasoning_effort"] = effort
+            else:
+                top_level["reasoning_effort"] = "high"
+        else:
+            top_level["reasoning_effort"] = "high"
         return extra_body, top_level
 
 
@@ -79,8 +83,9 @@ def build_builtin_profiles() -> list[ProviderProfile]:
             env_vars=("XAI_API_KEY",),
             base_url="https://api.x.ai/v1",
             base_url_env_var="XAI_BASE_URL",
-            default_model="grok-3",
-            default_aux_model="grok-3-mini",
+            # xAI flagship (Grok Build / API as of 2026-07)
+            default_model="grok-4.5",
+            default_aux_model="grok-4.5",
             auth_mode=AUTH_MODE_OAUTH,
             # Hermes: transport=codex_responses for xai
             api_mode=API_CODEX_RESPONSES,
@@ -94,7 +99,8 @@ def build_builtin_profiles() -> list[ProviderProfile]:
             env_vars=("ANTHROPIC_API_KEY", "ANTHROPIC_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"),
             base_url="https://api.anthropic.com",
             base_url_env_var="ANTHROPIC_BASE_URL",
-            default_model="claude-sonnet-4-5",
+            # Product default: max quality main, cheap aux for fold
+            default_model="claude-opus-4-5",
             default_aux_model="claude-haiku-4-5",
             auth_mode=AUTH_MODE_OAUTH,
             api_mode=API_ANTHROPIC_MESSAGES,  # Anthropic 系
@@ -113,8 +119,9 @@ def build_builtin_profiles() -> list[ProviderProfile]:
             # users still hit api.openai.com/v1/responses.
             base_url="https://api.openai.com/v1",
             base_url_env_var="OPENAI_BASE_URL",
-            default_model="gpt-5.1-codex",
-            default_aux_model="gpt-4.1-mini",
+            # GPT-5.6 Sol = Codex/ChatGPT power tier (2026-07)
+            default_model="gpt-5.6-sol",
+            default_aux_model="gpt-5.6-luna",
             auth_mode=AUTH_MODE_OAUTH,
             api_mode=API_CODEX_RESPONSES,
             reasoning_policy=REASONING_STRIP,
@@ -127,8 +134,8 @@ def build_builtin_profiles() -> list[ProviderProfile]:
             env_vars=("OPENAI_API_KEY",),
             base_url="https://api.openai.com/v1",
             base_url_env_var="OPENAI_BASE_URL",
-            default_model="gpt-4o-mini",
-            default_aux_model="gpt-4o-mini",
+            default_model="gpt-5.6-sol",
+            default_aux_model="gpt-5.6-luna",
             auth_mode=AUTH_MODE_API_KEY,
             api_mode=API_CHAT_COMPLETIONS,
             reasoning_policy=REASONING_STRIP,
@@ -141,7 +148,8 @@ def build_builtin_profiles() -> list[ProviderProfile]:
             env_vars=("OPENAI_API_KEY", "CODEDOGGY_API_KEY"),
             base_url="https://api.openai.com/v1",
             base_url_env_var="OPENAI_BASE_URL",
-            default_model="gpt-4o-mini",
+            default_model="gpt-5.6-sol",
+            default_aux_model="gpt-5.6-luna",
             auth_mode=AUTH_MODE_API_KEY,
             api_mode=API_CHAT_COMPLETIONS,
             reasoning_policy=REASONING_STRIP,
@@ -154,7 +162,8 @@ def build_builtin_profiles() -> list[ProviderProfile]:
             env_vars=("DEEPSEEK_API_KEY",),
             base_url="https://api.deepseek.com/v1",
             base_url_env_var="DEEPSEEK_BASE_URL",
-            default_model="deepseek-chat",
+            # Reasoner = max thinking path; chat for aux fold
+            default_model="deepseek-reasoner",
             default_aux_model="deepseek-chat",
             auth_mode=AUTH_MODE_API_KEY,
             api_mode=API_CHAT_COMPLETIONS,
@@ -180,7 +189,8 @@ def build_builtin_profiles() -> list[ProviderProfile]:
             env_vars=("CODEDOGGY_API_KEY", "OPENAI_API_KEY"),
             base_url="",
             base_url_env_var="CODEDOGGY_BASE_URL",
-            default_model="gpt-4o-mini",
+            default_model="gpt-5.6-sol",
+            default_aux_model="gpt-5.6-luna",
             auth_mode=AUTH_MODE_API_KEY,
             api_mode=API_CHAT_COMPLETIONS,
             reasoning_policy=REASONING_STRIP,
@@ -193,7 +203,8 @@ def build_builtin_profiles() -> list[ProviderProfile]:
             description="Bedrock Converse API (boto3 credential chain)",
             env_vars=("AWS_ACCESS_KEY_ID", "AWS_PROFILE", "AWS_BEARER_TOKEN_BEDROCK"),
             base_url="",  # not HTTP OpenAI
-            default_model="anthropic.claude-sonnet-4-5-20250929-v1:0",
+            default_model="anthropic.claude-opus-4-5-20251101-v1:0",
+            default_aux_model="anthropic.claude-haiku-4-5-20251001-v1:0",
             auth_mode=AUTH_MODE_API_KEY,
             api_mode="bedrock_converse",
             reasoning_policy=REASONING_STRIP,
@@ -206,6 +217,7 @@ def build_builtin_profiles() -> list[ProviderProfile]:
             env_vars=("GOOGLE_APPLICATION_CREDENTIALS", "VERTEX_CREDENTIALS_PATH"),
             base_url="",
             default_model="google/gemini-2.5-pro",
+            default_aux_model="google/gemini-2.5-flash",
             auth_mode=AUTH_MODE_API_KEY,
             api_mode=API_CHAT_COMPLETIONS,  # OpenAI-compat surface after token mint
             reasoning_policy=REASONING_STRIP,
@@ -217,7 +229,8 @@ def build_builtin_profiles() -> list[ProviderProfile]:
             description="Local `codex app-server` JSON-RPC (optional; needs codex CLI)",
             env_vars=("OPENAI_API_KEY",),
             base_url="",
-            default_model="gpt-5.1-codex",
+            default_model="gpt-5.6-sol",
+            default_aux_model="gpt-5.6-luna",
             auth_mode=AUTH_MODE_OAUTH,
             api_mode="codex_app_server",
             reasoning_policy=REASONING_STRIP,

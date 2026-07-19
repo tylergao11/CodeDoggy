@@ -21,7 +21,12 @@ import os
 import time
 from typing import Any, Callable
 
+from codedoggy.model.errors import ModelStreamCancelled
 from codedoggy.model.openai_compat import ModelError
+from codedoggy.model.stream_cancel import (
+    cancellation_requested,
+    run_cancellable_request,
+)
 from codedoggy.model.profile import ProviderProfile
 from codedoggy.model.profile_registry import get_profile
 from codedoggy.model.types import ChatMessage, CompletionResult, ModelConfig
@@ -509,6 +514,7 @@ def stream_converse_to_result(
     current_text_buffer: list[str] = []
     has_tool_use = False
     stop_reason = "end_turn"
+    saw_message_stop = False
     usage_data: dict[str, int] = {}
 
     stream = (
@@ -523,7 +529,7 @@ def stream_converse_to_result(
 
     for event in stream:
         if on_interrupt_check and on_interrupt_check():
-            break
+            raise ModelStreamCancelled()
         if not isinstance(event, dict):
             continue
 
@@ -548,7 +554,8 @@ def stream_converse_to_result(
                 text = delta["text"]
                 current_text_buffer.append(text)
                 if on_text_delta and not has_tool_use:
-                    on_text_delta(text)
+                    if on_text_delta(text) is False:
+                        raise ModelStreamCancelled()
             elif "toolUse" in delta and current_tool is not None:
                 current_tool["input_json"] += delta["toolUse"].get("input", "")
             elif "reasoningContent" in delta:
@@ -586,6 +593,7 @@ def stream_converse_to_result(
                 current_text_buffer = []
 
         elif "messageStop" in event:
+            saw_message_stop = True
             stop_reason = event["messageStop"].get("stopReason", "end_turn")
 
         elif "metadata" in event:
@@ -597,6 +605,11 @@ def stream_converse_to_result(
 
     if current_text_buffer:
         text_parts.append("".join(current_text_buffer))
+
+    if not saw_message_stop:
+        raise ModelError(
+            "Bedrock ConverseStream ended before messageStop; response is incomplete"
+        )
 
     finish = converse_stop_reason_to_openai(str(stop_reason))
     if tool_calls and finish == "stop":
@@ -819,6 +832,7 @@ class BedrockConverseClient:
         temperature: float | None = None,
         max_tokens: int | None = None,
         tools: list[dict[str, Any]] | None = None,
+        cancel_event: Any | None = None,
     ) -> CompletionResult:
         wire = _as_dicts(messages)
         if self._profile is not None:
@@ -836,7 +850,10 @@ class BedrockConverseClient:
             temperature=temp,
             guardrail_config=guardrail,
         )
-        return self._call_converse(kwargs)
+        return run_cancellable_request(
+            lambda: self._call_converse(kwargs),
+            cancel_event,
+        )
 
     def complete_stream(
         self,
@@ -845,7 +862,8 @@ class BedrockConverseClient:
         temperature: float | None = None,
         max_tokens: int | None = None,
         tools: list[dict[str, Any]] | None = None,
-        on_delta: Callable[[str], None] | None = None,
+        on_delta: Callable[[str], Any] | None = None,
+        cancel_event: Any | None = None,
     ) -> CompletionResult:
         wire = _as_dicts(messages)
         if self._profile is not None:
@@ -863,7 +881,14 @@ class BedrockConverseClient:
             temperature=temp,
             guardrail_config=guardrail,
         )
-        return self._call_converse_stream(kwargs, on_text_delta=on_delta)
+        return run_cancellable_request(
+            lambda: self._call_converse_stream(
+                kwargs,
+                on_text_delta=on_delta,
+                cancel_event=cancel_event,
+            ),
+            cancel_event,
+        )
 
     def _call_converse(self, kwargs: dict[str, Any]) -> CompletionResult:
         client = _get_bedrock_runtime_client(self._region)
@@ -890,7 +915,8 @@ class BedrockConverseClient:
         self,
         kwargs: dict[str, Any],
         *,
-        on_text_delta: Callable[[str], None] | None = None,
+        on_text_delta: Callable[[str], Any] | None = None,
+        cancel_event: Any | None = None,
     ) -> CompletionResult:
         client = _get_bedrock_runtime_client(self._region)
         try:
@@ -914,11 +940,25 @@ class BedrockConverseClient:
                     ) from exc2
             else:
                 raise ModelError(f"Bedrock converse_stream failed: {exc}") from exc
-        return stream_converse_to_result(
-            response,
-            model=self._config.model,
-            on_text_delta=on_text_delta,
-        )
+        stream = response.get("stream") if isinstance(response, dict) else None
+        try:
+            return stream_converse_to_result(
+                response,
+                model=self._config.model,
+                on_text_delta=on_text_delta,
+                on_interrupt_check=(
+                    (lambda: cancellation_requested(cancel_event))
+                    if cancel_event is not None
+                    else None
+                ),
+            )
+        finally:
+            close_stream = getattr(stream, "close", None)
+            if callable(close_stream):
+                try:
+                    close_stream()
+                except Exception:  # noqa: BLE001
+                    pass
 
 
 # Back-compat private name used by older code

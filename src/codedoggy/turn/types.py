@@ -27,6 +27,9 @@ class ToolCall:
     id: str
     name: str
     arguments: Any = field(default_factory=dict)
+    # Provider-required call metadata (Gemini thought signatures,
+    # Responses call_id, OpenRouter extra_content).  This must survive replay.
+    provider_data: dict[str, Any] | None = None
 
 
 @dataclass(slots=True)

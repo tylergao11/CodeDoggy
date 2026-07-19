@@ -83,9 +83,13 @@ def request_device_code(
     scopes: list[str],
     referrer: str = "codedoggy",
     extra_headers: dict[str, str] | None = None,
-    timeout_s: float = 30.0,
+    timeout_s: float = 5.0,
     allowed_hosts: frozenset[str] | None = None,
+    cancel_event: Any | None = None,
 ) -> DeviceCodeSession:
+    is_cancelled = getattr(cancel_event, "is_set", None)
+    if callable(is_cancelled) and is_cancelled():
+        raise DeviceFlowError("login cancelled")
     url = f"{issuer.rstrip('/')}/oauth2/device/code"
     form = {
         "client_id": client_id,
@@ -109,6 +113,9 @@ def request_device_code(
         raise DeviceFlowError(f"device code request failed HTTP {e.code}: {body[:300]}") from e
     except urllib.error.URLError as e:
         raise DeviceFlowError(f"device code request failed: {e.reason}") from e
+
+    if callable(is_cancelled) and is_cancelled():
+        raise DeviceFlowError("login cancelled")
 
     user_code = str(payload.get("user_code") or "")
     if not user_code:
@@ -160,6 +167,7 @@ def poll_device_token(
     extra_headers: dict[str, str] | None = None,
     on_pending: Callable[[], None] | None = None,
     timeout_s: float | None = None,
+    cancel_event: Any | None = None,
 ) -> TokenBundle:
     token_url = f"{issuer.rstrip('/')}/oauth2/token"
     interval = max(1, int(session.interval))
@@ -173,7 +181,15 @@ def poll_device_token(
     }
 
     while True:
-        time.sleep(interval)
+        if cancel_event is not None:
+            wait = getattr(cancel_event, "wait", None)
+            if callable(wait) and wait(interval):
+                raise DeviceFlowError("login cancelled")
+            is_set = getattr(cancel_event, "is_set", None)
+            if callable(is_set) and is_set():
+                raise DeviceFlowError("login cancelled")
+        else:
+            time.sleep(interval)
         if time.monotonic() > deadline:
             raise DeviceFlowError("device code expired — run login again")
 
@@ -185,7 +201,10 @@ def poll_device_token(
         data = urllib.parse.urlencode(form).encode("utf-8")
         req = urllib.request.Request(token_url, data=data, headers=headers, method="POST")
         try:
-            with urllib.request.urlopen(req, timeout=30.0) as resp:
+            # A TUI cancellation cannot interrupt urllib mid-read.  Keep the
+            # individual poll bounded so Esc/quit joins promptly.
+            remaining = max(1.0, deadline - time.monotonic())
+            with urllib.request.urlopen(req, timeout=min(5.0, remaining)) as resp:
                 payload = json.loads(resp.read().decode("utf-8"))
                 access = str(payload.get("access_token") or "")
                 if not access:

@@ -86,17 +86,27 @@ class SessionSearchTool(Tool):
         window = int(args.get("window") or 5)
         limit = int(args.get("limit") or 5)
         limit = max(1, min(limit, 30))
+        cwd_scope = str(Path(ctx.cwd).resolve()) if ctx.cwd is not None else None
+
+        if isinstance(session_id, str) and session_id.strip():
+            self._require_workspace_session(
+                store,
+                session_id.strip(),
+                cwd_scope=cwd_scope,
+            )
 
         # scroll
         if isinstance(session_id, str) and session_id.strip() and around is not None:
             data = store.get_messages_around(
                 session_id.strip(), int(around), window=window
             )
+            data = _public_transcript_payload(data)
             return json.dumps({"shape": "scroll", **data}, ensure_ascii=False, default=str)
 
         # read whole session
         if isinstance(session_id, str) and session_id.strip() and around is None and not query:
             msgs = store.get_messages(session_id.strip())
+            msgs = [_public_message(m) for m in msgs]
             if len(msgs) > 30:
                 head, tail = msgs[:20], msgs[-10:]
                 payload = {
@@ -116,9 +126,6 @@ class SessionSearchTool(Tool):
                 }
             return json.dumps(payload, ensure_ascii=False, default=str)
 
-        # Scope FTS to current workspace cwd (Hermes / cross-project boundary)
-        cwd_scope = str(Path(ctx.cwd).resolve()) if ctx.cwd is not None else None
-
         # discovery
         if isinstance(query, str) and query.strip():
             exclude = None
@@ -135,6 +142,7 @@ class SessionSearchTool(Tool):
                 around = store.get_messages_around(
                     h.session_id, h.message_id, window=5
                 )
+                around = _public_transcript_payload(around)
                 results.append(
                     {
                         "session_id": h.session_id,
@@ -158,9 +166,7 @@ class SessionSearchTool(Tool):
                 ensure_ascii=False,
                 default=str,
             )
-
         # browse — same cwd scope when store supports it
-        list_kw: dict[str, Any] = {"limit": limit}
         try:
             recent = store.list_recent_sessions(limit=limit, cwd=cwd_scope)
         except TypeError:
@@ -188,3 +194,50 @@ class SessionSearchTool(Tool):
             "No SessionStore bound. Wire via build_session or ToolCallContext.extra['session_store'].",
             code="session_store_not_configured",
         )
+
+    @staticmethod
+    def _require_workspace_session(
+        store: SessionStore,
+        session_id: str,
+        *,
+        cwd_scope: str | None,
+    ) -> None:
+        """Fail closed for explicit read/scroll across workspace boundaries."""
+        if not cwd_scope:
+            raise ToolError(
+                "Explicit session reads require a workspace cwd.",
+                code="session_scope_required",
+            )
+        check = store.validate_session_cwd(
+            session_id,
+            cwd_scope,
+            allow_missing=False,
+            allow_unbound=False,
+        )
+        if not check.allowed:
+            raise ToolError(
+                f"Session {session_id!r} is outside the current workspace "
+                f"({check.reason}).",
+                code="session_cwd_mismatch",
+            )
+
+
+def _public_message(message: dict[str, Any]) -> dict[str, Any]:
+    """Hide model-internal reasoning/signatures from the searchable tool view."""
+    return {
+        key: value
+        for key, value in message.items()
+        if key not in {"reasoning_content", "provider_data"}
+    }
+
+
+def _public_transcript_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    out = dict(payload)
+    for key in ("window", "messages"):
+        value = out.get(key)
+        if isinstance(value, list):
+            out[key] = [
+                _public_message(item) if isinstance(item, dict) else item
+                for item in value
+            ]
+    return out

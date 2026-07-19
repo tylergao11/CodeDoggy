@@ -19,6 +19,7 @@ import inspect
 import json
 import logging
 import threading
+from copy import deepcopy
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable
 
@@ -63,6 +64,10 @@ class MemoryManager:
         self.curated_store: Any | None = None
         self.session_store: Any | None = None
         self._session_id: str = ""
+        # External ecosystems may learn only completed turns.  Keep this
+        # projection separate from the raw Grok/live transcript used by the
+        # builtin session memory and model context.
+        self._completed_external_messages: dict[str, list[Any]] = {}
 
     @classmethod
     def create_default(
@@ -179,7 +184,8 @@ class MemoryManager:
         sid = session_id or self._session_id
         for p in self._providers:
             try:
-                result = p.prefetch(q, session_id=sid, cwd=cwd)
+                provider_query = _redact_external_text(p, q)
+                result = p.prefetch(provider_query, session_id=sid, cwd=cwd)
                 if result and str(result).strip():
                     parts.append(str(result).strip())
             except Exception as e:  # noqa: BLE001
@@ -201,7 +207,11 @@ class MemoryManager:
         def _run() -> None:
             for p in providers:
                 try:
-                    p.queue_prefetch(q, session_id=sid, cwd=cwd)
+                    p.queue_prefetch(
+                        _redact_external_text(p, q),
+                        session_id=sid,
+                        cwd=cwd,
+                    )
                 except Exception as e:  # noqa: BLE001
                     logger.debug("provider %s queue_prefetch failed: %s", p.name, e)
 
@@ -244,6 +254,7 @@ class MemoryManager:
         session_id: str = "",
         cwd: str = "",
         messages: list[Any] | None = None,
+        external_messages: list[Any] | None = None,
     ) -> None:
         """Post-turn sync on background worker (Hermes sync_all)."""
         providers = list(self._providers)
@@ -255,27 +266,42 @@ class MemoryManager:
         if not u.strip():
             return
 
-        def _run() -> None:
-            from codedoggy.memory.redact import redact_secrets
+        completed_turn = deepcopy(
+            list(external_messages)
+            if external_messages is not None
+            else [
+                {"role": "user", "content": u},
+                {"role": "assistant", "content": a},
+            ]
+        )
+        if any(_is_external_provider(p) for p in providers):
+            with self._lock:
+                transcript = self._completed_external_messages.setdefault(sid, [])
+                transcript.extend(deepcopy(completed_turn))
 
-            safe_u = redact_secrets(u) or ""
-            safe_a = redact_secrets(a) or ""
-            safe_msgs = _redact_messages_for_provider(messages)
+        def _run() -> None:
             for p in providers:
                 try:
+                    provider_u = _redact_external_text(p, u)
+                    provider_a = _redact_external_text(p, a)
+                    provider_msgs = (
+                        _redact_messages_for_provider(completed_turn)
+                        if _is_external_provider(p)
+                        else messages
+                    )
                     candidates: dict[str, Any] = {
                         "session_id": sid,
                         "cwd": cwd,
                     }
-                    if safe_msgs is not None:
-                        candidates["messages"] = safe_msgs
+                    if provider_msgs is not None:
+                        candidates["messages"] = provider_msgs
                     kwargs = self._supported_keyword_args(
                         p.sync_turn,
                         candidates,
                     )
                     # Exactly one call. A TypeError raised by provider logic is
                     # a real provider failure, not evidence of an old signature.
-                    p.sync_turn(safe_u, safe_a, **kwargs)
+                    p.sync_turn(provider_u, provider_a, **kwargs)
                 except Exception as e:  # noqa: BLE001
                     logger.warning(
                         "Memory provider '%s' sync_turn failed: %s", p.name, e
@@ -330,7 +356,15 @@ class MemoryManager:
                 return json.dumps(
                     {"success": False, "error": f"Provider has no handle_tool_call for {tool_name}"}
                 )
-            result = handle(tool_name, args, **kwargs)
+            if _is_external_provider(provider):
+                from codedoggy.model.redact import redact_tool_arguments
+
+                safe_args = redact_tool_arguments(args)
+                safe_kwargs = redact_tool_arguments(kwargs)
+            else:
+                safe_args = args
+                safe_kwargs = kwargs
+            result = handle(tool_name, safe_args, **safe_kwargs)
             if isinstance(result, str):
                 return result
             return json.dumps(result, ensure_ascii=False)
@@ -353,19 +387,31 @@ class MemoryManager:
             if not callable(hook):
                 continue
             try:
-                hook(turn_number, message, **kwargs)
+                hook(
+                    turn_number,
+                    _redact_external_text(p, message),
+                    **_redact_external_value(p, kwargs),
+                )
             except Exception as e:  # noqa: BLE001
                 logger.debug("provider %s on_turn_start failed: %s", p.name, e)
 
     def on_session_end(self, messages: list[Any] | None = None) -> None:
+        sid = self._session_id
+        with self._lock:
+            completed = deepcopy(self._completed_external_messages.get(sid, []))
         for p in self._providers:
             hook = getattr(p, "on_session_end", None)
             if not callable(hook):
                 continue
             try:
-                hook(list(messages or []))
+                snapshot = list(messages or [])
+                if _is_external_provider(p):
+                    snapshot = _redact_messages_for_provider(completed) or []
+                hook(snapshot)
             except Exception as e:  # noqa: BLE001
                 logger.warning("provider %s on_session_end failed: %s", p.name, e)
+        with self._lock:
+            self._completed_external_messages.pop(sid, None)
 
     def on_pre_compress(self, messages: list[Any] | None = None) -> str:
         """Hermes on_pre_compress — before context fold discards middle.
@@ -376,12 +422,19 @@ class MemoryManager:
         """
         parts: list[str] = []
         snap = list(messages or [])
+        with self._lock:
+            completed = deepcopy(
+                self._completed_external_messages.get(self._session_id, [])
+            )
         for p in self._providers:
             hook = getattr(p, "on_pre_compress", None)
             if not callable(hook):
                 continue
             try:
-                result = hook(snap)
+                provider_snap = snap
+                if _is_external_provider(p):
+                    provider_snap = _redact_messages_for_provider(completed) or []
+                result = hook(provider_snap)
                 if result and str(result).strip():
                     parts.append(str(result).strip())
             except Exception as e:  # noqa: BLE001
@@ -405,6 +458,8 @@ class MemoryManager:
         self._session_id = new_session_id
         if rewound:
             kwargs["rewound"] = True
+            with self._lock:
+                self._completed_external_messages.pop(new_session_id, None)
         for p in self._providers:
             hook = getattr(p, "on_session_switch", None)
             if not callable(hook):
@@ -541,13 +596,15 @@ class MemoryManager:
             if not callable(hook):
                 continue
             try:
+                safe_content = _redact_external_text(p, content)
+                safe_metadata = _redact_external_value(p, dict(metadata or {}))
                 metadata_mode = self._provider_memory_write_metadata_mode(p)
                 if metadata_mode == "keyword":
-                    hook(action, target, content, metadata=dict(metadata or {}))
+                    hook(action, target, safe_content, metadata=safe_metadata)
                 elif metadata_mode == "positional":
-                    hook(action, target, content, dict(metadata or {}))
+                    hook(action, target, safe_content, safe_metadata)
                 else:
-                    hook(action, target, content)
+                    hook(action, target, safe_content)
             except Exception as e:  # noqa: BLE001
                 logger.debug(
                     "Memory provider '%s' on_memory_write failed: %s", p.name, e
@@ -640,10 +697,10 @@ class MemoryManager:
                 continue
             try:
                 hook(
-                    task or "",
-                    result or "",
+                    _redact_external_text(p, task or ""),
+                    _redact_external_text(p, result or ""),
                     child_session_id=child_session_id,
-                    **kwargs,
+                    **_redact_external_value(p, kwargs),
                 )
             except Exception as e:  # noqa: BLE001
                 logger.debug(
@@ -783,32 +840,140 @@ class MemoryManager:
             return self._executor
 
 
+def _is_external_provider(provider: Any) -> bool:
+    name = str(getattr(provider, "name", "") or "")
+    return not (name == "builtin" or name.startswith("builtin"))
+
+
+def _redact_external_text(provider: Any, value: str) -> str:
+    if not _is_external_provider(provider):
+        return value
+    from codedoggy.model.redact import redact_sensitive_text
+
+    return redact_sensitive_text(value, force=True) or ""
+
+
+def _redact_external_value(provider: Any, value: Any) -> Any:
+    if not _is_external_provider(provider):
+        return value
+    from codedoggy.model.redact import redact_tool_arguments
+
+    return redact_tool_arguments(value)
+
+
 def _redact_messages_for_provider(messages: list[Any] | None) -> list[Any] | None:
-    """Best-effort redact of message content before external provider sync."""
+    """Build a provider-safe transcript without opaque replay credentials.
+
+    External memory providers need semantic text and tool shape, never signed
+    model replay blobs.  Redact tool inputs recursively and remove provider
+    metadata/reasoning so switching memory ecosystems cannot exfiltrate the
+    credentials embedded in a native model envelope.
+    """
     if not messages:
         return messages
-    from codedoggy.memory.redact import redact_secrets
+    import dataclasses
+
+    from codedoggy.model.redact import (
+        redact_sensitive_text,
+        redact_tool_arguments,
+    )
 
     out: list[Any] = []
     for m in messages:
         if isinstance(m, dict):
             d = dict(m)
             if "content" in d and isinstance(d["content"], str):
-                d["content"] = redact_secrets(d["content"])
+                d["content"] = redact_sensitive_text(d["content"], force=True)
+            if isinstance(d.get("tool_calls"), list):
+                d["tool_calls"] = [
+                    _redact_provider_tool_call(call, redact_tool_arguments)
+                    for call in d["tool_calls"]
+                ]
+            d.pop("reasoning_content", None)
+            d.pop("provider_data", None)
             out.append(d)
             continue
         content = getattr(m, "content", None)
-        if isinstance(content, str):
+        safe_content = (
+            redact_sensitive_text(content, force=True)
+            if isinstance(content, str)
+            else content
+        )
+        raw_calls = getattr(m, "tool_calls", None)
+        safe_calls = (
+            [
+                _redact_provider_tool_call(call, redact_tool_arguments)
+                for call in raw_calls
+            ]
+            if isinstance(raw_calls, list)
+            else raw_calls
+        )
+        if dataclasses.is_dataclass(m):
+            changes: dict[str, Any] = {}
+            fields = getattr(m, "__dataclass_fields__", {})
+            if "content" in fields:
+                changes["content"] = safe_content
+            if "tool_calls" in fields:
+                changes["tool_calls"] = safe_calls
+            if "reasoning_content" in fields:
+                changes["reasoning_content"] = None
+            if "provider_data" in fields:
+                changes["provider_data"] = None
             try:
-                # Prefer copy with redacted content when dataclass-like
-                if hasattr(m, "__dataclass_fields__"):
-                    import dataclasses
-
-                    out.append(
-                        dataclasses.replace(m, content=redact_secrets(content))
-                    )
-                    continue
+                out.append(dataclasses.replace(m, **changes))
+                continue
             except Exception:  # noqa: BLE001
                 pass
-        out.append(m)
+        # Unknown extension message objects are converted instead of sending
+        # the original object with attributes we cannot safely enumerate.
+        safe: dict[str, Any] = {
+            "role": str(getattr(getattr(m, "role", "user"), "value", getattr(m, "role", "user"))),
+            "content": safe_content,
+        }
+        for key in ("name", "tool_call_id"):
+            value = getattr(m, key, None)
+            if value is not None:
+                safe[key] = value
+        if safe_calls:
+            safe["tool_calls"] = safe_calls
+        out.append(safe)
     return out
+
+
+def _redact_provider_tool_call(call: Any, redact_arguments: Any) -> Any:
+    """Redact one flat or OpenAI-shaped tool call without mutating input."""
+    import dataclasses
+
+    if isinstance(call, dict):
+        safe = dict(call)
+        if "arguments" in safe:
+            safe["arguments"] = redact_arguments(safe["arguments"])
+        fn = safe.get("function")
+        if isinstance(fn, dict):
+            fn_safe = dict(fn)
+            if "arguments" in fn_safe:
+                fn_safe["arguments"] = redact_arguments(fn_safe["arguments"])
+            safe["function"] = fn_safe
+        # Tool-call provider metadata may contain thought signatures.
+        safe.pop("provider_data", None)
+        safe.pop("extra_content", None)
+        safe.pop("thought_signature", None)
+        return safe
+    if dataclasses.is_dataclass(call):
+        fields = getattr(call, "__dataclass_fields__", {})
+        changes: dict[str, Any] = {}
+        if "arguments" in fields:
+            changes["arguments"] = redact_arguments(
+                getattr(call, "arguments", {})
+            )
+        if "provider_data" in fields:
+            changes["provider_data"] = None
+        try:
+            return dataclasses.replace(call, **changes)
+        except Exception:  # noqa: BLE001
+            pass
+    return {
+        "id": str(getattr(call, "id", "")),
+        "name": str(getattr(call, "name", "")),
+        "arguments": redact_arguments(getattr(call, "arguments", {})),
+    }

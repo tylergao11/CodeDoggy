@@ -40,6 +40,7 @@ from codedoggy.tools.util.video_api import (
     VALID_VIDEO_RESOLUTIONS,
     XAI_VIDEO_BASE_MODEL,
     XAI_VIDEO_QUALITY_MODEL,
+    VideoConfig,
     generate_video,
     validate_imagine_duration,
     validate_one_of,
@@ -135,12 +136,14 @@ class ImageToVideoTool(Tool):
             validate_imagine_duration(duration)
             validate_one_of("resolution_name", resolution, list(VALID_VIDEO_RESOLUTIONS))
             image_url = resolve_image_reference(image, cwd=ctx.cwd)
+            cfg = VideoConfig.resolve(ctx.extra)
             raw = generate_video(
                 prompt=prompt if isinstance(prompt, str) else "",
                 image_url=image_url,
                 duration=duration if duration is not None else DEFAULT_IMAGINE_VIDEO_DURATION_SECS,
                 resolution=resolution,
                 model=XAI_VIDEO_QUALITY_MODEL,
+                config=cfg,
             )
         except ImagineNotSupported as e:
             raise ToolError(e.message, code=e.code) from e
@@ -241,6 +244,7 @@ class ReferenceToVideoTool(Tool):
             )
             validate_one_of("resolution_name", resolution, list(VALID_VIDEO_RESOLUTIONS))
             refs = [resolve_image_reference(str(img), cwd=ctx.cwd) for img in images]
+            cfg = VideoConfig.resolve(ctx.extra)
             raw = generate_video(
                 prompt=prompt.strip(),
                 reference_urls=refs,
@@ -248,6 +252,7 @@ class ReferenceToVideoTool(Tool):
                 aspect_ratio=aspect.strip(),
                 resolution=resolution,
                 model=XAI_VIDEO_BASE_MODEL,
+                config=cfg,
             )
         except ImagineNotSupported as e:
             raise ToolError(e.message, code=e.code) from e

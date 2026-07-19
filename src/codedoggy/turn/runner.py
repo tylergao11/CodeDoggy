@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from typing import Any
+from uuid import uuid4
 
 from codedoggy.session.types import TurnRequest, TurnResult, TurnStatus
 from codedoggy.tools.registry import FinalizedToolset
@@ -23,6 +24,8 @@ class AgentTurnRunner:
     SessionStore receives **archive copies** at message-create time (full
     tool bodies) so FTS is not limited to post-prune live content.
     """
+
+    supports_turn_host_events = True
 
     def __init__(
         self,
@@ -98,6 +101,8 @@ class AgentTurnRunner:
             check = getattr(session, "is_cancel_requested", None)
             return bool(check()) if callable(check) else False
 
+        cancel_event = getattr(session, "cancel_event", None)
+
         # Prefer RuntimeKernel as single source for handles + system prompt base
         kernel = getattr(session, "_kernel", None)
         if kernel is None:
@@ -151,6 +156,7 @@ class AgentTurnRunner:
 
             runtime = kernel.mcp_runtime
             connecting = list(getattr(runtime, "connecting_servers", []) or [])
+            statuses = list(getattr(runtime, "statuses", []) or [])
             connected_reminder = mcp_server_reminder_from_extra(
                 getattr(kernel, "tool_extra", None)
             )
@@ -166,6 +172,27 @@ class AgentTurnRunner:
                     "request likely requires one of these servers, mention that the server "
                     "is still connecting and proceed with what you can do in the meantime.",
                 ]
+                reminder_parts.append("\n".join(lines))
+            unavailable = [
+                item
+                for item in statuses
+                if isinstance(item, dict)
+                and item.get("status") in {"unavailable", "needs_auth"}
+            ]
+            if unavailable:
+                lines = [
+                    "Configured MCP servers currently unavailable (do not pretend their tools exist):"
+                ]
+                for item in unavailable:
+                    name = str(item.get("name") or "server")
+                    reason = str(item.get("reason") or item.get("status") or "unavailable")
+                    detail = " ".join(str(item.get("detail") or "").split())[:180]
+                    suffix = f" — {detail}" if detail else ""
+                    lines.append(f"- {name}: {reason}{suffix}")
+                lines.append(
+                    "If the request depends on one of these tools, report the exact MCP "
+                    "availability problem and continue only with capabilities that are actually ready."
+                )
                 reminder_parts.append("\n".join(lines))
             mcp_reminder = "\n\n".join(reminder_parts)
             if mcp_reminder:
@@ -220,6 +247,7 @@ class AgentTurnRunner:
         if compactor is not None and session_id:
             try:
                 compactor._session_id = session_id  # type: ignore[attr-defined]
+                compactor._cwd = str(cwd)  # type: ignore[attr-defined]
             except Exception:  # noqa: BLE001
                 pass
 
@@ -237,9 +265,29 @@ class AgentTurnRunner:
 
         prior = self.live_messages if self.resume_live and self.live_messages else None
 
+        turn_metadata = dict(request.metadata or {})
+        turn_observer = turn_metadata.get("on_live_message")
+        archive_turn_id = uuid4().hex
+        turn_archive_messages: list[Message] = []
+
         def _archive(msg: Message) -> None:
-            observer = self.on_live_message
-            if callable(observer):
+            # Keep a turn-local immutable projection.  ``loop.messages`` also
+            # contains resumed history, so passing it to an external memory
+            # provider would let a later successful turn teach an earlier
+            # cancelled/error/max-turn transcript.
+            from codedoggy.context.live_history import copy_message
+
+            turn_archive_messages.append(copy_message(msg))
+            # The runner-level observer is a legacy host hook.  Per-turn hosts
+            # (TUI/ACP/etc.) belong on TurnRequest.metadata so a model swap or
+            # concurrent host cannot leave a callback attached to the shared
+            # runner after the turn ends.
+            observers = (self.on_live_message, turn_observer)
+            seen_observers: set[int] = set()
+            for observer in observers:
+                if not callable(observer) or id(observer) in seen_observers:
+                    continue
+                seen_observers.add(id(observer))
                 try:
                     observer(msg)
                 except Exception:  # noqa: BLE001
@@ -253,7 +301,16 @@ class AgentTurnRunner:
                 tool_calls = None
                 if msg.tool_calls:
                     tool_calls = [
-                        {"id": tc.id, "name": tc.name, "arguments": tc.arguments}
+                        {
+                            "id": tc.id,
+                            "name": tc.name,
+                            "arguments": tc.arguments,
+                            **(
+                                {"provider_data": dict(tc.provider_data)}
+                                if isinstance(tc.provider_data, dict)
+                                else {}
+                            ),
+                        }
                         for tc in msg.tool_calls
                     ]
                 session_store.append_message(
@@ -263,6 +320,10 @@ class AgentTurnRunner:
                     tool_name=msg.name,
                     tool_call_id=msg.tool_call_id,
                     tool_calls=tool_calls,
+                    reasoning_content=msg.reasoning_content,
+                    provider_data=msg.provider_data,
+                    turn_id=archive_turn_id,
+                    outcome="pending",
                 )
             except Exception:  # noqa: BLE001
                 logger.warning("session archive append failed", exc_info=True)
@@ -308,6 +369,14 @@ class AgentTurnRunner:
         if request.prompt_id:
             tool_extra = dict(tool_extra)
             tool_extra["prompt_id"] = request.prompt_id
+        # Host streaming is turn-scoped.  Never write these callbacks into
+        # RuntimeKernel.tool_extra or ChatSampler: both outlive this request.
+        for key in ("stream_sample", "on_sample_delta"):
+            value = turn_metadata.get(key)
+            if value is not None:
+                if tool_extra is getattr(kernel, "tool_extra", None):
+                    tool_extra = dict(tool_extra)
+                tool_extra[key] = value
 
         loop = run_agent_loop(
             user_text=request.text,
@@ -317,6 +386,7 @@ class AgentTurnRunner:
             max_turns=max_turns,
             system_prompt=system_prompt,
             is_cancelled=_cancelled,
+            cancel_event=cancel_event,
             hooks=hooks,
             session=session,
             session_id=session_id,
@@ -333,6 +403,11 @@ class AgentTurnRunner:
         live = sanitize_tool_pairs(list(loop.messages))
         if self.resume_live:
             self.live_messages = live
+        if session_store is not None and session_id:
+            try:
+                session_store.save_context_snapshot(session_id, live)
+            except Exception:  # noqa: BLE001
+                logger.warning("canonical context snapshot save failed", exc_info=True)
 
         # Grok: clear UNTIL_SUCCESS suppress when a model sample completed.
         if not loop.error and compactor is not None:
@@ -399,6 +474,32 @@ class AgentTurnRunner:
                 metadata={"rounds": loop.rounds, **loop.metadata, **meta_extra},
             )
 
+        # Prefire is speculative generation only.  The outcome gate lives at
+        # the Session turn boundary so cancelled/aborted/error/max-turn work
+        # cannot become durable user memory.
+        finalize_context = getattr(compactor, "finalize_turn", None)
+        if callable(finalize_context):
+            try:
+                finalized = finalize_context(
+                    completed=result.status is TurnStatus.COMPLETED
+                )
+                if finalized:
+                    result.metadata["memory_flush_entries"] = int(finalized)
+            except Exception:  # noqa: BLE001
+                logger.exception("context turn finalization failed")
+
+        if session_store is not None and session_id:
+            try:
+                mark_outcome = getattr(session_store, "mark_turn_outcome", None)
+                if callable(mark_outcome):
+                    mark_outcome(
+                        session_id,
+                        archive_turn_id,
+                        result.status.value,
+                    )
+            except Exception:  # noqa: BLE001
+                logger.warning("session archive outcome update failed", exc_info=True)
+
         # Classify before durable provider sync. Cancel/abort/error/max-turn
         # transcripts remain observable, but cannot be learned as successes.
         on_turn_end(
@@ -409,6 +510,7 @@ class AgentTurnRunner:
             session_id=session_id or "",
             cwd=cwd_s,
             messages=list(loop.messages) if loop.messages else None,
+            external_messages=turn_archive_messages,
         )
         return result
 

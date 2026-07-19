@@ -28,10 +28,14 @@ from typing import Any
 from codedoggy.context.budget import (
     ContextBudget,
     estimate_chars,
+    estimate_tokens,
     needs_compaction,
 )
 from codedoggy.context.memory_flush import (
+    FlushResult,
     MemoryFlushConfig,
+    commit_memory_flush,
+    prepare_memory_flush,
     run_memory_flush,
     should_flush,
 )
@@ -154,6 +158,12 @@ class ContextCompactor:
     AWAITING_USAGE_MAX_ENSURES: int = 3
     prefire: PrefireController = field(default_factory=PrefireController)
     _prefire_flush_entries: int = 0
+    _prefire_flush_written_entries: list[str] = field(default_factory=list)
+    _pending_flushes: list[FlushResult] = field(default_factory=list)
+    _turn_active: bool = False
+    _turn_epoch: int = 0
+    _prefire_epoch: int | None = None
+    _turn_prior_flush_cycle: int = -1
 
     def update_from_response(self, usage: dict[str, Any] | None) -> None:
         """Track real API usage; clears awaiting_real_usage (Grok)."""
@@ -193,6 +203,16 @@ class ContextCompactor:
         """Grok tools_reserve: count tool schemas against the window each sample."""
         self.budget.bind_tools(tool_specs)
 
+    def bind_sample_overhead(
+        self,
+        canonical_messages: list[Message],
+        projected_messages: list[Message],
+    ) -> None:
+        """Reserve ephemeral user-info/memory-fence tokens for this sample."""
+        canonical = estimate_tokens(canonical_messages)
+        projected = estimate_tokens(projected_messages)
+        self.budget.ephemeral_reserve = max(0, projected - canonical)
+
     def bind_model_window(
         self,
         *,
@@ -215,10 +235,15 @@ class ContextCompactor:
         self._ineffective_compression_count = 0
         self._thrash_turns_left = 0
         self._prefire_flush_entries = 0
+        self._prefire_flush_written_entries = []
+        self._pending_flushes = []
+        self._turn_active = False
+        self._prefire_epoch = None
         self.budget.last_prompt_tokens = None
         self.budget.last_completion_tokens = None
         self.budget.awaiting_usage_ensures = 0
         self.budget.tools_reserve = 0
+        self.budget.ephemeral_reserve = 0
         self.suppressor.clear()
         self.prefire.clear()
 
@@ -241,16 +266,19 @@ class ContextCompactor:
 
         snap = [copy_message(m) for m in messages]
         client = self.summary_client
-        store = self.memory_store
         cfg = self.flush_config
 
-        def _job() -> int:
-            fr = run_memory_flush(
-                snap, client=client, memory_store=store, config=cfg
+        def _job() -> FlushResult:
+            return prepare_memory_flush(
+                snap,
+                client=client,
+                config=cfg,
             )
-            return int(fr.entries_written or 0)
 
-        return self.prefire.submit(_job)
+        submitted = self.prefire.submit(_job)
+        if submitted:
+            self._prefire_epoch = self._turn_epoch
+        return submitted
 
     def rewind_from_checkpoint(
         self, live_messages: list[Message], *, as_reference: bool = True
@@ -302,7 +330,68 @@ class ContextCompactor:
         )
 
     def on_turn_start(self) -> None:
+        # A flush can be generated speculatively during the turn, but durable
+        # memory is committed only after the owning turn is classified as
+        # completed.  Rotate the epoch so a timed-out old future can never be
+        # consumed by the next turn.
+        self._pending_flushes = []
+        self._turn_epoch += 1
+        self._turn_active = True
+        self._turn_prior_flush_cycle = self.last_flush_cycle
         self.suppressor.on_turn_start()
+
+    def finalize_turn(self, *, completed: bool) -> int:
+        """Commit staged memory only for a successfully completed turn."""
+        if not self._turn_active:
+            return 0
+
+        pre_epoch = self._prefire_epoch
+        pre_result = self.prefire.try_join()
+        if pre_result is None and completed and self.prefire.is_running():
+            pre_result = self.prefire.join(timeout_s=5.0)
+        if pre_result is not None:
+            self._prefire_epoch = None
+            if pre_epoch is None or pre_epoch == self._turn_epoch:
+                self.last_flush_cycle = self.compaction_count
+                if isinstance(pre_result, FlushResult):
+                    self._stage_or_commit_flush(pre_result)
+
+        written: list[str] = []
+        if completed:
+            for prepared in self._pending_flushes:
+                committed = commit_memory_flush(
+                    prepared,
+                    memory_store=self.memory_store,
+                )
+                written.extend(committed.written_entries)
+            if written:
+                # Refresh both curated prompt state and the external Hermes
+                # provider using the exact sections that were durably written.
+                _refresh_memory_after_flush(
+                    [],
+                    self.memory_store,
+                    self.memory_manager,
+                    written_entries=written,
+                )
+        else:
+            # The next valid turn must be allowed to extract again; a cancelled
+            # or aborted attempt cannot consume this compaction-cycle slot.
+            self.last_flush_cycle = self._turn_prior_flush_cycle
+            self.prefire.cancel_pending(timeout_s=0.0)
+
+        self._pending_flushes = []
+        self._prefire_flush_entries = 0
+        self._prefire_flush_written_entries = []
+        self._turn_active = False
+        return len(written)
+
+    def _stage_or_commit_flush(self, prepared: FlushResult) -> FlushResult:
+        """Honor turn outcome gating while preserving standalone semantics."""
+        if self._turn_active:
+            if prepared.kind.name == "ACCEPTED" and prepared.content:
+                self._pending_flushes.append(prepared)
+            return prepared
+        return commit_memory_flush(prepared, memory_store=self.memory_store)
 
     def on_model_success(self) -> None:
         self.suppressor.on_model_success()
@@ -324,13 +413,32 @@ class ContextCompactor:
         # Prefer non-blocking try_join so post-tool ensure does not serialize
         # against a just-submitted prefire (overlap with next sample wait).
         # Blocking join only when we must flush/fold under pressure.
-        # Join prefire: stash entry count only — refresh once in flush-account branch
-        pre_entries = self.prefire.try_join()
-        if pre_entries is None and needs_compaction(messages, self.budget):
-            pre_entries = self.prefire.join(timeout_s=45.0)
-        if isinstance(pre_entries, int) and pre_entries > 0:
-            self._prefire_flush_entries = pre_entries
+        # Join prefire, then commit on the turn thread.  Background prefire is
+        # generation-only and never writes a store that close() may tear down.
+        pre_epoch = self._prefire_epoch
+        pre_result = self.prefire.try_join()
+        if pre_result is None and needs_compaction(messages, self.budget):
+            pre_result = self.prefire.join(timeout_s=45.0)
+        if pre_result is not None:
+            self._prefire_epoch = None
+        if (
+            isinstance(pre_result, FlushResult)
+            and (pre_epoch is None or pre_epoch == self._turn_epoch)
+        ):
             self.last_flush_cycle = self.compaction_count
+            committed = self._stage_or_commit_flush(pre_result)
+            if committed.entries_written > 0:
+                self._prefire_flush_entries = committed.entries_written
+                self._prefire_flush_written_entries = list(
+                    committed.written_entries
+                )
+        elif isinstance(pre_result, int) and (
+            pre_epoch is None or pre_epoch == self._turn_epoch
+        ):
+            # Backward-compatible embedders may still return an entry count.
+            self.last_flush_cycle = self.compaction_count
+            if pre_result > 0:
+                self._prefire_flush_entries = pre_result
 
         # Bounded wait for real usage — never permanent when API omits usage
         if self.awaiting_real_usage and self.budget.last_prompt_tokens is None:
@@ -351,9 +459,13 @@ class ContextCompactor:
 
         before = estimate_chars(messages)
 
-        # Size soft-cap always (cheap). Retain-prune only under pressure —
-        # do not destroy early tool evidence when still under budget.
-        working, pruned = prune_oversized_tool_results(messages, self.budget)
+        # Grok keeps the verbatim window while it fits.  Truncating every tool
+        # result at a fixed 6k boundary silently amputated valid 8k subagent
+        # summaries even with tens of thousands of tokens still free.  Apply
+        # both size- and retain-pruning only once the actual sample window (or
+        # soft memory-flush threshold) is under pressure.
+        working = list(messages)
+        pruned = 0
         retained = 0
         under_pressure = needs_compaction(working, self.budget) or should_flush(
             working,
@@ -363,6 +475,10 @@ class ContextCompactor:
             current_cycle=self.compaction_count,
         )
         if under_pressure:
+            working, pruned = prune_oversized_tool_results(
+                working,
+                self.budget,
+            )
             working, retained = prune_retained_tool_results(
                 working,
                 retain_recent_tool_messages=self.budget.retain_recent_tool_messages,
@@ -375,10 +491,15 @@ class ContextCompactor:
         if self._prefire_flush_entries:
             flush_entries = self._prefire_flush_entries
             self._prefire_flush_entries = 0
+            written_entries = self._prefire_flush_written_entries
+            self._prefire_flush_written_entries = []
             if flush_entries:
                 mode = "flush+" + mode if mode != "none" else "flush"
                 working = _refresh_memory_after_flush(
-                    working, self.memory_store, self.memory_manager
+                    working,
+                    self.memory_store,
+                    self.memory_manager,
+                    written_entries=written_entries,
                 )
         elif should_flush(
             working,
@@ -387,18 +508,21 @@ class ContextCompactor:
             last_flush_cycle=self.last_flush_cycle,
             current_cycle=self.compaction_count,
         ) and not self.prefire.is_running():
-            fr = run_memory_flush(
+            prepared = prepare_memory_flush(
                 working,
                 client=self.summary_client,
-                memory_store=self.memory_store,
                 config=self.flush_config,
             )
+            fr = self._stage_or_commit_flush(prepared)
             flush_entries = fr.entries_written
             self.last_flush_cycle = self.compaction_count
             if flush_entries:
                 mode = "flush+" + mode if mode != "none" else "flush"
                 working = _refresh_memory_after_flush(
-                    working, self.memory_store, self.memory_manager
+                    working,
+                    self.memory_store,
+                    self.memory_manager,
+                    written_entries=fr.written_entries,
                 )
 
         if not needs_compaction(working, self.budget):
@@ -563,6 +687,8 @@ class ContextCompactor:
                     middle,
                     home=self.compaction_home,
                     note="pre-fold checkpoint (full middle before summary)",
+                    workspace=getattr(self, "_cwd", None),
+                    session_id=getattr(self, "_session_id", None),
                 )
                 self.last_checkpoint_path = str(segment_path)
             except Exception as e:  # noqa: BLE001
@@ -581,7 +707,13 @@ class ContextCompactor:
         elif self.mode is CompactionMode.SEGMENTS:
             from codedoggy.context.segments import compaction_dir
 
-            hint_loc = str(compaction_dir(self.compaction_home))
+            hint_loc = str(
+                compaction_dir(
+                    self.compaction_home,
+                    workspace=getattr(self, "_cwd", None),
+                    session_id=getattr(self, "_session_id", None),
+                )
+            )
         hint = self.mode.transcript_hint(hint_loc) or ""
 
         summary_msg = Message(
@@ -684,12 +816,28 @@ def _refresh_memory_after_flush(
     messages: list[Message],
     memory_store: Any | None,
     memory_manager: Any | None = None,
+    *,
+    written_entries: list[str] | None = None,
 ) -> list[Message]:
     """After mid-turn flush: one-spine refresh via Hermes seam when bound."""
     if memory_manager is not None:
         from codedoggy.memory.hermes_seam import notify_curated_write
 
-        notify_curated_write(memory_manager, "memory")
+        entries = list(written_entries or [])
+        if entries:
+            for entry in entries:
+                notify_curated_write(
+                    memory_manager,
+                    "memory",
+                    content=entry,
+                    metadata={"source": "context_flush"},
+                )
+        else:
+            # Compatibility for stores that only report a count: refresh the
+            # curated prompt, but do not invent an empty provider write.
+            refresh = getattr(memory_manager, "_refresh_curated_snapshot", None)
+            if callable(refresh):
+                refresh()
         store = getattr(memory_manager, "curated_store", None) or memory_store
     else:
         store = memory_store

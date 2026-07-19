@@ -10,7 +10,7 @@ from codedoggy.bootstrap import build_session
 from codedoggy.model.profiles import model_profiles_from_env
 
 
-def main(argv: list[str] | None = None) -> None:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="codedoggy",
         description="CodeDoggy parallel coding agent",
@@ -59,23 +59,28 @@ def main(argv: list[str] | None = None) -> None:
     try:
         if args.smoke:
             _print_wiring(session, profiles)
-            return
+            return 0
         interactive = not args.plain and sys.stdin.isatty() and sys.stdout.isatty()
         if interactive:
             from codedoggy.tui import run_tui
 
             run_tui(session, initial_prompt=args.prompt)
-            return
+            return 0
         if args.prompt:
-            _run_plain(session, args.prompt, profiles)
-            return
+            return _run_plain(session, args.prompt, profiles)
         _print_wiring(session, profiles)
         print("No TTY detected. Run `codedoggy` in a terminal or pass a prompt.")
+        return 0
     finally:
-        session.close()
+        # A normal process exit is a durability boundary: wait until memory,
+        # Graph and the session archive have actually persisted.  Exceptional
+        # unwinding stays bounded so a broken third-party/tool teardown cannot
+        # trap Ctrl-C or mask the original failure.
+        close_timeout = 5.0 if sys.exc_info()[0] is not None else None
+        session.close(timeout_s=close_timeout)
 
 
-def _run_plain(session: object, prompt: str, profiles: object) -> None:
+def _run_plain(session: object, prompt: str, profiles: object) -> int:
     _print_models(profiles)
     result = session.handle_prompt(prompt)  # type: ignore[attr-defined]
     print("status:", result.status.value)
@@ -83,6 +88,7 @@ def _run_plain(session: object, prompt: str, profiles: object) -> None:
         print(result.final_text)
     if result.error:
         print("error:", result.error)
+    return 0 if result.status.value == "completed" else 1
 
 
 def _print_models(profiles: object) -> None:
@@ -109,4 +115,4 @@ def _print_wiring(session: object, profiles: object) -> None:
 
 
 if __name__ == "__main__":
-    main(sys.argv[1:])
+    raise SystemExit(main(sys.argv[1:]))

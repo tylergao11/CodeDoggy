@@ -136,6 +136,7 @@ def on_turn_end(
     session_id: str = "",
     cwd: str = "",
     messages: list[Any] | None = None,
+    external_messages: list[Any] | None = None,
 ) -> None:
     """Sync only a genuinely completed user/assistant turn."""
     if memory_manager is None:
@@ -152,6 +153,7 @@ def on_turn_end(
             session_id=session_id,
             cwd=cwd,
             messages=messages,
+            external_messages=external_messages,
         )
     except Exception:  # noqa: BLE001
         logger.warning("sync_all failed", exc_info=True)

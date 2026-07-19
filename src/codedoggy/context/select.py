@@ -98,6 +98,8 @@ def sanitize_tool_pairs(messages: list[Message]) -> list[Message]:
                         tool_calls=None,
                         tool_call_id=None,
                         name=m.name,
+                        reasoning_content=m.reasoning_content,
+                        provider_data=None,
                     )
                 )
                 continue
@@ -111,6 +113,8 @@ def sanitize_tool_pairs(messages: list[Message]) -> list[Message]:
                             tool_calls=None,
                             tool_call_id=None,
                             name=m.name,
+                            reasoning_content=m.reasoning_content,
+                            provider_data=None,
                         )
                     )
                 continue

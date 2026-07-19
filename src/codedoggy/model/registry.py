@@ -160,17 +160,32 @@ def model_config_from_env(
 
 
 def _reasoning_extra_from_env() -> dict[str, Any]:
+    """Product default: reasoning ON at maximum effort (``high``).
+
+    Override with env:
+      CODEDOGGY_REASONING_EFFORT=low|medium|high|xhigh
+      CODEDOGGY_REASONING_ENABLED=0   # force off when supported
+    """
     extra: dict[str, Any] = {}
     enabled_raw = os.environ.get("CODEDOGGY_REASONING_ENABLED")
     effort_raw = os.environ.get("CODEDOGGY_REASONING_EFFORT")
+
+    # Default max when unset (user can lower via env).
     if enabled_raw is None and effort_raw is None:
-        return extra
+        return {"reasoning": {"enabled": True, "effort": "high"}}
+
     rc: dict[str, Any] = {}
     if enabled_raw is not None:
         rc["enabled"] = enabled_raw.strip().lower() in {"1", "true", "yes", "on"}
+    else:
+        rc["enabled"] = True
     if effort_raw is not None and effort_raw.strip():
         rc["effort"] = effort_raw.strip().lower()
-    if rc:
+    elif rc.get("enabled") is not False:
+        rc["effort"] = "high"
+    if rc.get("enabled") is False:
+        extra["reasoning"] = {"enabled": False}
+    else:
         extra["reasoning"] = rc
     return extra
 

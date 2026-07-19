@@ -7,6 +7,7 @@ Does not replace the transcript; detail view stays full-fidelity.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from threading import RLock
 from typing import Any
 
 
@@ -87,42 +88,53 @@ class LiveActivityBoard:
     """Per-(task, agent) short activity line for list + turn status."""
 
     def __init__(self) -> None:
+        self._lock = RLock()
         self._agents: dict[tuple[str, str], AgentActivity] = {}
 
     def clear(self) -> None:
-        self._agents.clear()
+        with self._lock:
+            self._agents.clear()
 
     def clear_task(self, task_id: str) -> None:
-        for key in [k for k in self._agents if k[0] == task_id]:
-            del self._agents[key]
+        with self._lock:
+            for key in [k for k in self._agents if k[0] == task_id]:
+                del self._agents[key]
 
     def clear_agent(self, task_id: str, agent_id: str) -> None:
-        self._agents.pop((task_id, agent_id), None)
+        with self._lock:
+            self._agents.pop((task_id, agent_id), None)
 
     def rebuild(self, task_id: str, agent_id: str, messages: list[Any]) -> str:
         """Recompute activity from a transcript snapshot (subagent poll path)."""
-        self.clear_agent(task_id, agent_id)
-        line = ""
-        for message in messages:
-            line = self.observe(task_id, agent_id, message)
-        return line
+        with self._lock:
+            self.clear_agent(task_id, agent_id)
+            line = ""
+            for message in messages:
+                line = self.observe(task_id, agent_id, message)
+            return line
 
     def line(self, task_id: str, agent_id: str) -> str:
-        state = self._agents.get((task_id, agent_id))
-        return state.line if state is not None else ""
+        with self._lock:
+            state = self._agents.get((task_id, agent_id))
+            return state.line if state is not None else ""
 
     def main_line(self, task_id: str) -> str:
-        main_key = (task_id, f"{task_id}:main")
-        state = self._agents.get(main_key)
-        if state is not None and state.line:
-            return state.line
-        for (tid, _aid), st in self._agents.items():
-            if tid == task_id and st.line:
-                return st.line
-        return ""
+        with self._lock:
+            main_key = (task_id, f"{task_id}:main")
+            state = self._agents.get(main_key)
+            if state is not None and state.line:
+                return state.line
+            for (tid, _aid), st in self._agents.items():
+                if tid == task_id and st.line:
+                    return st.line
+            return ""
 
     def observe(self, task_id: str, agent_id: str, message: Any) -> str:
         """Ingest one archived live message; return updated display line."""
+        with self._lock:
+            return self._observe_locked(task_id, agent_id, message)
+
+    def _observe_locked(self, task_id: str, agent_id: str, message: Any) -> str:
         key = (task_id, agent_id)
         state = self._agents.setdefault(key, AgentActivity())
         role = _role_value(message)

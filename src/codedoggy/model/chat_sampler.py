@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import inspect
+from copy import deepcopy
 from typing import Any
 
 from codedoggy.model.provider import ChatClient
@@ -35,19 +37,48 @@ class ChatSampler:
     ) -> SampleResult:
         chat_msgs = [_to_chat(m) for m in messages]
         tool_schemas = [_tool_schema(t) for t in tools] if tools else None
-        result = self._complete(chat_msgs, tool_schemas)
+        result = self._complete(chat_msgs, tool_schemas, cancel_event=None)
         return self._sample_from_completion(result)
 
-    def _complete(self, chat_msgs: list[ChatMessage], tool_schemas: list | None):
+    def sample_cancelable(
+        self,
+        messages: list[Message],
+        tools: list[ToolSpec],
+        *,
+        cancel_event: Any | None,
+    ) -> SampleResult:
+        """Sample with the turn's Grok-style cancellation token."""
+        chat_msgs = [_to_chat(m) for m in messages]
+        tool_schemas = [_tool_schema(t) for t in tools] if tools else None
+        result = self._complete(
+            chat_msgs,
+            tool_schemas,
+            cancel_event=cancel_event,
+        )
+        return self._sample_from_completion(result)
+
+    def _complete(
+        self,
+        chat_msgs: list[ChatMessage],
+        tool_schemas: list | None,
+        *,
+        cancel_event: Any | None,
+    ):
         if self.stream:
             stream_fn = getattr(self.client, "complete_stream", None)
             if callable(stream_fn):
-                return stream_fn(
-                    chat_msgs,
-                    tools=tool_schemas or None,
-                    on_delta=self.on_delta,
-                )
-        return self.client.complete(chat_msgs, tools=tool_schemas or None)
+                kwargs: dict[str, Any] = {
+                    "tools": tool_schemas or None,
+                    "on_delta": self.on_delta,
+                }
+                if _supports_keyword(stream_fn, "cancel_event"):
+                    kwargs["cancel_event"] = cancel_event
+                return stream_fn(chat_msgs, **kwargs)
+        complete = self.client.complete
+        kwargs = {"tools": tool_schemas or None}
+        if _supports_keyword(complete, "cancel_event"):
+            kwargs["cancel_event"] = cancel_event
+        return complete(chat_msgs, **kwargs)
 
     def _next_call_id(self) -> str:
         self._call_seq += 1
@@ -81,6 +112,7 @@ class ChatSampler:
                     id=tid,
                     name=str(name),
                     arguments=args,
+                    provider_data=_tool_call_provider_data(tc, fn),
                 )
             )
         raw = dict(result.raw or {})
@@ -108,11 +140,23 @@ def _sample_from_completion(result: Any) -> SampleResult:
     return ChatSampler._sample_from_completion(sampler, result)
 
 
+def _supports_keyword(fn: Any, name: str) -> bool:
+    """Decide compatibility before a provider call; never retry side effects."""
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+    return name in params or any(
+        p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()
+    )
+
+
 def _to_chat(m: Message) -> ChatMessage:
     tool_calls = None
     if m.tool_calls:
-        tool_calls = [
-            {
+        tool_calls = []
+        for tc in m.tool_calls:
+            wire: dict[str, Any] = {
                 "id": tc.id,
                 "type": "function",
                 "function": {
@@ -122,8 +166,16 @@ def _to_chat(m: Message) -> ChatMessage:
                     else str(tc.arguments),
                 },
             }
-            for tc in m.tool_calls
-        ]
+            pdata = getattr(tc, "provider_data", None)
+            if isinstance(pdata, dict):
+                fn_extra = pdata.get("_function_extra")
+                if isinstance(fn_extra, dict):
+                    for key, value in fn_extra.items():
+                        wire["function"].setdefault(key, deepcopy(value))
+                for key, value in pdata.items():
+                    if key != "_function_extra":
+                        wire.setdefault(key, deepcopy(value))
+            tool_calls.append(wire)
     role = m.role.value if isinstance(m.role, Role) else str(m.role)
     reasoning = getattr(m, "reasoning_content", None)
     pdata = getattr(m, "provider_data", None)
@@ -147,3 +199,20 @@ def _tool_schema(spec: ToolSpec) -> dict[str, Any]:
             "parameters": spec.parameters or {"type": "object", "properties": {}},
         },
     }
+
+
+def _tool_call_provider_data(
+    raw: dict[str, Any],
+    function: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Retain unknown wire fields required by non-OpenAI ecosystems."""
+    core = {"id", "type", "function", "name", "arguments"}
+    data = {key: deepcopy(value) for key, value in raw.items() if key not in core}
+    fn_extra = {
+        key: deepcopy(value)
+        for key, value in function.items()
+        if key not in {"name", "arguments"}
+    }
+    if fn_extra:
+        data["_function_extra"] = fn_extra
+    return data or None
