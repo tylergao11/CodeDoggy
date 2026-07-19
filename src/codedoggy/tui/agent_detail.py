@@ -46,20 +46,25 @@ DETAIL_FILTER_LABELS: dict[DetailFilter, str] = {
 # cockpit Style without importing or mutating app.py from this module.
 DETAIL_STYLE_RULES = {
     "detail.header": "bg:#0b0b0d #ff2d9a bold",
-    "detail.meta": "bg:#0b0b0d #78909c",
+    "detail.meta": "bg:#0b0b0d #6f8791",
     "detail.active": "bg:#0b0b0d #16dfe8 bold",
-    "detail.separator": "bg:#0b0b0d #15515a",
-    "detail.text": "bg:#0b0b0d #f5f5f7",
+    "detail.separator": "bg:#0b0b0d #123b43",
+    "detail.border.left": "bg:#0b0b0d #8f1b58",
+    "detail.border.right": "bg:#0b0b0d #0b6670",
+    "detail.text": "bg:#0b0b0d #e8f2f2",
     "detail.actor": "bg:#0b0b0d #16dfe8 bold",
+    "detail.actor.user": "bg:#0b0b0d #ff2d9a bold",
+    "detail.actor.assistant": "bg:#0b0b0d #16dfe8 bold",
+    "detail.actor.tool": "bg:#0b0b0d #ffb13b bold",
     "detail.tool": "bg:#0b0b0d #16dfe8",
-    "detail.block": "bg:#07171a #f0c7a4",
-    "detail.code": "bg:#07171a #f5f5f7",
-    "detail.diff.add": "bg:#07171a #16dfe8",
-    "detail.diff.remove": "bg:#07171a #ff2d9a",
-    "detail.diff.hunk": "bg:#07171a #ff9a3c",
-    "detail.success": "bg:#07171a #ff9a3c",
-    "detail.error": "bg:#07171a #ff2d9a",
-    "detail.warning": "bg:#07171a #ffd43b",
+    "detail.block": "bg:#071318 #cbdada",
+    "detail.code": "bg:#071318 #f5f5f7",
+    "detail.diff.add": "bg:#071318 #16dfe8",
+    "detail.diff.remove": "bg:#071318 #ff2d9a",
+    "detail.diff.hunk": "bg:#071318 #ffb13b",
+    "detail.success": "bg:#071318 #16dfe8",
+    "detail.error": "bg:#071318 #ff2d9a",
+    "detail.warning": "bg:#071318 #ffd43b",
 }
 
 
@@ -290,7 +295,13 @@ def render_detail_body(
     fragments: StyleAndTextTuples = []
     for index, record in enumerate(records):
         if index:
-            fragments.append(("class:detail.separator", "─" * width + "\n"))
+            fragments.extend(
+                [
+                    ("class:detail.border.left", "╾"),
+                    ("class:detail.separator", "┈" * max(1, width - 2)),
+                    ("class:detail.border.right", "╼\n"),
+                ]
+            )
         fragments.extend(_render_record(record, width))
     return fragments
 
@@ -318,11 +329,12 @@ def _render_record(record: DetailRecord, width: int) -> StyleAndTextTuples:
     fragments: StyleAndTextTuples = []
     prefix = f"{timestamp:<9}  "
     actor_piece = f"{actor:<10}  "
+    actor_style = _actor_style(actor)
     if get_cwidth(prefix + actor_piece) < width:
         fragments.extend(
             [
                 ("class:detail.meta", prefix),
-                ("class:detail.actor", actor_piece),
+                (actor_style, actor_piece),
                 (
                     "class:detail.text",
                     _truncate_display(
@@ -338,7 +350,7 @@ def _render_record(record: DetailRecord, width: int) -> StyleAndTextTuples:
             [
                 ("class:detail.meta", _truncate_display(timestamp, width)),
                 ("", "\n"),
-                ("class:detail.actor", _truncate_display(actor, width)),
+                (actor_style, _truncate_display(actor, width)),
                 ("", "\n"),
                 ("class:detail.text", _truncate_display(record.title, width)),
                 ("", "\n"),
@@ -353,7 +365,13 @@ def _render_record(record: DetailRecord, width: int) -> StyleAndTextTuples:
                 ]
             )
         if block.kind in {"code", "diff", "command", "output", "metadata"}:
-            fragments.append(("class:detail.separator", "  ┌" + "─" * (width - 4) + "┐\n"))
+            fragments.extend(
+                [
+                    ("class:detail.border.left", "  ┌"),
+                    ("class:detail.separator", "─" * (width - 4)),
+                    ("class:detail.border.right", "┐\n"),
+                ]
+            )
             for raw_line in block.text.splitlines() or [""]:
                 wrapped = _wrap_display(raw_line, body_width)
                 for line in wrapped:
@@ -361,12 +379,18 @@ def _render_record(record: DetailRecord, width: int) -> StyleAndTextTuples:
                     padding = max(0, body_width - get_cwidth(line))
                     fragments.extend(
                         [
-                            ("class:detail.separator", "  │"),
+                            ("class:detail.border.left", "  │"),
                             (style, line + " " * padding),
-                            ("class:detail.separator", "│\n"),
+                            ("class:detail.border.right", "│\n"),
                         ]
                     )
-            fragments.append(("class:detail.separator", "  └" + "─" * (width - 4) + "┘\n"))
+            fragments.extend(
+                [
+                    ("class:detail.border.left", "  └"),
+                    ("class:detail.separator", "─" * (width - 4)),
+                    ("class:detail.border.right", "┘\n"),
+                ]
+            )
         else:
             for paragraph_line in block.text.splitlines() or [""]:
                 for line in _wrap_display(paragraph_line, body_width):
@@ -377,6 +401,17 @@ def _render_record(record: DetailRecord, width: int) -> StyleAndTextTuples:
                         ]
                     )
     return fragments
+
+
+def _actor_style(actor: str) -> str:
+    normalized = actor.strip().upper()
+    if normalized == "USER":
+        return "class:detail.actor.user"
+    if normalized in {"TOOL", "SYSTEM"}:
+        return "class:detail.actor.tool"
+    if normalized in {"ASSISTANT", "AGENT", "MAIN"}:
+        return "class:detail.actor.assistant"
+    return "class:detail.actor"
 
 
 def _arguments_block(name: str, arguments: Any) -> DetailBlock:

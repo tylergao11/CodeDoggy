@@ -63,19 +63,29 @@ STATUS_TEXT = {
 CODEDOGGY_DARK = Style.from_dict(
     {
         "root": "bg:#0b0b0d #f5f5f7",
-        "header": "bg:#0b0b0d #16dfe8",
+        "header": "bg:#0b0b0d #dce9e9",
         "brand": "#ff2d9a bold",
-        "meta": "#78909c",
-        "separator": "#15515a",
-        "task.spine": "#15515a",
+        "brand.edge.pink": "#ff2d9a bold",
+        "brand.edge.cyan": "#16dfe8 bold",
+        "header.rule.dim": "#10373e",
+        "header.rule.pink": "#ff2d9a bold",
+        "header.rule.cyan": "#16dfe8 bold",
+        "header.rule.scan": "#d9ffff bold",
+        "meta": "#6f8791",
+        "separator": "#123b43",
+        "task.spine": "#123b43",
         "task.spine.active": "#16dfe8 bold",
         "task.marker": "#ff2d9a bold",
+        "task.marker.active": "#ffb13b bold",
+        "task.marker.idle": "#49636c",
         "task.title": "#f5f5f7 bold",
-        "task.divider": "#15515a",
-        "task.status": "#78909c",
+        "task.divider": "#123b43",
+        "task.divider.pink": "#8f1b58",
+        "task.divider.cyan": "#0b6670",
+        "task.status": "#6f8791",
         "task.status.running": "#16dfe8 bold",
         "task.status.reporting": "#ff2d9a bold",
-        "task.status.completed": "#ff9a3c bold",
+        "task.status.completed": "#ffb13b bold",
         "task.status.failed": "#ff2d9a bold",
         "doggy.wordmark": "#ff2d9a bold",
         "agent.border": "#16dfe8",
@@ -83,19 +93,21 @@ CODEDOGGY_DARK = Style.from_dict(
         "agent.label": "#16dfe8 bold",
         "agent.label.selected": "#ff9a3c bold",
         "reporter.running": "#16dfe8 bold",
-        "reporter.completed": "#ff9a3c bold",
-        "reporter.waiting": "#78909c bold",
+        "reporter.completed": "#ffb13b bold",
+        "reporter.waiting": "#6f8791 bold",
         "reporter.failed": "#ff2d9a bold",
-        "report": "#f0c7a4",
+        "report": "#dce9e9",
         "input": "bg:#071014 #f5f5f7",
         "input.placeholder": "bg:#071014 #536b75",
         "prompt": "bg:#071014 #ff2d9a bold",
         "prompt.border": "bg:#0b0b0d #16dfe8",
         "prompt.border.focus": "bg:#0b0b0d #ff2d9a bold",
+        "prompt.border.dim": "bg:#0b0b0d #401a31",
+        "prompt.corner.cyan": "bg:#0b0b0d #16dfe8 bold",
         "prompt.border.info": "bg:#0b0b0d #16dfe8",
         "prompt.border.success": "bg:#0b0b0d #ff9a3c",
         "prompt.border.warning": "bg:#0b0b0d #ff2d9a",
-        "prompt.caption": "bg:#0b0b0d #16dfe8",
+        "prompt.caption": "bg:#0b0b0d #16dfe8 bold",
         "turn.status": "bg:#0b0b0d #16dfe8",
         "turn.elapsed": "bg:#0b0b0d #78909c",
         "turn.stop": "bg:#0b0b0d #ff2d9a bold",
@@ -110,6 +122,10 @@ CODEDOGGY_DARK = Style.from_dict(
         "agent-window.header": "bg:#0b0b0d #ff2d9a bold",
         "agent-window.close": "bg:#40102d #ff5ab3 bold",
         "agent-window.hint": "bg:#0b0b0d #16dfe8",
+        "modal.border.left": "bg:#0b0b0d #ff2d9a bold",
+        "modal.border.right": "bg:#0b0b0d #16dfe8 bold",
+        "modal.border.dim": "bg:#0b0b0d #123b43",
+        "modal.border.scan": "bg:#0b0b0d #d9ffff bold",
         "detail.input": "bg:#071014 #f5f5f7",
         "detail.input.prompt": "bg:#071014 #ff9a3c bold",
         **DETAIL_STYLE_RULES,
@@ -217,7 +233,11 @@ class CodeDoggyTUI:
             height=1,
             style="class:header",
         )
-        separator = Window(height=1, char="─", style="class:separator")
+        separator = Window(
+            FormattedTextControl(self._render_header_rule),
+            height=1,
+            style="class:header",
+        )
         turn_status = Window(
             FormattedTextControl(self._render_turn_status),
             height=1,
@@ -280,23 +300,58 @@ class CodeDoggyTUI:
             ],
             style="class:agent-window",
         )
+        modal_panel = HSplit(
+            [
+                modal_header,
+                Window(height=1, char="─", style="class:separator"),
+                Window(
+                    FormattedTextControl(self._render_modal_filters),
+                    height=1,
+                    style="class:agent-window",
+                ),
+                Window(height=1, char="─", style="class:separator"),
+                self._detail_window,
+                self._detail_input,
+                Window(
+                    FormattedTextControl(self._render_modal_hint),
+                    height=1,
+                    style="class:agent-window.hint",
+                ),
+            ],
+            style="class:agent-window",
+        )
         modal_content = ConditionalContainer(
             HSplit(
                 [
-                    modal_header,
-                    Window(height=1, char="─", style="class:separator"),
                     Window(
-                        FormattedTextControl(self._render_modal_filters),
+                        FormattedTextControl(
+                            lambda: self._render_modal_border(top=True)
+                        ),
                         height=1,
                         style="class:agent-window",
                     ),
-                    Window(height=1, char="─", style="class:separator"),
-                    self._detail_window,
-                    self._detail_input,
+                    VSplit(
+                        [
+                            Window(
+                                width=1,
+                                char="│",
+                                style="class:modal.border.left",
+                            ),
+                            modal_panel,
+                            Window(
+                                width=1,
+                                char="│",
+                                style="class:modal.border.right",
+                            ),
+                        ],
+                        style="class:agent-window",
+                    ),
                     Window(
-                        FormattedTextControl(self._render_modal_hint),
+                        FormattedTextControl(
+                            lambda: self._render_modal_border(top=False)
+                        ),
                         height=1,
-                        style="class:agent-window.hint",
+                        style="class:agent-window",
                     ),
                 ],
                 style="class:agent-window",
@@ -794,20 +849,41 @@ class CodeDoggyTUI:
 
     def _render_prompt_top(self) -> StyleAndTextTuples:
         width = max(16, _terminal_width())
-        return [(self._prompt_border_class(), "  ╭" + "─" * (width - 4) + "╮")]
+        border = self._prompt_border_class()
+        rail_width = width - 4
+        if border != "class:prompt.border.focus" or rail_width < 8:
+            return [(border, "  ╭" + "─" * rail_width + "╮")]
+
+        scan = int(time.monotonic() * 14) % rail_width
+        styles = ["class:prompt.border.dim"] * rail_width
+        styles[0] = border
+        for offset in range(3):
+            styles[(scan + offset) % rail_width] = border
+        fragments: StyleAndTextTuples = [(border, "  ╭")]
+        for style, cells in groupby(styles):
+            fragments.append((style, "─" * sum(1 for _ in cells)))
+        fragments.append(("class:prompt.corner.cyan", "╮"))
+        return fragments
 
     def _render_prompt_right(self) -> StyleAndTextTuples:
-        return [(self._prompt_border_class(), "│  ")]
+        return [("class:prompt.corner.cyan", "│  ")]
 
     def _render_prompt_bottom(self) -> StyleAndTextTuples:
         width = max(16, _terminal_width())
         caption_text = _truncate_display(_model_and_mode_text(self.session), width - 7)
         caption = f" {caption_text} "
         fill = max(1, width - 4 - get_cwidth(caption))
+        border = self._prompt_border_class()
+        rail = (
+            "class:prompt.border.dim"
+            if border == "class:prompt.border.focus"
+            else border
+        )
         return [
-            (self._prompt_border_class(), "  ╰" + "─" * fill),
+            (border, "  ╰"),
+            (rail, "─" * fill),
             ("class:prompt.caption", caption),
-            (self._prompt_border_class(), "╯"),
+            ("class:prompt.corner.cyan", "╯"),
         ]
 
     def _prompt_border_class(self) -> str:
@@ -925,11 +1001,59 @@ class CodeDoggyTUI:
         width = max(1, _terminal_width())
         left = "  ==DOGGY=="
         right = _budget_text(self.session)
-        left = _truncate_display(left, width)
+        if width < get_cwidth(left):
+            return [("class:brand", _truncate_display(left, width))]
+
+        pulse = int(time.monotonic() * 2) % 2
+        edge_left = (
+            "class:brand.edge.pink" if pulse == 0 else "class:brand.edge.cyan"
+        )
+        edge_right = (
+            "class:brand.edge.cyan" if pulse == 0 else "class:brand.edge.pink"
+        )
+        fragments: StyleAndTextTuples = [
+            ("class:header", "  "),
+            (edge_left, "=="),
+            ("class:brand", "DOGGY"),
+            (edge_right, "=="),
+        ]
         if not right or get_cwidth(left) + get_cwidth(right) + 2 > width:
-            return [("class:brand", left)]
+            return fragments
         gap = width - get_cwidth(left) - get_cwidth(right) - 1
-        return [("class:brand", left), ("class:meta", " " * gap + right + " ")]
+        fragments.append(("class:meta", " " * gap + right + " "))
+        return fragments
+
+    def _render_header_rule(self) -> StyleAndTextTuples:
+        width = max(1, _terminal_width())
+        styles = ["class:header.rule.dim"] * width
+        for index in range(min(4, width)):
+            styles[index] = "class:header.rule.pink"
+        for index in range(max(0, width - 4), width):
+            styles[index] = "class:header.rule.cyan"
+        scan = int(time.monotonic() * 18) % width
+        for offset in range(min(3, width)):
+            styles[(scan + offset) % width] = "class:header.rule.scan"
+        fragments: StyleAndTextTuples = []
+        for style, cells in groupby(styles):
+            fragments.append((style, "─" * sum(1 for _ in cells)))
+        return fragments
+
+    def _render_modal_border(self, *, top: bool) -> StyleAndTextTuples:
+        width = max(4, _terminal_width() - 4)
+        rail_width = width - 2
+        styles = ["class:modal.border.dim"] * rail_width
+        scan = int(time.monotonic() * 10) % rail_width
+        for offset in range(min(3, rail_width)):
+            styles[(scan + offset) % rail_width] = "class:modal.border.scan"
+        fragments: StyleAndTextTuples = [
+            ("class:modal.border.left", "╭" if top else "╰")
+        ]
+        for style, cells in groupby(styles):
+            fragments.append((style, "─" * sum(1 for _ in cells)))
+        fragments.append(
+            ("class:modal.border.right", "╮" if top else "╯")
+        )
+        return fragments
 
     def _render_tasks(self) -> StyleAndTextTuples:
         tasks = self.ledger.snapshots()
@@ -952,6 +1076,15 @@ class CodeDoggyTUI:
                 else _task_stage_text(task)
             )
             marker = "◆" if active else "•"
+            marker_style = (
+                "class:task.marker.active"
+                if active and int(time.monotonic() * 4) % 2 == 0
+                else (
+                    "class:task.marker"
+                    if active
+                    else "class:task.marker.idle"
+                )
+            )
             minimum_gap = 1 if width < 34 else 2
             fixed_width = get_cwidth(prefix) + 1 + 2 + minimum_gap + 2
             title_budget = max(1, width - get_cwidth(status) - fixed_width)
@@ -961,7 +1094,7 @@ class CodeDoggyTUI:
             fragments.extend(
                 [
                     (spine_style, prefix),
-                    ("class:task.marker", marker),
+                    (marker_style, marker),
                     ("class:task.title", f"  {title}"),
                     (_task_status_style(task), " " * gap + status + "  \n"),
                 ]
@@ -985,7 +1118,12 @@ class CodeDoggyTUI:
             fragments.extend(
                 [
                     (spine_style, prefix),
-                    ("class:task.divider", "  " + "┈" * divider_width + "\n"),
+                    ("class:task.divider.pink", "  ╾"),
+                    (
+                        "class:task.divider",
+                        "┈" * max(1, divider_width - 2),
+                    ),
+                    ("class:task.divider.cyan", "╼\n"),
                 ]
             )
             line += 1
@@ -1104,6 +1242,11 @@ class CodeDoggyTUI:
         width = max(12, _terminal_width() - 9)
         left = f"  ‹ {agent.label} · {task.title}"
         right = STATUS_TEXT.get(agent.status, agent.status)
+        if agent.status in {"pending", "running"}:
+            spinner = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"[
+                int(time.monotonic() * 8) % 10
+            ]
+            right = f"{spinner} {right}"
         if get_cwidth(left) + get_cwidth(right) + 2 <= width:
             gap = width - get_cwidth(left) - get_cwidth(right)
             return [
@@ -1118,7 +1261,9 @@ class CodeDoggyTUI:
         fragments: StyleAndTextTuples = [("", "  ")]
         used = 2
         for index, detail_filter in enumerate(DETAIL_FILTERS, start=1):
-            label = f"F{index} {DETAIL_FILTER_LABELS[detail_filter]}"
+            active = detail_filter == self._detail_filter
+            base_label = f"F{index} {DETAIL_FILTER_LABELS[detail_filter]}"
+            label = f"╾ {base_label} ╼" if active else base_label
             piece_width = get_cwidth(label) + (3 if used > 2 else 0)
             if used + piece_width > width:
                 break
@@ -1126,7 +1271,7 @@ class CodeDoggyTUI:
                 fragments.append(("class:detail.meta", " · "))
             style = (
                 "class:detail.active"
-                if detail_filter == self._detail_filter
+                if active
                 else "class:detail.meta"
             )
             fragments.append(
