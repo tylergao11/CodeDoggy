@@ -12,7 +12,9 @@ from prompt_toolkit.input.defaults import create_pipe_input
 from prompt_toolkit.output import DummyOutput
 from prompt_toolkit.utils import get_cwidth
 
+from codedoggy.session import Session, SessionExtensions
 from codedoggy.session.types import TurnResult, TurnStatus
+from codedoggy.tools import ToolRegistryBuilder
 from codedoggy.tui.app import (
     CodeDoggyTUI,
     _compact_task_stage_text,
@@ -20,11 +22,12 @@ from codedoggy.tui.app import (
     _task_activity_text,
     _task_status_style,
     _task_stage_text,
-    agent_text_from_messages,
+    agent_summary_text_from_messages,
     task_report_from_agent,
 )
 from codedoggy.tui.model import TaskLedger
-from codedoggy.turn.types import Message, Role, ToolCall
+from codedoggy.turn import AgentTurnRunner
+from codedoggy.turn.types import Message, Role, SampleResult, ToolCall
 
 
 class _Session:
@@ -92,7 +95,7 @@ def test_ledger_keeps_agents_under_their_task_and_exposes_parallel_stage() -> No
     assert _task_status_style(snapshot) == "class:task.status.reporting"
 
 
-def test_agent_detail_contains_assistant_output_not_tool_records() -> None:
+def test_overview_summary_contains_assistant_output_not_tool_noise() -> None:
     messages = [
         Message(role=Role.ASSISTANT, content="我先检查入口。"),
         Message(
@@ -104,10 +107,106 @@ def test_agent_detail_contains_assistant_output_not_tool_records() -> None:
         Message(role=Role.ASSISTANT, content="入口已经确认，可以实现。"),
     ]
 
-    output = agent_text_from_messages(messages)
+    output = agent_summary_text_from_messages(messages)
     assert output == "我先检查入口。\n\n入口已经确认，可以实现。"
     assert "raw grep output" not in output
     assert "grep" not in output
+
+
+def test_open_agent_uses_full_turn_transcript_including_tool_details() -> None:
+    class _TranscriptSession(_Session):
+        def handle_prompt(self, prompt: str, **_: object) -> TurnResult:
+            messages = [
+                Message(role=Role.ASSISTANT, content="我先运行定向测试。"),
+                Message(
+                    role=Role.ASSISTANT,
+                    tool_calls=[
+                        ToolCall(
+                            id="shell-1",
+                            name="shell",
+                            arguments={"command": "pytest tests/test_tui.py -q"},
+                        )
+                    ],
+                ),
+                Message(
+                    role=Role.TOOL,
+                    name="shell",
+                    tool_call_id="shell-1",
+                    content="12 passed in 0.84s",
+                ),
+                Message(role=Role.ASSISTANT, content="测试完成。"),
+            ]
+            observer = getattr(self.extensions.turn_runner, "on_live_message", None)
+            for message in messages:
+                if callable(observer):
+                    observer(message)
+            self.extensions.turn_runner.live_messages.extend(messages)
+            return TurnResult(status=TurnStatus.COMPLETED, final_text=f"已完成：{prompt}")
+
+    with create_pipe_input() as pipe_input:
+        tui = CodeDoggyTUI(
+            _TranscriptSession(),
+            input=pipe_input,
+            output=DummyOutput(),
+        )
+        tui._start_task("实现全量详情")
+        assert _wait_until(lambda: not tui._is_running())
+        task = tui.ledger.snapshots()[0]
+        tui._open_agent(task.id, task.agents[0].id)
+
+        detail = "".join(fragment[1] for fragment in tui._render_modal_body())
+        assert "我先运行定向测试" in detail
+        assert "$ pytest tests/test_tui.py -q" in detail
+        assert "12 passed in 0.84s" in detail
+        filters = "".join(fragment[1] for fragment in tui._render_modal_filters())
+        assert "F1 全部" in filters and "F5 测试" in filters
+
+        tui._set_detail_filter("test")
+        filtered = "".join(fragment[1] for fragment in tui._render_modal_body())
+        assert "pytest tests/test_tui.py -q" in filtered
+        assert "我先运行定向测试" not in filtered
+
+
+def test_real_session_runner_flows_into_clicked_main_detail(tmp_path: Path) -> None:
+    class _ScriptedSampler:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def sample(self, _: list[Message], __: object) -> SampleResult:
+            self.calls += 1
+            if self.calls == 1:
+                return SampleResult(
+                    content="我先读取真实文件。",
+                    tool_calls=[
+                        ToolCall(
+                            id="real-read",
+                            name="read_file",
+                            arguments={"target_file": "detail.txt"},
+                        )
+                    ],
+                )
+            return SampleResult(content="真实链路读取完成。")
+
+    (tmp_path / "detail.txt").write_text("full transcript payload\n", encoding="utf-8")
+    tools = ToolRegistryBuilder.new().finalize()
+    runner = AgentTurnRunner(sampler=_ScriptedSampler(), tools=tools)
+    session = Session.create(tmp_path, max_turns=3)
+    session.bind_extensions(SessionExtensions(turn_runner=runner, tools=tools))
+    try:
+        with create_pipe_input() as pipe_input:
+            tui = CodeDoggyTUI(session, input=pipe_input, output=DummyOutput())
+            tui._start_task("读取 detail.txt")
+            assert _wait_until(lambda: not tui._is_running())
+            task = tui.ledger.snapshots()[0]
+            tui._open_agent(task.id, task.agents[0].id)
+
+            detail = "".join(fragment[1] for fragment in tui._render_modal_body())
+            assert "我先读取真实文件" in detail
+            assert "target_file: detail.txt" in detail
+            assert "full transcript payload" in detail
+            assert "真实链路读取完成" in detail
+    finally:
+        session.close()
 
 
 def test_task_report_is_the_agents_first_brief_paragraph() -> None:
@@ -123,10 +222,9 @@ def test_empty_state_is_only_neon_doggy_city_art_without_overflow() -> None:
     narrow = "".join(fragment[1] for fragment in narrow_fragments)
     wide = "".join(fragment[1] for fragment in wide_fragments)
 
-    assert "— DOGGY —" in narrow
+    assert "DOGGY DRIVE" not in narrow
     assert "D   o   g   g   y" not in narrow
     for accidental_label in (
-        "DOGGY DRIVE",
         "SPEED",
         "GEAR",
         "HEAT",
@@ -140,9 +238,9 @@ def test_empty_state_is_only_neon_doggy_city_art_without_overflow() -> None:
     ):
         assert accidental_label not in narrow
     styles = " ".join(fragment[0] for fragment in wide_fragments)
-    assert "#16dfe5" in styles
-    assert "#f12698" in styles
-    assert "#ffc21a" in styles
+    assert "#16dfe8" in styles
+    assert "#ff2d9a" in styles
+    assert "#f0c7a4" in styles
     assert narrow_fragments != pulse_fragments
     assert all(get_cwidth(line) <= 36 for line in narrow.splitlines())
     assert all(get_cwidth(line) <= 80 for line in wide.splitlines())
@@ -192,6 +290,125 @@ def test_parallel_runtime_uses_child_descriptions_as_clickable_participants() ->
         assert "正在验证交互" in rendered
 
 
+def test_child_agent_detail_uses_serialized_runtime_transcript() -> None:
+    session = _Session()
+    session.subagents.append(
+        SimpleNamespace(
+            subagent_id="sub_builder",
+            subagent_type="general-purpose",
+            description="详情构建",
+            status="completed",
+            output="实现完成",
+            error=None,
+            live_messages=[
+                {"role": "assistant", "content": "我先读取详情入口。"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "read-child",
+                            "name": "read_file",
+                            "arguments": {"path": "src/codedoggy/tui/app.py"},
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "name": "read_file",
+                    "tool_call_id": "read-child",
+                    "content": "1238 def _open_agent(...):",
+                },
+            ],
+        )
+    )
+    with create_pipe_input() as pipe_input:
+        tui = CodeDoggyTUI(session, input=pipe_input, output=DummyOutput())
+        task = tui.ledger.create("接入子 Agent 详情")
+        tui._active_task_id = task.id
+        tui._subagent_baselines[task.id] = set()
+        tui._sync_runtime()
+        tui._open_agent(task.id, "sub_builder")
+
+        detail = "".join(fragment[1] for fragment in tui._render_modal_body())
+        assert "我先读取详情入口" in detail
+        assert "path: src/codedoggy/tui/app.py" in detail
+        assert "def _open_agent" in detail
+
+
+def test_running_child_detail_does_not_fake_unavailable_tool_history() -> None:
+    session = _Session()
+    session.subagents.append(
+        SimpleNamespace(
+            subagent_id="sub_running",
+            subagent_type="general-purpose",
+            description="交互验证",
+            status="running",
+            output="正在验证",
+            error=None,
+        )
+    )
+    with create_pipe_input() as pipe_input:
+        tui = CodeDoggyTUI(session, input=pipe_input, output=DummyOutput())
+        task = tui.ledger.create("等待子 Agent 完整记录")
+        tui._active_task_id = task.id
+        tui._subagent_baselines[task.id] = set()
+        tui._sync_runtime()
+        tui._open_agent(task.id, "sub_running")
+
+        detail = "".join(fragment[1] for fragment in tui._render_modal_body())
+        assert "当前运行时只在本轮结束后同步完整工具记录" in detail
+        assert "正在验证" not in detail
+
+
+def test_detail_interjection_cannot_cross_from_historical_task() -> None:
+    class _RecordingSession(_Session):
+        def __init__(self) -> None:
+            super().__init__()
+            self.interjections: list[tuple[str, str | None]] = []
+
+        def interject(self, text: str, **kwargs: object) -> None:
+            self.interjections.append((text, kwargs.get("prompt_id")))  # type: ignore[arg-type]
+
+    session = _RecordingSession()
+    with create_pipe_input() as pipe_input:
+        tui = CodeDoggyTUI(session, input=pipe_input, output=DummyOutput())
+        historical = tui.ledger.create("历史任务")
+        current = tui.ledger.create("当前运行任务")
+        tui._active_task_id = current.id
+        tui._open_agent(historical.id, historical.agents[0].id)
+        tui._is_running = lambda: True  # type: ignore[method-assign]
+        buffer = SimpleNamespace(text="不要串到当前任务")
+
+        assert tui._accept_detail_prompt(buffer) is True
+        assert session.interjections == []
+        assert tui._feedback_text == "只能向当前运行任务补充指令"
+
+
+def test_detail_prompt_prefix_leaves_input_room_on_narrow_terminals(
+    monkeypatch: object,
+) -> None:
+    with create_pipe_input() as pipe_input:
+        tui = CodeDoggyTUI(_Session(), input=pipe_input, output=DummyOutput())
+        task = tui.ledger.create("窄屏输入")
+        tui.ledger.update_agent(
+            task.id,
+            "long-child",
+            label="VERY LONG CHILD AGENT",
+            status="running",
+        )
+        tui._open_agent(task.id, "long-child")
+
+        for width in (12, 20, 36, 40, 80, 120):
+            monkeypatch.setattr(  # type: ignore[attr-defined]
+                tui_app,
+                "_terminal_width",
+                lambda width=width: width,
+            )
+            prefix = "".join(piece[1] for piece in tui._render_detail_prompt_prefix())
+            assert get_cwidth(prefix) <= max(4, width - 20)
+
+
 def test_task_panel_keeps_reference_layout_across_terminal_widths(
     monkeypatch: object,
 ) -> None:
@@ -225,9 +442,9 @@ def test_task_panel_keeps_reference_layout_across_terminal_widths(
             assert all(get_cwidth(line) <= width for line in rendered.splitlines())
             header = "".join(fragment[1] for fragment in tui._render_header())
             assert get_cwidth(header) <= width
-            assert header.startswith("  CODEDOGGY")
+            assert header.startswith("  ==DOGGY==")
             assert "main ·" not in header
-            assert "▼" in rendered
+            assert "◆" in rendered
             expected_stage = "3 并行" if width < 36 else "3 个 Agent 并行中"
             assert expected_stage in rendered
             if width >= 36:
@@ -302,12 +519,14 @@ def test_full_screen_agent_window_is_opaque_and_interactive() -> None:
         assert _wait_until(lambda: tui.ledger.snapshots()[0].phase == "done")
         task_text = "".join(fragment[1] for fragment in tui._render_tasks())
         assert "已完成 · 1 个 Agent" in task_text
-        assert "│ MAIN  › │" in task_text
+        assert "╭ MAIN  › ╮" in task_text
         assert "已完成：实现 CLI" in task_text
 
         pipe_input.send_text("\t\r")
         assert _wait_until(lambda: tui._modal_open)
-        assert "已完成：实现 CLI" in tui._agent_output.text
+        detail_text = "".join(fragment[1] for fragment in tui._render_modal_body())
+        assert "已完成：实现 CLI" in detail_text
+        assert tui.app.layout.has_focus(tui._detail_window)
 
         pipe_input.send_text("\x1b")
         assert _wait_until(lambda: not tui._modal_open)

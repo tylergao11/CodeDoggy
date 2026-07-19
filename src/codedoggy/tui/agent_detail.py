@@ -1,19 +1,15 @@
 """Full-fidelity Agent transcript model and prompt-toolkit renderer.
 
-This module is intentionally independent from :mod:`codedoggy.tui.app` so the
-detail surface can be built and tested while the main task cockpit evolves.
-The eventual integration only needs to feed real messages/tool records into
-``AgentDetailStore`` and place the returned formatted-text fragments in a
-scrollable ``FormattedTextControl``.
+This module is intentionally independent from :mod:`codedoggy.tui.app`: it
+adapts the runtime transcript into immutable view data and renders it.  The
+runtime transcript remains the single source of truth.
 """
 
 from __future__ import annotations
 
 import json
-import time
-from copy import deepcopy
-from dataclasses import dataclass, field, replace
-from threading import RLock
+import re
+from dataclasses import dataclass, replace
 from typing import Any, Iterable, Literal
 
 from prompt_toolkit.formatted_text import StyleAndTextTuples
@@ -49,21 +45,21 @@ DETAIL_FILTER_LABELS: dict[DetailFilter, str] = {
 # Kept separate so the final integration can merge these names into the
 # cockpit Style without importing or mutating app.py from this module.
 DETAIL_STYLE_RULES = {
-    "detail.header": "bg:#0b0b0d #f5f5f7 bold",
-    "detail.meta": "bg:#0b0b0d #8e8e93",
-    "detail.active": "bg:#0b0b0d #64d2ff bold",
-    "detail.separator": "bg:#0b0b0d #2c2c2e",
+    "detail.header": "bg:#0b0b0d #ff2d9a bold",
+    "detail.meta": "bg:#0b0b0d #78909c",
+    "detail.active": "bg:#0b0b0d #16dfe8 bold",
+    "detail.separator": "bg:#0b0b0d #15515a",
     "detail.text": "bg:#0b0b0d #f5f5f7",
-    "detail.actor": "bg:#0b0b0d #64d2ff bold",
-    "detail.tool": "bg:#0b0b0d #64d2ff",
-    "detail.block": "bg:#141416 #d1d1d6",
-    "detail.code": "bg:#141416 #d1d1d6",
-    "detail.diff.add": "bg:#141416 #30d158",
-    "detail.diff.remove": "bg:#141416 #ff453a",
-    "detail.diff.hunk": "bg:#141416 #64d2ff",
-    "detail.success": "bg:#141416 #30d158",
-    "detail.error": "bg:#141416 #ff453a",
-    "detail.warning": "bg:#141416 #ff9f0a",
+    "detail.actor": "bg:#0b0b0d #16dfe8 bold",
+    "detail.tool": "bg:#0b0b0d #16dfe8",
+    "detail.block": "bg:#07171a #f0c7a4",
+    "detail.code": "bg:#07171a #f5f5f7",
+    "detail.diff.add": "bg:#07171a #16dfe8",
+    "detail.diff.remove": "bg:#07171a #ff2d9a",
+    "detail.diff.hunk": "bg:#07171a #ff9a3c",
+    "detail.success": "bg:#07171a #ff9a3c",
+    "detail.error": "bg:#07171a #ff2d9a",
+    "detail.warning": "bg:#07171a #ffd43b",
 }
 
 
@@ -104,118 +100,6 @@ class AgentDetailSnapshot:
     records: tuple[DetailRecord, ...] = ()
 
 
-@dataclass(slots=True)
-class _TranscriptState:
-    task_id: str
-    agent_id: str
-    agent_label: str
-    task_title: str
-    status: str
-    started_at: float
-    records: dict[str, DetailRecord] = field(default_factory=dict)
-    next_sequence: int = 1
-
-
-class AgentDetailStore:
-    """Thread-safe source for full Agent transcripts.
-
-    ``upsert`` is deliberate: streamed Agent messages and in-flight tool calls
-    can update one record without producing hundreds of near-duplicate rows.
-    Existing records retain their original sequence and timestamp.
-    """
-
-    def __init__(self) -> None:
-        self._lock = RLock()
-        self._states: dict[tuple[str, str], _TranscriptState] = {}
-
-    def open(
-        self,
-        task_id: str,
-        agent_id: str,
-        *,
-        agent_label: str,
-        task_title: str,
-        status: str = "running",
-        started_at: float | None = None,
-    ) -> AgentDetailSnapshot:
-        key = (task_id, agent_id)
-        with self._lock:
-            state = self._states.get(key)
-            if state is None:
-                state = _TranscriptState(
-                    task_id=task_id,
-                    agent_id=agent_id,
-                    agent_label=_clean_label(agent_label),
-                    task_title=_clean_text(task_title) or "未命名任务",
-                    status=status,
-                    started_at=time.monotonic() if started_at is None else started_at,
-                )
-                self._states[key] = state
-            else:
-                state.agent_label = _clean_label(agent_label)
-                state.task_title = _clean_text(task_title) or state.task_title
-                state.status = status
-            return _snapshot(state)
-
-    def upsert(
-        self,
-        task_id: str,
-        agent_id: str,
-        *,
-        record_id: str,
-        actor: str,
-        category: DetailCategory,
-        title: str,
-        blocks: Iterable[DetailBlock] = (),
-        timestamp: str | None = None,
-        status: str = "completed",
-    ) -> DetailRecord:
-        key = (task_id, agent_id)
-        with self._lock:
-            state = self._states.get(key)
-            if state is None:
-                state = _TranscriptState(
-                    task_id=task_id,
-                    agent_id=agent_id,
-                    agent_label=_clean_label(actor),
-                    task_title="未命名任务",
-                    status="running",
-                    started_at=time.monotonic(),
-                )
-                self._states[key] = state
-            old = state.records.get(record_id)
-            if old is None:
-                sequence = state.next_sequence
-                state.next_sequence += 1
-                record_timestamp = timestamp or _clock_text()
-            else:
-                sequence = old.sequence
-                record_timestamp = old.timestamp if timestamp is None else timestamp
-            record = DetailRecord(
-                id=record_id,
-                sequence=sequence,
-                actor=_clean_label(actor),
-                category=_normalize_category(category),
-                title=_clean_text(title),
-                blocks=tuple(blocks),
-                timestamp=record_timestamp,
-                status=status,
-            )
-            state.records[record_id] = record
-            return deepcopy(record)
-
-    def set_status(self, task_id: str, agent_id: str, status: str) -> None:
-        with self._lock:
-            state = self._states.get((task_id, agent_id))
-            if state is not None:
-                state.status = status
-
-    def snapshot(self, task_id: str, agent_id: str) -> AgentDetailSnapshot | None:
-        with self._lock:
-            state = self._states.get((task_id, agent_id))
-            return None if state is None else _snapshot(state)
-
-
 def snapshot_from_messages(
     messages: Iterable[Any],
     *,
@@ -228,19 +112,35 @@ def snapshot_from_messages(
     """Build a full detail snapshot from existing OpenAI-style messages.
 
     This adapter is intentionally duck-typed so it can consume both CodeDoggy
-    ``Message`` instances and restored session records. System/user prompts are
-    not duplicated in the Agent detail page. Assistant prose, tool arguments,
-    tool outputs, code, diffs and command results remain visible.
+    ``Message`` instances and restored session records. System prompts stay
+    hidden. User instructions, assistant prose, tool arguments, tool outputs,
+    code, diffs and command results remain visible. The initial instruction is
+    suppressed only when it exactly duplicates the task title.
     """
 
     records: list[DetailRecord] = []
     tool_positions: dict[str, int] = {}
     sequence = 1
     for message in messages:
-        role = getattr(message, "role", "")
+        role = _read_field(message, "role", "")
         role_value = str(getattr(role, "value", role)).lower()
-        if role_value == "assistant":
-            content = _clean_text(getattr(message, "content", ""))
+        if role_value == "user":
+            content = _clean_text(_read_field(message, "content", ""))
+            if content and not (not records and content == _clean_text(task_title)):
+                records.append(
+                    DetailRecord(
+                        id=f"message-{sequence}",
+                        sequence=sequence,
+                        actor="USER",
+                        category="message",
+                        title="补充指令",
+                        blocks=(DetailBlock("text", content),),
+                        timestamp=f"#{sequence:03d}",
+                    )
+                )
+                sequence += 1
+        elif role_value == "assistant":
+            content = _clean_text(_read_field(message, "content", ""))
             if content:
                 records.append(
                     DetailRecord(
@@ -254,10 +154,10 @@ def snapshot_from_messages(
                     )
                 )
                 sequence += 1
-            for call in list(getattr(message, "tool_calls", None) or []):
-                call_id = str(getattr(call, "id", "") or f"tool-{sequence}")
-                name = str(getattr(call, "name", "tool") or "tool")
-                arguments = getattr(call, "arguments", {})
+            for call in list(_read_field(message, "tool_calls", None) or []):
+                call_id = str(_read_field(call, "id", "") or f"tool-{sequence}")
+                name = str(_read_field(call, "name", "tool") or "tool")
+                arguments = _read_field(call, "arguments", {})
                 category = _tool_category(name, arguments)
                 record = DetailRecord(
                     id=call_id,
@@ -273,9 +173,9 @@ def snapshot_from_messages(
                 records.append(record)
                 sequence += 1
         elif role_value == "tool":
-            call_id = str(getattr(message, "tool_call_id", "") or "")
-            name = str(getattr(message, "name", "") or "tool")
-            output = str(getattr(message, "content", "") or "")
+            call_id = str(_read_field(message, "tool_call_id", "") or "")
+            name = str(_read_field(message, "name", "") or "tool")
+            output = str(_read_field(message, "content", "") or "")
             result_block = _tool_result_block(name, output)
             if call_id in tool_positions:
                 position = tool_positions[call_id]
@@ -331,26 +231,41 @@ def render_detail_header(
 ) -> StyleAndTextTuples:
     """Render the compact fixed header and filter row."""
 
-    width = max(36, width)
+    width = max(12, width)
     elapsed = _elapsed_text(elapsed_seconds)
     right = f"{_status_text(snapshot.status)}"
     if elapsed:
         right += f" · {elapsed}"
     title = f"{snapshot.agent_label} · {snapshot.task_title}"
-    title_budget = max(8, width - get_cwidth(right) - 5)
-    title = _truncate_display(title, title_budget)
-    gap = max(1, width - get_cwidth(title) - get_cwidth(right) - 2)
-    fragments: StyleAndTextTuples = [
-        ("class:detail.header", title),
-        ("", " " * gap),
-        ("class:detail.active", right),
-        ("", "\n"),
-        ("class:detail.separator", "─" * width + "\n"),
-    ]
+    if get_cwidth(title) + get_cwidth(right) + 2 <= width:
+        gap = width - get_cwidth(title) - get_cwidth(right)
+        fragments: StyleAndTextTuples = [
+            ("class:detail.header", title),
+            ("", " " * gap),
+            ("class:detail.active", right),
+            ("", "\n"),
+        ]
+    else:
+        fragments = [
+            ("class:detail.header", _truncate_display(title, width)),
+            ("", "\n"),
+            ("class:detail.active", _truncate_display(right, width)),
+            ("", "\n"),
+        ]
+    fragments.append(("class:detail.separator", "─" * width + "\n"))
+    used = 0
     for item in DETAIL_FILTERS:
         label = f"[{DETAIL_FILTER_LABELS[item]}]"
+        item_width = get_cwidth(label) + (2 if used else 0)
+        if used and used + item_width > width:
+            fragments.append(("", "\n"))
+            used = 0
+            item_width = get_cwidth(label)
+        if used:
+            fragments.append(("", "  "))
         style = "class:detail.active" if item == active_filter else "class:detail.meta"
-        fragments.extend([(style, label), ("", "  ")])
+        fragments.append((style, label))
+        used += item_width
     fragments.extend(
         [
             ("", "\n"),
@@ -368,7 +283,7 @@ def render_detail_body(
 ) -> StyleAndTextTuples:
     """Render every selected record without summarizing or truncating bodies."""
 
-    width = max(36, width)
+    width = max(12, width)
     records = filter_detail_records(snapshot.records, active_filter)
     if not records:
         return [("class:detail.meta", "\n  当前分类没有记录。\n")]
@@ -400,16 +315,36 @@ def render_agent_detail(
 def _render_record(record: DetailRecord, width: int) -> StyleAndTextTuples:
     timestamp = record.timestamp or f"#{record.sequence:03d}"
     actor = record.actor or "AGENT"
-    header = f"{timestamp:<9}  {actor:<10}  {record.title}".rstrip()
     fragments: StyleAndTextTuples = []
-    for line in _wrap_display(header, width):
+    prefix = f"{timestamp:<9}  "
+    actor_piece = f"{actor:<10}  "
+    if get_cwidth(prefix + actor_piece) < width:
         fragments.extend(
             [
-                ("class:detail.actor", line),
+                ("class:detail.meta", prefix),
+                ("class:detail.actor", actor_piece),
+                (
+                    "class:detail.text",
+                    _truncate_display(
+                        record.title,
+                        max(1, width - get_cwidth(prefix + actor_piece)),
+                    ),
+                ),
                 ("", "\n"),
             ]
         )
-    body_width = max(12, width - 4)
+    else:
+        fragments.extend(
+            [
+                ("class:detail.meta", _truncate_display(timestamp, width)),
+                ("", "\n"),
+                ("class:detail.actor", _truncate_display(actor, width)),
+                ("", "\n"),
+                ("class:detail.text", _truncate_display(record.title, width)),
+                ("", "\n"),
+            ]
+        )
+    body_width = max(1, width - 4)
     for block in record.blocks:
         if block.label:
             fragments.extend(
@@ -449,7 +384,12 @@ def _arguments_block(name: str, arguments: Any) -> DetailBlock:
         text = arguments
     elif isinstance(arguments, dict):
         command = arguments.get("command") or arguments.get("cmd")
-        if command is not None and _tool_category(name, arguments) == "test":
+        if command is not None and name.lower() in {
+            "shell",
+            "run_terminal_cmd",
+            "run_command",
+            "bash",
+        }:
             return DetailBlock("command", f"$ {command}", label="调用参数")
         lines: list[str] = []
         for key, value in arguments.items():
@@ -492,7 +432,9 @@ def _tool_category(name: str, arguments: Any) -> DetailCategory:
 
 def _result_status(output: str) -> str:
     lowered = output.lower()
-    if any(marker in lowered for marker in ("error", "failed", "traceback", "exception")):
+    hard_error = any(marker in lowered for marker in ("traceback", "exception", "error:"))
+    failed_count = re.search(r"\b([1-9]\d*)\s+failed\b", lowered)
+    if hard_error or failed_count:
         return "error"
     if any(marker in lowered for marker in ("passed", "success", "exit code: 0", "exit 0")):
         return "success"
@@ -563,16 +505,16 @@ def _clean_text(value: Any) -> str:
     return str(value or "").strip()
 
 
+def _read_field(value: Any, name: str, default: Any = None) -> Any:
+    """Read one field from either a runtime dataclass or serialized mapping."""
+
+    if isinstance(value, dict):
+        return value.get(name, default)
+    return getattr(value, name, default)
+
+
 def _clean_label(value: Any) -> str:
     return _clean_text(value).upper() or "AGENT"
-
-
-def _normalize_category(value: str) -> DetailCategory:
-    return value if value in {"message", "tool", "file", "test"} else "tool"  # type: ignore[return-value]
-
-
-def _clock_text() -> str:
-    return time.strftime("%H:%M:%S")
 
 
 def _elapsed_text(seconds: float | None) -> str:
@@ -597,26 +539,13 @@ def _status_text(status: str) -> str:
     }.get(status, status)
 
 
-def _snapshot(state: _TranscriptState) -> AgentDetailSnapshot:
-    records = tuple(sorted(state.records.values(), key=lambda item: item.sequence))
-    return AgentDetailSnapshot(
-        task_id=state.task_id,
-        agent_id=state.agent_id,
-        agent_label=state.agent_label,
-        task_title=state.task_title,
-        status=state.status,
-        started_at=state.started_at,
-        records=deepcopy(records),
-    )
-
-
 __all__ = [
     "DETAIL_FILTERS",
     "DETAIL_FILTER_LABELS",
     "DETAIL_STYLE_RULES",
     "AgentDetailSnapshot",
-    "AgentDetailStore",
     "DetailBlock",
+    "DetailFilter",
     "DetailRecord",
     "filter_detail_records",
     "render_agent_detail",

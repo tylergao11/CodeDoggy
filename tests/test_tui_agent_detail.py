@@ -2,13 +2,12 @@
 
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
-
 from prompt_toolkit.utils import get_cwidth
 
 from codedoggy.tui.agent_detail import (
-    AgentDetailStore,
+    AgentDetailSnapshot,
     DetailBlock,
+    DetailRecord,
     filter_detail_records,
     render_agent_detail,
     render_detail_body,
@@ -21,84 +20,10 @@ def _plain(fragments: list[tuple]) -> str:
     return "".join(fragment[1] for fragment in fragments)
 
 
-def test_store_upserts_streamed_records_without_reordering() -> None:
-    store = AgentDetailStore()
-    store.open(
-        "task_001",
-        "builder",
-        agent_label="builder",
-        task_title="实现详情页",
-        started_at=10.0,
-    )
-    first = store.upsert(
-        "task_001",
-        "builder",
-        record_id="stream-main",
-        actor="builder",
-        category="message",
-        title="进度",
-        blocks=(DetailBlock("text", "正在读取"),),
-        timestamp="14:32:07",
-        status="running",
-    )
-    store.upsert(
-        "task_001",
-        "builder",
-        record_id="tool-1",
-        actor="tool",
-        category="file",
-        title="TOOL · read_file",
-        blocks=(DetailBlock("metadata", "path: app.py"),),
-    )
-    updated = store.upsert(
-        "task_001",
-        "builder",
-        record_id="stream-main",
-        actor="builder",
-        category="message",
-        title="进度",
-        blocks=(DetailBlock("text", "读取完成，准备修改"),),
-        status="completed",
-    )
-
-    snapshot = store.snapshot("task_001", "builder")
-    assert snapshot is not None
-    assert snapshot.agent_label == "BUILDER"
-    assert [record.id for record in snapshot.records] == ["stream-main", "tool-1"]
-    assert updated.sequence == first.sequence == 1
-    assert updated.timestamp == "14:32:07"
-    assert snapshot.records[0].blocks[0].text == "读取完成，准备修改"
-
-
-def test_store_accepts_concurrent_tool_records_without_losing_detail() -> None:
-    store = AgentDetailStore()
-    store.open("task", "tester", agent_label="tester", task_title="验证")
-
-    def add(index: int) -> None:
-        store.upsert(
-            "task",
-            "tester",
-            record_id=f"tool-{index}",
-            actor="tool",
-            category="test",
-            title="TOOL · shell",
-            blocks=(DetailBlock("output", f"test-{index} passed"),),
-        )
-
-    with ThreadPoolExecutor(max_workers=8) as pool:
-        list(pool.map(add, range(40)))
-
-    snapshot = store.snapshot("task", "tester")
-    assert snapshot is not None
-    assert len(snapshot.records) == 40
-    assert {record.blocks[0].text for record in snapshot.records} == {
-        f"test-{index} passed" for index in range(40)
-    }
-
-
 def test_message_adapter_keeps_prose_tool_arguments_and_tool_results() -> None:
     messages = [
-        Message(role=Role.USER, content="不要在详情页重复用户提示"),
+        Message(role=Role.USER, content="实现详情页"),
+        Message(role=Role.USER, content="补充：必须显示完整工具记录"),
         Message(role=Role.ASSISTANT, content="我先读取入口，再修改模型。"),
         Message(
             role=Role.ASSISTANT,
@@ -143,15 +68,51 @@ def test_message_adapter_keeps_prose_tool_arguments_and_tool_results() -> None:
 
     assert [record.category for record in snapshot.records] == [
         "message",
+        "message",
         "file",
         "test",
     ]
+    assert snapshot.records[0].actor == "USER"
+    assert "补充：必须显示完整工具记录" in text
     assert "我先读取入口" in text
     assert "path: src/codedoggy/tui/app.py" in text
     assert "369 def _start_task" in text
     assert "$ pytest tests/test_tui.py -q" in text
     assert "12 passed in 0.84s" in text
-    assert "不要在详情页重复用户提示" not in text
+    assert "实现详情页" not in text
+
+
+def test_message_adapter_accepts_serialized_subagent_transcripts() -> None:
+    snapshot = snapshot_from_messages(
+        [
+            {"role": "assistant", "content": "正在读取子 Agent 文件。"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "child-read",
+                        "name": "read_file",
+                        "arguments": {"path": "src/child.py", "limit": 80},
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "name": "read_file",
+                "tool_call_id": "child-read",
+                "content": "1  def child():\n2      return True",
+            },
+        ],
+        task_id="task",
+        agent_id="child",
+        agent_label="BUILDER",
+        task_title="子任务",
+    )
+    rendered = _plain(render_detail_body(snapshot, 72))
+    assert "正在读取子 Agent 文件" in rendered
+    assert "path: src/child.py" in rendered
+    assert "def child" in rendered
 
 
 def test_filters_keep_file_and_test_records_under_tool_tab() -> None:
@@ -182,34 +143,36 @@ def test_filters_keep_file_and_test_records_under_tool_tab() -> None:
 
 def test_renderer_shows_full_wrapped_content_and_never_overflows_width() -> None:
     long_text = "完整细节不能被摘要。" * 18
-    store = AgentDetailStore()
-    store.open("task", "builder", agent_label="builder", task_title="详情页")
-    store.upsert(
-        "task",
-        "builder",
-        record_id="message",
-        actor="builder",
-        category="message",
-        title="当前进度",
-        blocks=(DetailBlock("text", long_text),),
-        timestamp="14:32:07",
-    )
-    store.upsert(
-        "task",
-        "builder",
-        record_id="patch",
-        actor="tool",
-        category="file",
-        title="TOOL · apply_patch",
-        blocks=(
-            DetailBlock(
-                "diff",
-                "@@ -1,2 +1,3 @@\n-output: str = ''\n+records: list[AgentRecord]",
+    snapshot = AgentDetailSnapshot(
+        task_id="task",
+        agent_id="builder",
+        agent_label="BUILDER",
+        task_title="详情页",
+        records=(
+            DetailRecord(
+                id="message",
+                sequence=1,
+                actor="BUILDER",
+                category="message",
+                title="当前进度",
+                blocks=(DetailBlock("text", long_text),),
+                timestamp="14:32:07",
+            ),
+            DetailRecord(
+                id="patch",
+                sequence=2,
+                actor="TOOL",
+                category="file",
+                title="TOOL · apply_patch",
+                blocks=(
+                    DetailBlock(
+                        "diff",
+                        "@@ -1,2 +1,3 @@\n-output: str = ''\n+records: list[AgentRecord]",
+                    ),
+                ),
             ),
         ),
     )
-    snapshot = store.snapshot("task", "builder")
-    assert snapshot is not None
 
     fragments = render_agent_detail(snapshot, 56, elapsed_seconds=266)
     rendered = _plain(fragments)
@@ -223,6 +186,19 @@ def test_renderer_shows_full_wrapped_content_and_never_overflows_width() -> None
     styles = " ".join(fragment[0] for fragment in fragments)
     assert "class:detail.diff.remove" in styles
     assert "class:detail.diff.add" in styles
+
+
+def test_header_and_body_fit_terminals_narrower_than_filter_row() -> None:
+    snapshot = snapshot_from_messages(
+        [Message(role=Role.ASSISTANT, content="窄终端仍显示完整正文")],
+        task_id="task",
+        agent_id="main",
+        agent_label="MAIN",
+        task_title="详情",
+    )
+    for width in (12, 16, 20, 24, 32, 36):
+        rendered = _plain(render_agent_detail(snapshot, width))
+        assert all(get_cwidth(line) <= width for line in rendered.splitlines())
 
 
 def test_empty_filter_is_explicit_instead_of_falling_back_to_summary() -> None:

@@ -26,6 +26,7 @@ from prompt_toolkit.layout import (
     VSplit,
     Window,
 )
+from prompt_toolkit.layout.margins import ScrollbarMargin
 from prompt_toolkit.layout.screen import Point
 from prompt_toolkit.layout.processors import AfterInput, ConditionalProcessor
 from prompt_toolkit.mouse_events import MouseEvent, MouseEventType
@@ -35,8 +36,17 @@ from prompt_toolkit.utils import get_cwidth
 from prompt_toolkit.widgets import TextArea
 
 from codedoggy.session.types import TurnStatus
+from codedoggy.tui.agent_detail import (
+    DETAIL_FILTERS,
+    DETAIL_FILTER_LABELS,
+    DETAIL_STYLE_RULES,
+    AgentDetailSnapshot,
+    DetailFilter,
+    render_detail_body,
+    snapshot_from_messages,
+)
 from codedoggy.tui.model import AgentView, TaskLedger, TaskView
-from codedoggy.turn.types import Role
+from codedoggy.turn.types import Message, Role
 
 
 STATUS_TEXT = {
@@ -50,57 +60,59 @@ STATUS_TEXT = {
 }
 
 
-DOGGY_NEON = Style.from_dict(
+CODEDOGGY_DARK = Style.from_dict(
     {
-        "root": "bg:#020507 #e8f1ef",
-        "header": "bg:#020507 #e8f1ef",
-        "brand": "#f4f6f5 bold",
-        "meta": "#66858a",
-        "separator": "#454c4e",
-        "task.spine": "#263c40",
-        "task.spine.active": "#16dfe5 bold",
-        "task.marker": "#aeb9b9 bold",
-        "task.title": "#f4f6f5 bold",
-        "task.divider": "#263c40",
-        "task.status": "#6d8c90",
-        "task.status.running": "#16dfe5 bold",
-        "task.status.reporting": "#f12698 bold",
-        "task.status.completed": "#ffc21a bold",
-        "task.status.failed": "#ff4aa8 bold",
-        "doggy.wordmark": "#f12698 bold",
-        "agent.border": "#697477",
-        "agent.border.selected": "#f12698 bold",
-        "agent.label": "#c7d1d0 bold",
-        "agent.label.selected": "#ff4aa8 bold",
-        "reporter.running": "#16dfe5 bold",
-        "reporter.completed": "#f2d397 bold",
-        "reporter.waiting": "#879496 bold",
-        "reporter.failed": "#ff4aa8 bold",
-        "report": "#d7e5e3",
-        "input": "bg:#071116 #e8f1ef",
-        "input.placeholder": "bg:#071116 #48666b",
-        "prompt": "bg:#071116 #f2d397 bold",
-        "prompt.border": "bg:#020507 #16464c",
-        "prompt.border.focus": "bg:#020507 #f12698",
-        "prompt.border.info": "bg:#020507 #16dfe5",
-        "prompt.border.success": "bg:#020507 #ffc21a",
-        "prompt.border.warning": "bg:#020507 #ff4aa8",
-        "prompt.caption": "bg:#020507 #66858a",
-        "turn.status": "bg:#020507 #b8d0cf",
-        "turn.elapsed": "bg:#020507 #587075",
-        "turn.stop": "bg:#020507 #f12698 bold",
-        "feedback.info": "bg:#020507 #16dfe5",
-        "feedback.success": "bg:#020507 #ffc21a",
-        "feedback.warning": "bg:#020507 #ff4aa8",
-        "shortcut.key": "bg:#020507 #f2d397 bold",
-        "shortcut.label": "bg:#020507 #587075",
-        "shortcut.separator": "bg:#020507 #16464c",
-        "shortcut.pending": "bg:#020507 #ff4aa8",
-        "agent-window": "bg:#050b0e #e8f1ef",
-        "agent-window.header": "bg:#050b0e #16dfe5 bold",
-        "agent-window.close": "bg:#2b1023 #ff4aa8 bold",
-        "agent-output": "bg:#050b0e #d7e5e3",
-        "agent-window.hint": "bg:#050b0e #66858a",
+        "root": "bg:#0b0b0d #f5f5f7",
+        "header": "bg:#0b0b0d #16dfe8",
+        "brand": "#ff2d9a bold",
+        "meta": "#78909c",
+        "separator": "#15515a",
+        "task.spine": "#15515a",
+        "task.spine.active": "#16dfe8 bold",
+        "task.marker": "#ff2d9a bold",
+        "task.title": "#f5f5f7 bold",
+        "task.divider": "#15515a",
+        "task.status": "#78909c",
+        "task.status.running": "#16dfe8 bold",
+        "task.status.reporting": "#ff2d9a bold",
+        "task.status.completed": "#ff9a3c bold",
+        "task.status.failed": "#ff2d9a bold",
+        "doggy.wordmark": "#ff2d9a bold",
+        "agent.border": "#16dfe8",
+        "agent.border.selected": "#ff2d9a bold",
+        "agent.label": "#16dfe8 bold",
+        "agent.label.selected": "#ff9a3c bold",
+        "reporter.running": "#16dfe8 bold",
+        "reporter.completed": "#ff9a3c bold",
+        "reporter.waiting": "#78909c bold",
+        "reporter.failed": "#ff2d9a bold",
+        "report": "#f0c7a4",
+        "input": "bg:#071014 #f5f5f7",
+        "input.placeholder": "bg:#071014 #536b75",
+        "prompt": "bg:#071014 #ff2d9a bold",
+        "prompt.border": "bg:#0b0b0d #16dfe8",
+        "prompt.border.focus": "bg:#0b0b0d #ff2d9a bold",
+        "prompt.border.info": "bg:#0b0b0d #16dfe8",
+        "prompt.border.success": "bg:#0b0b0d #ff9a3c",
+        "prompt.border.warning": "bg:#0b0b0d #ff2d9a",
+        "prompt.caption": "bg:#0b0b0d #16dfe8",
+        "turn.status": "bg:#0b0b0d #16dfe8",
+        "turn.elapsed": "bg:#0b0b0d #78909c",
+        "turn.stop": "bg:#0b0b0d #ff2d9a bold",
+        "feedback.info": "bg:#0b0b0d #16dfe8",
+        "feedback.success": "bg:#0b0b0d #ff9a3c",
+        "feedback.warning": "bg:#0b0b0d #ff2d9a",
+        "shortcut.key": "bg:#0b0b0d #ff2d9a bold",
+        "shortcut.label": "bg:#0b0b0d #16dfe8",
+        "shortcut.separator": "bg:#0b0b0d #15515a",
+        "shortcut.pending": "bg:#0b0b0d #ff9a3c",
+        "agent-window": "bg:#0b0b0d #f5f5f7",
+        "agent-window.header": "bg:#0b0b0d #ff2d9a bold",
+        "agent-window.close": "bg:#40102d #ff5ab3 bold",
+        "agent-window.hint": "bg:#0b0b0d #16dfe8",
+        "detail.input": "bg:#071014 #f5f5f7",
+        "detail.input.prompt": "bg:#071014 #ff9a3c bold",
+        **DETAIL_STYLE_RULES,
     }
 )
 
@@ -126,6 +138,10 @@ class CodeDoggyTUI:
         self._selected_line = 0
         self._modal_open = False
         self._modal_ref: tuple[str, str] | None = None
+        self._detail_messages: dict[tuple[str, str], list[Any]] = {}
+        self._detail_filter: DetailFilter = "all"
+        self._detail_cursor_line = 0
+        self._detail_line_count = 1
         self._closing = False
         self._task_started_at: float | None = None
         self._quit_armed_until = 0.0
@@ -163,14 +179,37 @@ class CodeDoggyTUI:
                 )
             ],
         )
-        self._agent_output = TextArea(
-            text="",
-            read_only=True,
+        self._detail_control = FormattedTextControl(
+            text=self._render_modal_body,
             focusable=True,
-            focus_on_click=True,
-            scrollbar=True,
-            wrap_lines=True,
-            style="class:agent-output",
+            show_cursor=False,
+            get_cursor_position=lambda: Point(x=0, y=self._detail_cursor_line),
+        )
+        self._detail_window = Window(
+            content=self._detail_control,
+            wrap_lines=False,
+            scroll_offsets=ScrollOffsets(top=1, bottom=2),
+            right_margins=[ScrollbarMargin(display_arrows=True)],
+            style="class:agent-window",
+        )
+        self._detail_input = TextArea(
+            height=1,
+            multiline=False,
+            prompt=self._render_detail_prompt_prefix,
+            style="class:detail.input",
+            accept_handler=self._accept_detail_prompt,
+            input_processors=[
+                ConditionalProcessor(
+                    AfterInput(
+                        "补充要求…",
+                        style="class:input.placeholder",
+                    ),
+                    Condition(
+                        lambda: not getattr(self, "_detail_input", None)
+                        or not self._detail_input.text
+                    ),
+                )
+            ],
         )
 
         header = Window(
@@ -246,11 +285,16 @@ class CodeDoggyTUI:
                 [
                     modal_header,
                     Window(height=1, char="─", style="class:separator"),
-                    self._agent_output,
                     Window(
-                        FormattedTextControl(
-                            [("class:agent-window.hint", "Esc 关闭")]
-                        ),
+                        FormattedTextControl(self._render_modal_filters),
+                        height=1,
+                        style="class:agent-window",
+                    ),
+                    Window(height=1, char="─", style="class:separator"),
+                    self._detail_window,
+                    self._detail_input,
+                    Window(
+                        FormattedTextControl(self._render_modal_hint),
                         height=1,
                         style="class:agent-window.hint",
                     ),
@@ -277,11 +321,11 @@ class CodeDoggyTUI:
         self.app: Application[None] = Application(
             layout=Layout(root, focused_element=self._input),
             key_bindings=self._keys,
-            style=DOGGY_NEON,
+            style=CODEDOGGY_DARK,
             full_screen=True,
             mouse_support=True,
             color_depth=ColorDepth.TRUE_COLOR,
-            refresh_interval=0.25,
+            refresh_interval=0.10,
             before_render=lambda _: self._sync_runtime(),
             input=input,
             output=output,
@@ -306,6 +350,10 @@ class CodeDoggyTUI:
         tasks_focused = Condition(
             lambda: not self._modal_open and get_app().layout.has_focus(self._task_window)
         )
+        detail_focused = Condition(
+            lambda: self._modal_open
+            and get_app().layout.has_focus(self._detail_window)
+        )
 
         @keys.add("tab", filter=~modal)
         def _next_agent(event: Any) -> None:
@@ -316,6 +364,50 @@ class CodeDoggyTUI:
         def _previous_agent(event: Any) -> None:
             self._move_agent(-1)
             event.app.layout.focus(self._task_window)
+
+        @keys.add("tab", filter=modal)
+        @keys.add("s-tab", filter=modal)
+        def _toggle_detail_focus(event: Any) -> None:
+            if event.app.layout.has_focus(self._detail_input):
+                event.app.layout.focus(self._detail_window)
+            else:
+                event.app.layout.focus(self._detail_input)
+
+        @keys.add("up", filter=detail_focused)
+        def _detail_up(_: Any) -> None:
+            self._move_detail_cursor(-1)
+
+        @keys.add("down", filter=detail_focused)
+        def _detail_down(_: Any) -> None:
+            self._move_detail_cursor(1)
+
+        @keys.add("pageup", filter=detail_focused)
+        def _detail_page_up(_: Any) -> None:
+            self._move_detail_cursor(-max(4, _terminal_height() - 10))
+
+        @keys.add("pagedown", filter=detail_focused)
+        def _detail_page_down(_: Any) -> None:
+            self._move_detail_cursor(max(4, _terminal_height() - 10))
+
+        @keys.add("home", filter=detail_focused)
+        def _detail_home(_: Any) -> None:
+            self._detail_cursor_line = 0
+            self.app.invalidate()
+
+        @keys.add("end", filter=detail_focused)
+        def _detail_end(_: Any) -> None:
+            self._detail_cursor_line = max(0, self._detail_line_count - 1)
+            self.app.invalidate()
+
+        for key, detail_filter in zip(
+            ("f1", "f2", "f3", "f4", "f5"),
+            DETAIL_FILTERS,
+            strict=True,
+        ):
+
+            @keys.add(key, filter=modal)
+            def _set_filter(_: Any, value: DetailFilter = detail_filter) -> None:
+                self._set_detail_filter(value)
 
         @keys.add("enter", filter=tasks_focused)
         def _open_selected(_: Any) -> None:
@@ -365,9 +457,37 @@ class CodeDoggyTUI:
         self._start_task(prompt)
         return True
 
+    def _accept_detail_prompt(self, buffer: Any) -> bool:
+        prompt = buffer.text.strip()
+        buffer.text = ""
+        if not prompt or self._modal_ref is None:
+            return True
+        if not self._is_running():
+            self._set_feedback("任务已结束，无法继续插话", "warning", duration=2.2)
+            self.app.invalidate()
+            return True
+        task_id, agent_id = self._modal_ref
+        if task_id != self._active_task_id:
+            self._set_feedback(
+                "只能向当前运行任务补充指令",
+                "warning",
+                duration=2.2,
+            )
+            self.app.invalidate()
+            return True
+        agent = self.ledger.get_agent(task_id, agent_id)
+        label = "AGENT" if agent is None else agent.label
+        routed = prompt if label == "MAIN" else f"请转交给 {label}：{prompt}"
+        self.session.interject(routed, prompt_id=task_id)
+        self._set_feedback(f"补充指令已交给 MAIN · {label}", "info")
+        self.app.layout.focus(self._detail_window)
+        self.app.invalidate()
+        return True
+
     def _start_task(self, prompt: str) -> None:
         task = self.ledger.create(prompt)
         self._active_task_id = task.id
+        self._detail_messages[(task.id, f"{task.id}:main")] = []
         self._task_started_at = time.monotonic()
         self._subagent_baselines[task.id] = {
             item.subagent_id for item in self._subagents()
@@ -386,10 +506,18 @@ class CodeDoggyTUI:
     def _run_task(self, task_id: str, prompt: str) -> None:
         runner = getattr(self.session.extensions, "turn_runner", None)
         sampler = getattr(runner, "sampler", None)
-        before_messages = len(getattr(runner, "live_messages", []) or [])
+        detail_key = (task_id, f"{task_id}:main")
+        turn_messages = self._detail_messages.setdefault(detail_key, [])
         streamed: list[str] = []
         old_stream = getattr(sampler, "stream", None)
         old_delta = getattr(sampler, "on_delta", None)
+        old_live_message = getattr(runner, "on_live_message", None)
+
+        def on_live_message(message: Any) -> None:
+            turn_messages.append(message)
+            if callable(old_live_message):
+                old_live_message(message)
+            self.app.invalidate()
 
         def on_delta(piece: str) -> bool:
             streamed.append(str(piece or ""))
@@ -406,6 +534,8 @@ class CodeDoggyTUI:
         if sampler is not None:
             sampler.stream = True
             sampler.on_delta = on_delta
+        if runner is not None:
+            runner.on_live_message = on_live_message
 
         try:
             result = self.session.handle_prompt(
@@ -413,8 +543,8 @@ class CodeDoggyTUI:
                 prompt_id=task_id,
                 metadata={"tui_task_id": task_id},
             )
-            messages = list(getattr(runner, "live_messages", []) or [])[before_messages:]
-            output = agent_text_from_messages(messages)
+            messages = list(turn_messages)
+            output = agent_summary_text_from_messages(messages)
             if not output:
                 output = (result.final_text or "".join(streamed) or result.error or "").strip()
             status = _turn_status(result.status)
@@ -472,6 +602,8 @@ class CodeDoggyTUI:
                 if old_stream is not None:
                     sampler.stream = old_stream
                 sampler.on_delta = old_delta
+            if runner is not None:
+                runner.on_live_message = old_live_message
             self._sync_runtime()
             if self._active_task_id == task_id:
                 self._task_started_at = None
@@ -506,6 +638,9 @@ class CodeDoggyTUI:
                 output=output,
                 description=description,
             )
+            live_messages = getattr(snap, "live_messages", None)
+            if live_messages is not None:
+                self._detail_messages[(task_id, snap.subagent_id)] = list(live_messages)
 
         for task in self.ledger.snapshots():
             if task.phase in {"done", "failed", "cancelled"}:
@@ -518,11 +653,11 @@ class CodeDoggyTUI:
             else:
                 self.ledger.set_task_phase(task.id, "dispatching")
 
-        if self._modal_open and self._modal_ref:
-            task_id, agent_id = self._modal_ref
-            agent = self.ledger.get_agent(task_id, agent_id)
-            if agent is not None:
-                self._agent_output.text = _display_agent_output(agent)
+        if self._modal_open:
+            self._detail_cursor_line = min(
+                self._detail_cursor_line,
+                max(0, self._detail_line_count - 1),
+            )
 
     def _subagents(self) -> list[Any]:
         kernel = getattr(self.session.extensions, "kernel", None)
@@ -788,7 +923,7 @@ class CodeDoggyTUI:
 
     def _render_header(self) -> StyleAndTextTuples:
         width = max(1, _terminal_width())
-        left = "  CODEDOGGY"
+        left = "  ==DOGGY=="
         right = _budget_text(self.session)
         left = _truncate_display(left, width)
         if not right or get_cwidth(left) + get_cwidth(right) + 2 > width:
@@ -816,7 +951,7 @@ class CodeDoggyTUI:
                 if width < 34
                 else _task_stage_text(task)
             )
-            marker = "▼" if active else "▸"
+            marker = "◆" if active else "•"
             minimum_gap = 1 if width < 34 else 2
             fixed_width = get_cwidth(prefix) + 1 + 2 + minimum_gap + 2
             title_budget = max(1, width - get_cwidth(status) - fixed_width)
@@ -929,43 +1064,33 @@ class CodeDoggyTUI:
 
         fragments: StyleAndTextTuples = []
         for group in groups:
-            for row in range(3):
-                fragments.extend([(spine_style, prefix), ("", "  ")])
-                for chip_index, (index, inner, box_width) in enumerate(group):
-                    selected = index == self._selected_agent
-                    border = (
-                        "class:agent.border.selected"
-                        if selected
-                        else "class:agent.border"
-                    )
-                    label_style = (
-                        "class:agent.label.selected"
-                        if selected
-                        else "class:agent.label"
-                    )
-                    handler = self._agent_mouse(index)
-                    if chip_index:
-                        fragments.append(("", "  "))
-                    if row == 0:
-                        fragments.append(
-                            (border, "╭" + "─" * (box_width - 2) + "╮", handler)
-                        )
-                    elif row == 1:
-                        fragments.extend(
-                            [
-                                (border, "│", handler),
-                                (label_style, inner, handler),
-                                (border, "│", handler),
-                            ]
-                        )
-                        if selected:
-                            selected_line = line
-                    else:
-                        fragments.append(
-                            (border, "╰" + "─" * (box_width - 2) + "╯", handler)
-                        )
-                fragments.append(("", "\n"))
-                line += 1
+            fragments.extend([(spine_style, prefix), ("", "  ")])
+            for chip_index, (index, inner, _box_width) in enumerate(group):
+                selected = index == self._selected_agent
+                border = (
+                    "class:agent.border.selected"
+                    if selected
+                    else "class:agent.border"
+                )
+                label_style = (
+                    "class:agent.label.selected"
+                    if selected
+                    else "class:agent.label"
+                )
+                handler = self._agent_mouse(index)
+                if chip_index:
+                    fragments.append(("", "  "))
+                fragments.extend(
+                    [
+                        (border, "╭", handler),
+                        (label_style, inner, handler),
+                        (border, "╮", handler),
+                    ]
+                )
+                if selected:
+                    selected_line = line
+            fragments.append(("", "\n"))
+            line += 1
         return fragments, line, selected_line
 
     def _render_modal_title(self) -> StyleAndTextTuples:
@@ -976,7 +1101,138 @@ class CodeDoggyTUI:
         task = next((item for item in self.ledger.snapshots() if item.id == task_id), None)
         if agent is None or task is None:
             return []
-        return [("class:agent-window.header", f"  {agent.label} · {task.title}")]
+        width = max(12, _terminal_width() - 9)
+        left = f"  ‹ {agent.label} · {task.title}"
+        right = STATUS_TEXT.get(agent.status, agent.status)
+        if get_cwidth(left) + get_cwidth(right) + 2 <= width:
+            gap = width - get_cwidth(left) - get_cwidth(right)
+            return [
+                ("class:agent-window.header", left),
+                ("", " " * gap),
+                ("class:detail.active", right),
+            ]
+        return [("class:agent-window.header", _truncate_display(left, width))]
+
+    def _render_modal_filters(self) -> StyleAndTextTuples:
+        width = max(12, _terminal_width() - 8)
+        fragments: StyleAndTextTuples = [("", "  ")]
+        used = 2
+        for index, detail_filter in enumerate(DETAIL_FILTERS, start=1):
+            label = f"F{index} {DETAIL_FILTER_LABELS[detail_filter]}"
+            piece_width = get_cwidth(label) + (3 if used > 2 else 0)
+            if used + piece_width > width:
+                break
+            if used > 2:
+                fragments.append(("class:detail.meta", " · "))
+            style = (
+                "class:detail.active"
+                if detail_filter == self._detail_filter
+                else "class:detail.meta"
+            )
+            fragments.append(
+                (style, label, self._detail_filter_mouse(detail_filter))
+            )
+            used += piece_width
+        return fragments
+
+    def _render_modal_body(self) -> StyleAndTextTuples:
+        snapshot = self._current_detail_snapshot()
+        if snapshot is None:
+            self._detail_line_count = 1
+            return [("class:detail.meta", "当前 Agent 没有可用记录。\n")]
+        width = max(12, _terminal_width() - 8)
+        fragments = render_detail_body(
+            snapshot,
+            width,
+            active_filter=self._detail_filter,
+        )
+        self._detail_line_count = max(
+            1,
+            sum(fragment[1].count("\n") for fragment in fragments),
+        )
+        self._detail_cursor_line = min(
+            self._detail_cursor_line,
+            self._detail_line_count - 1,
+        )
+        return fragments
+
+    def _current_detail_snapshot(self) -> AgentDetailSnapshot | None:
+        if self._modal_ref is None:
+            return None
+        task_id, agent_id = self._modal_ref
+        task = next((item for item in self.ledger.snapshots() if item.id == task_id), None)
+        agent = self.ledger.get_agent(task_id, agent_id)
+        if task is None or agent is None:
+            return None
+        messages = list(self._detail_messages.get((task_id, agent_id), []))
+        if not messages:
+            is_main = agent_id == f"{task_id}:main"
+            if not is_main and agent.status in {"pending", "running"}:
+                fallback = (
+                    "子 Agent 正在执行。当前运行时只在本轮结束后同步完整工具记录；"
+                    "完成后此页会显示真实消息、工具参数与返回结果。"
+                )
+            else:
+                fallback = agent.output.strip() or agent.description.strip()
+            if fallback:
+                messages = [Message(role=Role.ASSISTANT, content=fallback)]
+        return snapshot_from_messages(
+            messages,
+            task_id=task_id,
+            agent_id=agent_id,
+            agent_label=agent.label,
+            task_title=task.title,
+            status=agent.status,
+        )
+
+    def _render_detail_prompt_prefix(self) -> StyleAndTextTuples:
+        label = "MAIN"
+        if self._modal_ref:
+            task_id, agent_id = self._modal_ref
+            agent = self.ledger.get_agent(task_id, agent_id)
+            if agent is not None:
+                label = agent.label
+        terminal_width = max(1, _terminal_width())
+        if terminal_width < 40:
+            text = "  › "
+        else:
+            if label == "MAIN":
+                text = "  › 给 MAIN 补充指令  "
+            else:
+                text = f"  › 请 MAIN 转交给 {label}  "
+            text = _truncate_display(text, max(4, min(36, terminal_width - 20)))
+        return [("class:detail.input.prompt", text)]
+
+    def _render_modal_hint(self) -> StyleAndTextTuples:
+        text = "  ↑↓/PgUp/PgDn 滚动 · F1-F5 筛选 · Tab 补充指令 · Esc 返回"
+        return [
+            (
+                "class:agent-window.hint",
+                _truncate_display(text, max(1, _terminal_width() - 6)),
+            )
+        ]
+
+    def _detail_filter_mouse(
+        self, detail_filter: DetailFilter
+    ) -> Callable[[MouseEvent], None]:
+        def handler(event: MouseEvent) -> None:
+            if event.event_type is MouseEventType.MOUSE_UP:
+                self._set_detail_filter(detail_filter)
+
+        return handler
+
+    def _set_detail_filter(self, detail_filter: DetailFilter) -> None:
+        self._detail_filter = detail_filter
+        self._detail_cursor_line = 0
+        self.app.layout.focus(self._detail_window)
+        self.app.invalidate()
+
+    def _move_detail_cursor(self, delta: int) -> None:
+        self._detail_cursor_line = min(
+            max(0, self._detail_cursor_line + delta),
+            max(0, self._detail_line_count - 1),
+        )
+        self.app.invalidate()
 
     def _move_agent(self, delta: int) -> None:
         self._render_tasks()
@@ -997,15 +1253,17 @@ class CodeDoggyTUI:
         if agent is None:
             return
         self._modal_ref = (task_id, agent_id)
-        self._agent_output.text = _display_agent_output(agent)
-        self._agent_output.buffer.cursor_position = 0
+        self._detail_filter = "all"
+        self._detail_cursor_line = 0
+        self._detail_input.text = ""
         self._modal_open = True
-        self.app.layout.focus(self._agent_output)
+        self.app.layout.focus(self._detail_window)
         self.app.invalidate()
 
     def _close_modal(self) -> None:
         self._modal_open = False
         self._modal_ref = None
+        self._detail_input.text = ""
         self.app.layout.focus(self._task_window)
         self.app.invalidate()
 
@@ -1027,8 +1285,8 @@ def run_tui(session: Any, *, initial_prompt: str | None = None) -> None:
     CodeDoggyTUI(session, initial_prompt=initial_prompt).run()
 
 
-def agent_text_from_messages(messages: list[Any]) -> str:
-    """Return only normal assistant prose; tool records stay hidden."""
+def agent_summary_text_from_messages(messages: list[Any]) -> str:
+    """Return assistant prose for the compact overview, not the detail page."""
     parts: list[str] = []
     for message in messages:
         role = getattr(message, "role", None)
@@ -1076,14 +1334,6 @@ def _turn_status(status: TurnStatus | Any) -> str:
     if value == TurnStatus.MAX_TURNS_REACHED.value:
         return "max_turns"
     return "failed"
-
-
-def _display_agent_output(agent: AgentView) -> str:
-    if agent.output.strip():
-        return agent.output.strip()
-    if agent.status in {"pending", "running"}:
-        return "Agent 正在工作，完成后会在这里给出完整输出。"
-    return agent.description.strip() or "Agent 没有留下文字输出。"
 
 
 def _terminal_width() -> int:
@@ -1260,41 +1510,45 @@ _DOGGY_CITY_ART = (
 
 _DOGGY_CORNER_ART = (
     "........................",
-    "........................",
-    "...DGG......GGG.........",
-    "...GDG.....GDDG.........",
-    "..GGDDG...GDDDG.........",
-    "..GDDDGGGGGGDDG.........",
-    "...GDGGGGGGGDDG.........",
-    "...GGGGGGGGGGGG.........",
-    "...DD.DGDD..DG..........",
-    "...D..DDD..GGG..........",
-    "...GGGD.GGGGGG..........",
-    "...GGGDDGGGGGG..........",
-    "...DDDGGDGDGDDG.........",
-    ".....GGGGGGDDGGG..WDD...",
-    "...GGDDWWDDDGGGGG.DWDW..",
-    "...GGWDGGFGGGGGGGG.WFW..",
-    "...GGWGGGWWGGGGGGG.W....",
-    "....GGWGWWGGGGDGGGG.....",
-    "....GGDGWFGGGDDGGGGG....",
-    "....GGGGGGGGGDDGGGGG....",
-    "..DGGGG..DGGGDGGGDD.....",
-    "..........WWDG..........",
-    "........................",
+    "...GG..........GG.......",
+    "..GDDG........GDDG......",
+    "..GFDG........GDFG......",
+    "..GGGGGGGGGGGGGGGG......",
+    "...GGDDDDGGDDDDGGG......",
+    "...GDWDDGGDDWDGGG.......",
+    "...GGDDDDDDDDDDGGG......",
+    "....GGGGDFFFDGGGG.......",
+    ".....GGFFFFFFFFGG.......",
+    "......GGFFDDFFGG........",
+    "....GGGGGGGGGGGGGG......",
+    "...GGGGGGGGGGGGGGGG.....",
+    "...GGGGCCCCCCCCGGGG.....",
+    "...GGGGGGCCCCGGGGGG.....",
+    "..GGGGGFFFFFFFFGGGG.D...",
+    "..GGGGFFFFFFFFFFGGG.DD..",
+    "...GGGFFFFFFFFFFGG.GG...",
+    "...GGGG...FFFF...GGGG...",
+    "..GGGG....FFFF....GGGG..",
+    "..GG......G..G......GG..",
     "........................",
 )
 
 _DOGGY_ART_PALETTE = {
-    ".": "#020507",
-    "C": "#16dfe5",
-    "M": "#f12698",
-    "G": "#ffc21a",
-    "F": "#f2d397",
-    "D": "#343a3e",
-    "S": "#92999e",
-    "W": "#f4f6f5",
-    "B": "#07596a",
+    ".": "#0b0b0d",
+    "C": "#16dfe8",
+    "M": "#ff2d9a",
+    "c": "#0b6670",
+    "m": "#8f1b58",
+    "G": "#ff7a32",
+    "Y": "#ffd43b",
+    "T": "#ff9a3c",
+    "P": "#ff2d9a",
+    "R": "#071014",
+    "F": "#f0c7a4",
+    "D": "#2c2c2e",
+    "S": "#8e8e93",
+    "W": "#f5f5f7",
+    "B": "#1c1c1e",
 }
 
 _DOGGY_ART_PRIORITY = {
@@ -1302,12 +1556,156 @@ _DOGGY_ART_PRIORITY = {
     "B": 1,
     "D": 2,
     "S": 3,
+    "c": 4,
+    "m": 4,
     "F": 4,
     "C": 5,
     "M": 6,
     "G": 7,
-    "W": 8,
+    "Y": 8,
+    "T": 8,
+    "P": 8,
+    "R": 1,
+    "W": 9,
 }
+
+# The large idle art is still portable ANSI/Unicode, but these overlays add
+# the details that matter at terminal resolution: sunglasses, gold chain,
+# moving cigarette smoke and a separate exhaust plume behind the car.
+_DOGGY_GLASSES_PIXELS = {
+    (26, 6): "D", (27, 6): "W", (28, 6): "D", (29, 6): "D", (30, 6): "D",
+    (32, 6): "D", (33, 6): "W", (34, 6): "D", (35, 6): "D", (36, 6): "D",
+    (26, 7): "D", (27, 7): "D", (28, 7): "D", (29, 7): "D", (30, 7): "D",
+    (31, 7): "D",
+    (32, 7): "D", (33, 7): "D", (34, 7): "D", (35, 7): "D", (36, 7): "D",
+    (27, 8): "D", (28, 8): "D", (29, 8): "D", (30, 8): "D",
+    (32, 8): "D", (33, 8): "D", (34, 8): "D", (35, 8): "D",
+}
+
+_DOGGY_CHAIN_PIXELS = (
+    (25, 10), (34, 10),
+    (25, 11), (26, 11), (27, 11),
+    (26, 12), (27, 12), (28, 12), (32, 12), (33, 12),
+    (27, 13), (28, 13), (29, 13), (31, 13), (32, 13), (33, 13),
+    (29, 14), (30, 14), (31, 14), (32, 14),
+    (31, 15),
+)
+
+_DOGGY_SMOKE_FRAMES = (
+    ((38, 9), (38, 8), (39, 7), (39, 6), (40, 5), (40, 4), (39, 3), (40, 2), (41, 1)),
+    ((38, 9), (39, 8), (39, 7), (40, 6), (41, 5), (40, 4), (41, 3), (42, 2), (43, 1)),
+    ((38, 9), (38, 8), (40, 7), (41, 6), (41, 5), (42, 4), (41, 3), (43, 2), (44, 1)),
+    ((38, 9), (39, 8), (40, 7), (39, 6), (40, 5), (41, 4), (42, 3), (42, 2), (44, 1)),
+)
+
+_DOGGY_EXHAUST_FRAMES = (
+    ((4, 23), (3, 24), (2, 25), (1, 25), (0, 26)),
+    ((4, 24), (3, 24), (2, 24), (1, 25), (0, 25)),
+    ((4, 23), (3, 24), (2, 24), (1, 24), (0, 25)),
+    ((4, 24), (3, 25), (2, 25), (1, 26), (0, 26)),
+)
+
+_DOGGY_WHEEL_CENTERS = ((5, 22), (23, 22))
+_DOGGY_WHEEL_SPOKES = (
+    ((0, -1), (0, 1)),
+    ((-1, -1), (1, 1)),
+    ((-1, 0), (1, 0)),
+    ((1, -1), (-1, 1)),
+)
+
+
+def _animate_doggy_city(rows: tuple[str, ...], frame: int) -> tuple[str, ...]:
+    """Return one refined animation frame without mutating the source art."""
+
+    canvas = [list(row.replace("S", ".")) for row in rows]
+    # Remove the two legacy hot-pink masses called out in the visual review:
+    # the solid skyline behind the rear half of the car and the horizontal
+    # under-car trail. Procedural skyline, palms and diagonal track stay intact.
+    for y, row in enumerate(canvas):
+        for x, value in enumerate(row):
+            if value == "M" and ((x < 24 and y < 28) or y >= 27):
+                canvas[y][x] = "."
+    for (x, y), value in _DOGGY_GLASSES_PIXELS.items():
+        canvas[y][x] = value
+    canvas[6][27] = "D"
+    canvas[6][33] = "D"
+    glint_shift = frame % 3
+    canvas[6][27 + glint_shift] = "W"
+    canvas[6][33 + glint_shift] = "W"
+    for x, y in _DOGGY_CHAIN_PIXELS:
+        canvas[y][x] = "Y"
+    for x, y in _DOGGY_SMOKE_FRAMES[frame % len(_DOGGY_SMOKE_FRAMES)]:
+        canvas[y][x] = "S"
+    for x, y in _DOGGY_EXHAUST_FRAMES[frame % len(_DOGGY_EXHAUST_FRAMES)]:
+        canvas[y][x] = "S"
+    ring = (
+        (-1, -2), (0, -2), (1, -2),
+        (-2, -1), (2, -1),
+        (-2, 0), (2, 0),
+        (-2, 1), (2, 1),
+        (-1, 2), (0, 2), (1, 2),
+    )
+    for center_x, center_y in _DOGGY_WHEEL_CENTERS:
+        for dx, dy in ring:
+            canvas[center_y + dy][center_x + dx] = "D"
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                canvas[center_y + dy][center_x + dx] = "B"
+        for dx, dy in _DOGGY_WHEEL_SPOKES[frame % len(_DOGGY_WHEEL_SPOKES)]:
+            canvas[center_y + dy][center_x + dx] = "W"
+        canvas[center_y][center_x] = "Y"
+    # Cigarette ember flickers independently from the smoke ribbon.
+    canvas[10][37] = "Y" if frame % 2 else "M"
+    return tuple("".join(row) for row in canvas)
+
+
+def _compose_doggy_scene(
+    art_rows: tuple[str, ...],
+    width: int,
+    scene_time: float,
+) -> tuple[str, ...]:
+    """Compose the diagonal road behind the foreground dog-and-car art."""
+
+    height = len(art_rows)
+    scene_width = max(1, width)
+    flicker_tick = int(scene_time * 4)
+    canvas = [["."] * scene_width for _ in range(height)]
+
+    def put(x: int, y: int, value: str, *, overwrite: bool = True) -> None:
+        if 0 <= x < scene_width and 0 <= y < height:
+            if overwrite or canvas[y][x] == ".":
+                canvas[y][x] = value
+
+    # A diagonal road runs between two parallel rails in exactly the
+    # bottom-right -> top-left direction indicated by the reference arrows.
+    road_top = 3
+    road_span = max(1, height - road_top - 1)
+    road_width = max(24, int(scene_width * 0.68))
+    for y in range(road_top, height):
+        progress = (y - road_top) / road_span
+        left = int(scene_width * (-0.18 + 0.48 * progress))
+        right = left + road_width
+        for x in range(left + 1, min(scene_width, right)):
+            put(x, y, "R")
+        put(left, y, "M")
+        put(left + 1, y, "M")
+        put(right - 1, y, "C")
+        put(right, y, "C")
+        lane = left + road_width // 2
+        if (y + flicker_tick) % 6 < 3:
+            put(lane, y, "Y")
+            put(lane + 1, y, "Y")
+
+    art_width = len(art_rows[0]) if art_rows else 0
+
+    # Foreground art wins over the procedural road; transparent cells leave
+    # the track visible around and through the vehicle silhouette.
+    art_left = max(0, (scene_width - art_width) // 2)
+    for y, row in enumerate(art_rows):
+        for x, value in enumerate(row):
+            if value != ".":
+                put(art_left + x, y, value)
+    return tuple("".join(row) for row in canvas)
 
 
 def _render_doggy_empty(
@@ -1316,26 +1714,24 @@ def _render_doggy_empty(
     now: float | None = None,
 ) -> StyleAndTextTuples:
     """Render the idle Frenchie cockpit as opaque true-colour terminal pixels."""
-    rows = _DOGGY_CITY_ART
+    clock = time.monotonic() if now is None else now
+    art_tick = int(clock * 4)
+    frame = art_tick % len(_DOGGY_SMOKE_FRAMES)
+    rows = _animate_doggy_city(_DOGGY_CITY_ART, frame)
     target_width = max(1, min(len(rows[0]), width - 4))
     if target_width < len(rows[0]):
         rows = tuple(_fit_art_row(row, target_width) for row in rows)
 
+    rows = _compose_doggy_scene(rows, width, clock)
     art_width = len(rows[0])
-    outer = max(0, (width - art_width) // 2)
-    title = "— DOGGY —"
-    title_outer = max(0, (width - get_cwidth(title)) // 2)
-    tick = int((time.monotonic() if now is None else now) * 4) % 2
+    outer = max(0, width - art_width)
+    tick = frame % 2
     palette = dict(_DOGGY_ART_PALETTE)
     if tick:
-        palette["G"] = "#ffe36a"
+        palette["M"] = "#ff5ab3"
+        palette["S"] = "#aeaeb2"
 
-    fragments: StyleAndTextTuples = [
-        ("", "\n"),
-        ("", " " * title_outer),
-        ("class:doggy.wordmark", title + "\n"),
-        ("", "\n"),
-    ]
+    fragments: StyleAndTextTuples = [("", "\n")]
     for top, bottom in zip(rows[::2], rows[1::2], strict=True):
         fragments.append(("", " " * outer))
         pairs = zip(top, bottom, strict=True)
@@ -1344,6 +1740,132 @@ def _render_doggy_empty(
             style, glyph = _half_block(pair[0], pair[1], palette)
             fragments.append((style, glyph * count))
         fragments.append(("", "\n"))
+    runway_height = max(0, min(16, _terminal_height() - 25))
+    fragments.extend(_render_neon_track(width, runway_height, int(clock * 6)))
+    return fragments
+
+
+def _render_neon_track(
+    width: int,
+    height: int,
+    frame: int,
+) -> StyleAndTextTuples:
+    """Continue the scene's parallel diagonal rails toward the lower-right."""
+
+    if height <= 0 or width < 12:
+        return []
+    fragments: StyleAndTextTuples = []
+    base_style = "bg:#0b0b0d"
+    road_style = "bg:#071014"
+    edge_pink = "fg:#ff2d9a bg:#071014 bold"
+    edge_cyan = "fg:#16dfe8 bg:#071014 bold"
+    glow_pink = "fg:#8f1b58 bg:#071014"
+    glow_cyan = "fg:#0b6670 bg:#071014"
+    lane_orange = "fg:#ff9a3c bg:#071014 bold"
+    road_width = max(24, int(width * 0.68))
+    left_start = int(width * 0.30)
+    diagonal_step = max(2, int(width * 0.035))
+    phase = frame % 10
+    hud_left = 2
+    hud_width = min(44, max(0, left_start - 4))
+    hud_right = hud_left + hud_width - 1
+
+    for y in range(height):
+        chars = [" "] * width
+        styles = [base_style] * width
+
+        def put(x: int, glyph: str, style: str) -> None:
+            if 0 <= x < width:
+                chars[x] = glyph
+                styles[x] = style
+
+        def write(x: int, text: str, style: str) -> None:
+            for offset, glyph in enumerate(text):
+                put(x + offset, glyph, style)
+
+        left = left_start + y * diagonal_step
+        right = left + road_width
+        for x in range(max(0, left + 1), min(width, right)):
+            styles[x] = road_style
+            if (x + y * 2 + phase // 2) % 17 == 0:
+                put(x, "·", "fg:#0b6670 bg:#071014")
+
+        put(left, "\\", edge_pink)
+        put(left + 1, "\\", edge_pink)
+        put(right - 1, "\\", edge_cyan)
+        put(right, "\\", edge_cyan)
+
+        lane = left + road_width // 2
+        if (y + phase - 2) % 8 == 0:
+            put(lane, "╲", lane_orange)
+
+        # Sparse roadside reflectors retreat up-left beneath the right-facing
+        # car. Deriving x from y follows the road perspective instead of
+        # sweeping sideways or piling up into barcode-like clusters.
+        pink_tail = (y + phase) % 10
+        if pink_tail in (0, 1):
+            marker = left + road_width // 3
+            put(marker, "╲", edge_pink if pink_tail == 0 else glow_pink)
+            if pink_tail == 0:
+                put(marker + 1, "╲", edge_pink)
+
+        cyan_tail = (y + phase - 5) % 10
+        if cyan_tail in (0, 1):
+            marker = left + road_width * 2 // 3
+            put(marker, "╲", edge_cyan if cyan_tail == 0 else glow_cyan)
+            if cyan_tail == 0:
+                put(marker + 1, "╲", edge_cyan)
+
+        if height >= 5 and hud_width >= 28 and y < 5:
+            hud_bg = "bg:#071014"
+            hud_pink = "fg:#ff2d9a bg:#071014 bold"
+            hud_cyan = "fg:#16dfe8 bg:#071014 bold"
+            hud_orange = "fg:#ff9a3c bg:#071014 bold"
+            hud_dim = "fg:#0b6670 bg:#071014"
+            for x in range(hud_left, hud_right + 1):
+                styles[x] = hud_bg
+
+            if y == 0:
+                for x in range(hud_left + 1, hud_right):
+                    put(x, "─", hud_pink)
+                put(hud_left, "╭", hud_pink)
+                put(hud_right, "╮", hud_cyan)
+                title = " STREET MODE "
+                write(hud_left + 2, title, hud_pink)
+            elif y == 4:
+                for x in range(hud_left + 1, hud_right):
+                    put(x, "─", hud_cyan)
+                put(hud_left, "╰", hud_pink)
+                put(hud_right, "╯", hud_cyan)
+            else:
+                put(hud_left, "│", hud_pink)
+                put(hud_right, "│", hud_cyan)
+                if y == 1:
+                    speed = 274 + (frame * 11) % 25
+                    write(hud_left + 2, "SPEED", hud_cyan)
+                    write(hud_left + 9, f"{speed:03d}", hud_orange)
+                    write(hud_left + 13, "KM/H", hud_cyan)
+                elif y == 2:
+                    write(hud_left + 2, "GEAR", hud_cyan)
+                    write(hud_left + 7, "5", hud_orange)
+                    write(hud_left + 10, "BOOST", hud_cyan)
+                    bar_width = max(3, hud_width - 19)
+                    active = min(bar_width, max(1, bar_width - 2 + frame % 3))
+                    for index in range(bar_width):
+                        put(
+                            hud_left + 16 + index,
+                            "■" if index < active else "·",
+                            hud_pink if index < active else hud_dim,
+                        )
+                else:
+                    write(hud_left + 2, "NO BRAKES", hud_pink)
+                    swag = "SWAG MAX"
+                    write(hud_right - len(swag) - 2, swag, hud_orange)
+
+        for (style, glyph), cells in groupby(zip(styles, chars, strict=True)):
+            count = sum(1 for _ in cells)
+            fragments.append((style, glyph * count))
+        fragments.append((base_style, "\n"))
     return fragments
 
 
@@ -1354,7 +1876,7 @@ def _render_doggy_corner(width: int) -> StyleAndTextTuples:
     outer = max(0, width - art_width - 4)
     palette = dict(_DOGGY_ART_PALETTE)
     if int(time.monotonic() * 3) % 2:
-        palette["G"] = "#ffe36a"
+        palette["G"] = "#ff9a5a"
     fragments: StyleAndTextTuples = []
     for top, bottom in zip(rows[::2], rows[1::2], strict=True):
         fragments.append(("", " " * outer))
