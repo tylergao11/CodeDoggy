@@ -107,13 +107,14 @@ def test_go_back_from_home_closes() -> None:
     assert action.kind == "close"
 
 
-def test_wizard_pick_model_emits_apply_action() -> None:
+def test_wizard_pick_model_then_reasoning_then_apply() -> None:
     w = AuthWizard()
     w.open(active_provider="ollama", active_model="qwen3:8b")
     w.provider = "ollama"
     w.step = WizardStep.PROVIDER
     w._rebuild()
     assert any(i.id == "pick_model" for i in w.items)
+    assert any(i.id == "pick_reasoning" for i in w.items)
     for i, item in enumerate(w.items):
         if item.id == "pick_model":
             w.cursor = i
@@ -134,12 +135,24 @@ def test_wizard_pick_model_emits_apply_action() -> None:
                 mid = item.id.split(":", 1)[1]
                 break
     action = w.activate()
+    # Model pick no longer applies immediately — next is effort.
+    assert action.kind == "blur_input"
+    assert w.step == WizardStep.REASONING
+    assert w.pending_model == mid
+    assert any(i.id.startswith("effort:") for i in w.items)
+    for i, item in enumerate(w.items):
+        if item.id == "effort:medium":
+            w.cursor = i
+            break
+    action = w.activate()
     assert action.kind == "reload_client"
     assert action.provider == "ollama"
     assert action.model == mid
+    assert action.reasoning_effort == "medium"
+    assert action.reasoning_enabled is True
 
 
-def test_wizard_custom_model_paste() -> None:
+def test_wizard_custom_model_paste_goes_to_reasoning() -> None:
     w = AuthWizard()
     w.provider = "ollama"
     w.step = WizardStep.MODEL
@@ -152,6 +165,84 @@ def test_wizard_custom_model_paste() -> None:
     assert action.kind == "focus_input"
     assert w.paste_kind == "model"
     action = w.submit_paste_text("my-custom:7b")
+    assert w.step == WizardStep.REASONING
+    assert w.pending_model == "my-custom:7b"
+    for i, item in enumerate(w.items):
+        if item.id == "effort:high":
+            w.cursor = i
+            break
+    action = w.activate()
     assert action.kind == "reload_client"
     assert action.model == "my-custom:7b"
     assert action.provider == "ollama"
+    assert action.reasoning_effort == "high"
+
+
+def test_wizard_pick_reasoning_only_from_provider() -> None:
+    w = AuthWizard()
+    w.open(
+        active_provider="ollama",
+        active_model="qwen3:8b",
+        active_reasoning_effort="high",
+        active_reasoning_enabled=True,
+    )
+    w.provider = "ollama"
+    w.step = WizardStep.PROVIDER
+    w._rebuild()
+    for i, item in enumerate(w.items):
+        if item.id == "pick_reasoning":
+            w.cursor = i
+            break
+    w.activate()
+    assert w.step == WizardStep.REASONING
+    for i, item in enumerate(w.items):
+        if item.id == "effort:low":
+            w.cursor = i
+            break
+    action = w.activate()
+    assert action.kind == "reload_client"
+    # Reasoning-only: model=None so apply keeps connection model (or profile default).
+    assert action.model is None
+    assert action.reasoning_effort == "low"
+    # Actives not dirtied before host applies snap.
+    assert w.active_model == "qwen3:8b"
+    assert w.active_reasoning_effort == "high"
+
+
+def test_wizard_cross_provider_reasoning_does_not_ship_old_model() -> None:
+    w = AuthWizard()
+    w.open(active_provider="ollama", active_model="qwen3:8b")
+    w.provider = "grok"
+    w.step = WizardStep.PROVIDER
+    w.pending_model = "qwen3:8b"  # leftover contamination
+    w._rebuild()
+    for i, item in enumerate(w.items):
+        if item.id == "pick_reasoning":
+            w.cursor = i
+            break
+    w.activate()
+    assert w.pending_model == ""
+    for i, item in enumerate(w.items):
+        if item.id == "effort:medium":
+            w.cursor = i
+            break
+    action = w.activate()
+    assert action.provider == "grok"
+    assert action.model is None
+    assert action.reasoning_effort == "medium"
+
+
+def test_wizard_go_back_from_reasoning() -> None:
+    w = AuthWizard()
+    w.open(active_provider="ollama", active_model="qwen3:8b")
+    w.provider = "ollama"
+    w._enter_reasoning(from_step="model", model="other:7b")
+    assert w.step == WizardStep.REASONING
+    assert w.pending_model == "other:7b"
+    action = w.go_back()
+    assert w.step == WizardStep.MODEL
+    assert action.kind == "blur_input"
+    w._enter_reasoning(from_step="provider")
+    w.go_back()
+    assert w.step == WizardStep.PROVIDER
+    assert w.pending_model == ""

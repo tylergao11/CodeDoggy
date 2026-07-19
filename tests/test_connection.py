@@ -39,6 +39,23 @@ def test_connection_from_config_snapshot_fields() -> None:
     assert snap.ready_to_sample is True
     assert snap.label == "ollama/qwen3:8b"
     assert snap.generation == 0
+    # Missing extra → product default high
+    assert snap.reasoning_enabled is True
+    assert snap.reasoning_effort == "high"
+    assert snap.reasoning_label == "推理:high"
+
+
+def test_connection_reads_reasoning_from_config_extra() -> None:
+    snap = connection_from_config(
+        _cfg(extra={"reasoning": {"enabled": True, "effort": "medium"}}),
+    )
+    assert snap.reasoning_effort == "medium"
+    assert snap.reasoning_label == "推理:medium"
+    off = connection_from_config(
+        _cfg(extra={"reasoning": {"enabled": False}}),
+    )
+    assert off.reasoning_enabled is False
+    assert off.reasoning_label == "推理:off"
 
 
 def test_bootstrap_service_snapshot_stable() -> None:
@@ -97,7 +114,10 @@ def test_connection_of_reads_extensions() -> None:
     assert connection_of(session) is svc
     assert session_surface.provider_id(session) == "ollama"
     assert session_surface.model_id(session) == "qwen3:8b"
-    assert "qwen3:8b" in session_surface.model_and_mode_text(session)
+    caption = session_surface.model_and_mode_text(session)
+    assert "qwen3:8b" in caption
+    assert "推理:high" in caption
+    assert "auto" in caption
 
 
 def test_hud_projection_uses_connection_not_env(
@@ -141,6 +161,75 @@ def test_reasoning_defaults_to_high(monkeypatch: pytest.MonkeyPatch) -> None:
     cfg = model_config_from_env()
     assert cfg.extra.get("reasoning", {}).get("effort") == "high"
     assert cfg.extra.get("reasoning", {}).get("enabled") is True
+
+
+def test_apply_sets_reasoning_effort(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("CODEDOGGY_PROVIDER", "ollama")
+    monkeypatch.setenv("CODEDOGGY_MODEL", "qwen3:8b")
+    monkeypatch.setenv("CODEDOGGY_BASE_URL", "http://127.0.0.1:11434/v1")
+    monkeypatch.delenv("CODEDOGGY_REASONING_EFFORT", raising=False)
+    monkeypatch.delenv("CODEDOGGY_REASONING_ENABLED", raising=False)
+
+    class _Client:
+        def __init__(self, config: ModelConfig) -> None:
+            self.config = config
+
+    def _fake_create(cfg: ModelConfig, **_k: object) -> _Client:
+        return _Client(cfg)
+
+    monkeypatch.setattr(
+        "codedoggy.model.connection.create_client",
+        _fake_create,
+    )
+    svc = ConnectionService.bootstrap(_cfg())
+    snap = svc.apply(
+        provider="ollama",
+        model="qwen3:8b",
+        reasoning_effort="medium",
+        reasoning_enabled=True,
+        require_auth=False,
+    )
+    assert snap.reasoning_effort == "medium"
+    assert snap.reasoning_label == "推理:medium"
+    assert snap.reasoning_enabled is True
+    import os
+
+    assert os.environ.get("CODEDOGGY_REASONING_EFFORT") == "medium"
+    # refresh_auth must not drop reasoning fields
+    refreshed = svc.refresh_auth()
+    assert refreshed.reasoning_effort == "medium"
+    assert refreshed.reasoning_enabled is True
+
+
+def test_apply_failure_does_not_publish_reasoning_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CODEDOGGY_PROVIDER", "ollama")
+    monkeypatch.setenv("CODEDOGGY_MODEL", "qwen3:8b")
+    monkeypatch.setenv("CODEDOGGY_BASE_URL", "http://127.0.0.1:11434/v1")
+    monkeypatch.setenv("CODEDOGGY_REASONING_EFFORT", "high")
+    monkeypatch.setenv("CODEDOGGY_REASONING_ENABLED", "1")
+
+    def _boom(cfg: ModelConfig, **_k: object) -> None:
+        raise RuntimeError("no client")
+
+    monkeypatch.setattr("codedoggy.model.connection.create_client", _boom)
+    svc = ConnectionService.bootstrap(
+        _cfg(extra={"reasoning": {"enabled": True, "effort": "high"}})
+    )
+    import os
+
+    with pytest.raises(RuntimeError, match="no client"):
+        svc.apply(
+            provider="ollama",
+            model="qwen3:8b",
+            reasoning_effort="low",
+            reasoning_enabled=True,
+            require_auth=False,
+        )
+    # Failed apply must not leave the new effort in process env.
+    assert os.environ.get("CODEDOGGY_REASONING_EFFORT") == "high"
+    assert svc.snapshot().reasoning_effort == "high"
 
 
 def test_apply_model_keeps_provider(monkeypatch: pytest.MonkeyPatch) -> None:

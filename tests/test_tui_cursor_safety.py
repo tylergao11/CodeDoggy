@@ -141,15 +141,24 @@ def test_auth_body_empty_items_never_returns_empty_fragments() -> None:
 def test_modal_underlay_empty_content_clamps_task_cursor() -> None:
     with create_pipe_input() as pin:
         tui = CodeDoggyTUI(_Session(), input=pin, output=DummyOutput())
+        tui._startup_brand = False
+        tui._follow_latest_task = False
         for i in range(4):
             tui.ledger.create(f"t{i}")
-        tui._selected_line = 80
+        tui._render_tasks()
+        tui._selected_line = 12
+        saved = tui._selected_line
         tui._modal_open = True
         fr = tui._render_tasks()
         pos = tui._task_cursor_position()
         assert tui._agent_refs == []
         assert tui._task_line_count == _pt_line_count(fr)
+        # Cursor position is clamped for paint; free-scroll y is preserved.
         assert 0 <= pos.y < tui._task_line_count
+        assert tui._selected_line == saved
+        tui._modal_open = False
+        tui._render_tasks()
+        assert tui._selected_line == saved
 
 
 def test_modal_title_never_empty() -> None:
@@ -243,3 +252,79 @@ def test_ensure_fragments_never_empty() -> None:
     assert tui._ensure_fragments([])
     assert tui._ensure_fragments(None)
     assert tui._count_fragment_lines(tui._ensure_fragments([])) >= 1
+
+
+def test_brief_two_lines_does_not_ellipsis_when_fits() -> None:
+    from codedoggy.tui.app import _MORE_HINT_WIDTH, _brief_two_lines, _more_hint
+    from prompt_toolkit.utils import get_cwidth
+
+    # Fits on one line of width 20.
+    lines, truncated = _brief_two_lines("hello world", 20)
+    assert lines == ["hello world"]
+    assert truncated is False
+    # Fits exactly across two full-width lines — no more-marker.
+    text = "abcdefghij" * 2
+    lines, truncated = _brief_two_lines(text, 10)
+    assert truncated is False
+    assert len(lines) == 2
+    assert not any("…" in line or "=>" in line for line in lines)
+    assert "".join(lines) == text
+    # Overflow past two lines → truncated flag; body leaves room for ==> .
+    long = "abcdefghij" * 3
+    overflow, truncated = _brief_two_lines(long, 10)
+    assert truncated is True
+    assert len(overflow) == 2
+    assert not overflow[1].endswith("…")
+    assert get_cwidth(overflow[0]) <= 10
+    assert get_cwidth(overflow[1]) + _MORE_HINT_WIDTH <= 10
+    # Narrow budget must not inflate past caller width.
+    narrow, n_trunc = _brief_two_lines(long, 5)
+    assert all(get_cwidth(line) <= 5 for line in narrow)
+    if n_trunc:
+        assert get_cwidth(narrow[-1]) + _MORE_HINT_WIDTH <= 5 or get_cwidth(narrow[-1]) <= 5
+    # Marker itself is always width-3 and changes over time.
+    assert get_cwidth(_more_hint(now=0.0)) == 3
+    assert get_cwidth(_more_hint(now=0.2)) == 3
+    assert {_more_hint(now=t / 10) for t in range(20)}  # non-empty set
+
+
+def test_task_paint_cache_skips_rebuild_when_idle() -> None:
+    """Idle task list must not full-walk cards on every refresh tick."""
+    with create_pipe_input() as pin:
+        tui = CodeDoggyTUI(_Session(), input=pin, output=DummyOutput())
+        tui._startup_brand = False
+        tui.ledger.create("short done")
+        tui._paint_clock = 10.0
+        fr1 = tui._render_tasks()
+        fr2 = tui._render_tasks()
+        assert fr1 is fr2
+        # Content change busts the cache.
+        tui.ledger.create("another")
+        fr3 = tui._render_tasks()
+        assert fr3 is not fr1
+
+
+def test_more_hint_is_paint_time_only_and_2hz() -> None:
+    from codedoggy.tui.app import _MORE_HINT_FRAMES, _more_hint
+
+    a = _more_hint(now=1.0)
+    b = _more_hint(now=1.4)  # same 2Hz bucket
+    c = _more_hint(now=1.6)  # next bucket
+    assert a == b
+    assert a in _MORE_HINT_FRAMES
+    assert c in _MORE_HINT_FRAMES
+
+
+def test_focus_latest_task_from_prompt_ignores_prior_selection() -> None:
+    """Tab from input must always land on the newest task, not last browse."""
+    with create_pipe_input() as pin:
+        tui = CodeDoggyTUI(_Session(), input=pin, output=DummyOutput())
+        for i in range(4):
+            tui.ledger.create(f"task-{i}")
+        tui._selected_task = 0
+        tui._follow_latest_task = False
+        tui._pinned_task_for_line = 0
+        assert tui._focus_latest_task() is True
+        assert tui._selected_task == 3
+        assert tui._follow_latest_task is True
+        assert tui._task_refs[-1] == tui.ledger.snapshots()[-1].id

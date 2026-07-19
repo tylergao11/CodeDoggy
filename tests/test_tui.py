@@ -212,7 +212,11 @@ def test_real_session_runner_flows_into_clicked_main_detail(tmp_path: Path) -> N
 def test_task_report_is_the_agents_first_brief_paragraph() -> None:
     text = "## 已完成\n入口已经接通。\n\n后面是只有点开 Agent 才需要看的大量细节。"
     assert task_report_from_agent(text) == "已完成 入口已经接通。"
-    assert task_report_from_agent("x" * 400).endswith("…")
+    # Hard-cap only — no ellipsis; list UI paints animated ==> when truncated.
+    long = task_report_from_agent("x" * 400)
+    assert len(long) == 260
+    assert not long.endswith("…")
+    assert not long.endswith("...")
 
 
 def test_startup_brand_is_neon_couple_art_without_overflow() -> None:

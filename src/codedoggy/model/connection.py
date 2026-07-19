@@ -42,6 +42,9 @@ class ActiveConnection:
     max_tokens: int | None
     context_window: int | None
     timeout_s: float
+    # From ModelConfig.extra["reasoning"] — product default is high when unset.
+    reasoning_enabled: bool
+    reasoning_effort: str
     aux_provider: str
     aux_model: str
     aux_base_url: str
@@ -67,12 +70,28 @@ class ActiveConnection:
         return f"{self.provider}/{self.model}"
 
     @property
+    def reasoning_label(self) -> str:
+        """Short UI label for reasoning effort (e.g. ``推理:high`` / ``推理:off``)."""
+        if not self.reasoning_enabled:
+            return "推理:off"
+        effort = (self.reasoning_effort or "high").strip().lower() or "high"
+        return f"推理:{effort}"
+
+    @property
     def model_mode_caption(self) -> str:
         """Bottom-bar style ``model · …`` left half (mode filled by surface)."""
         return self.model
 
     def to_model_config(self) -> ModelConfig:
         """Routing config without secrets (auth layer fills keys on create)."""
+        reasoning: dict[str, Any]
+        if not self.reasoning_enabled:
+            reasoning = {"enabled": False}
+        else:
+            reasoning = {
+                "enabled": True,
+                "effort": (self.reasoning_effort or "high").strip().lower() or "high",
+            }
         return ModelConfig(
             provider=self.provider,
             model=self.model,
@@ -82,7 +101,32 @@ class ActiveConnection:
             max_tokens=self.max_tokens,
             timeout_s=self.timeout_s,
             context_window=self.context_window,
+            extra={"reasoning": reasoning},
         )
+
+
+def reasoning_from_extra(extra: dict[str, Any] | None) -> tuple[bool, str]:
+    """Parse ``ModelConfig.extra['reasoning']`` → ``(enabled, effort)``.
+
+    Product default when unset: enabled + ``high`` (matches registry env defaults).
+    """
+    if not isinstance(extra, dict):
+        return True, "high"
+    rc = extra.get("reasoning")
+    if not isinstance(rc, dict):
+        return True, "high"
+    effort = str(rc.get("effort") or "").strip().lower()
+    if rc.get("enabled") is False or effort == "off":
+        return False, "off"
+    if not effort:
+        effort = "high"
+    if effort in {"max", "ultra"}:
+        effort = "xhigh"
+    elif effort == "minimal":
+        effort = "low"
+    if effort not in {"low", "medium", "high", "xhigh"}:
+        effort = "high"
+    return True, effort
 
 
 def connection_from_config(
@@ -99,6 +143,7 @@ def connection_from_config(
     api_mode = str(getattr(profile, "api_mode", "") or "chat_completions")
     st = auth_status(provider)
     aux_cfg = aux or main
+    reasoning_on, reasoning_effort = reasoning_from_extra(getattr(main, "extra", None))
     return ActiveConnection(
         provider=provider,
         model=str(main.model or "").strip() or (profile.default_model if profile else "model"),
@@ -112,6 +157,8 @@ def connection_from_config(
         max_tokens=main.max_tokens,
         context_window=main.context_window,
         timeout_s=float(main.timeout_s or 120.0),
+        reasoning_enabled=reasoning_on,
+        reasoning_effort=reasoning_effort,
         aux_provider=str(aux_cfg.provider or provider).strip().lower(),
         aux_model=str(aux_cfg.model or main.model or "").strip(),
         aux_base_url=str(aux_cfg.base_url or main.base_url or "").strip(),
@@ -233,6 +280,8 @@ class ConnectionService:
         *,
         provider: str | None = None,
         model: str | None = None,
+        reasoning_effort: str | None = None,
+        reasoning_enabled: bool | None = None,
         require_auth: bool = True,
         source: ConnectionSource = "panel",
     ) -> ActiveConnection:
@@ -268,6 +317,16 @@ class ConnectionService:
                 cfg = replace_config(cfg, temperature=cur.temperature)
             if cfg.max_tokens is None and cur.max_tokens is not None:
                 cfg = replace_config(cfg, max_tokens=cur.max_tokens)
+            # Reasoning effort: explicit panel choice wins; else keep connection.
+            # Env is only published after create_client succeeds (no failed-swap leak).
+            cfg = _apply_reasoning_to_config(
+                cfg,
+                effort=reasoning_effort,
+                enabled=reasoning_enabled,
+                fallback_effort=cur.reasoning_effort,
+                fallback_enabled=cur.reasoning_enabled,
+                publish_env=False,
+            )
 
             try:
                 # Ollama is deliberately credential-free.  The TUI hard auth
@@ -284,6 +343,7 @@ class ConnectionService:
                 )
                 raise
 
+            _publish_reasoning_env(cfg)
             self._push_runtime(client, cfg)
             st = auth_status(prov)
             profile = get_profile(prov)
@@ -296,6 +356,7 @@ class ConnectionService:
             aux_base = cur.aux_base_url
 
             self._client = client
+            reasoning_on, reasoning_effort = reasoning_from_extra(getattr(cfg, "extra", None))
             self._state = ActiveConnection(
                 provider=prov,
                 model=str(cfg.model or mod).strip(),
@@ -309,6 +370,8 @@ class ConnectionService:
                 max_tokens=cfg.max_tokens,
                 context_window=cfg.context_window,
                 timeout_s=float(cfg.timeout_s or cur.timeout_s or 120.0),
+                reasoning_enabled=reasoning_on,
+                reasoning_effort=reasoning_effort,
                 aux_provider=str(aux_provider).strip().lower(),
                 aux_model=str(aux_model or mod).strip(),
                 aux_base_url=str(aux_base or cfg.base_url or "").strip(),
@@ -364,6 +427,72 @@ class ConnectionService:
             budget.last_prompt_tokens = None
             budget.last_completion_tokens = None
             budget.awaiting_usage_ensures = 0
+
+
+def _normalize_reasoning_choice(
+    *,
+    effort: str | None,
+    enabled: bool | None,
+    fallback_effort: str = "high",
+    fallback_enabled: bool = True,
+) -> tuple[bool, str]:
+    """Resolve panel/connection reasoning into ``(enabled, effort)``."""
+    if enabled is None and effort is None:
+        # Connection snapshot is truth — do not re-open env defaults here.
+        on = bool(fallback_enabled)
+        eff = (fallback_effort or "high").strip().lower() or "high"
+    else:
+        on = fallback_enabled if enabled is None else bool(enabled)
+        eff = (effort or fallback_effort or "high").strip().lower() or "high"
+    if not on or eff == "off":
+        return False, "off"
+    if eff in {"max", "ultra"}:
+        eff = "xhigh"
+    elif eff == "minimal":
+        eff = "low"
+    elif eff not in {"low", "medium", "high", "xhigh"}:
+        eff = "high"
+    return True, eff
+
+
+def _apply_reasoning_to_config(
+    cfg: ModelConfig,
+    *,
+    effort: str | None,
+    enabled: bool | None,
+    fallback_effort: str = "high",
+    fallback_enabled: bool = True,
+    publish_env: bool = False,
+) -> ModelConfig:
+    """Merge reasoning into ``ModelConfig.extra`` (optionally publish env)."""
+    on, eff = _normalize_reasoning_choice(
+        effort=effort,
+        enabled=enabled,
+        fallback_effort=fallback_effort,
+        fallback_enabled=fallback_enabled,
+    )
+    extra = dict(cfg.extra)
+    if on:
+        extra["reasoning"] = {"enabled": True, "effort": eff}
+    else:
+        extra["reasoning"] = {"enabled": False}
+    out = replace_config(cfg, extra=extra)
+    if publish_env:
+        _publish_reasoning_env(out)
+    return out
+
+
+def _publish_reasoning_env(cfg: ModelConfig) -> None:
+    """Mirror successful connection reasoning into process env for later reloads."""
+    import os
+
+    on, eff = reasoning_from_extra(getattr(cfg, "extra", None))
+    if on:
+        os.environ["CODEDOGGY_REASONING_ENABLED"] = "1"
+        os.environ["CODEDOGGY_REASONING_EFFORT"] = eff
+    else:
+        os.environ["CODEDOGGY_REASONING_ENABLED"] = "0"
+        os.environ.pop("CODEDOGGY_REASONING_EFFORT", None)
 
 
 def replace_config(cfg: ModelConfig, **kwargs: Any) -> ModelConfig:

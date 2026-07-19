@@ -206,6 +206,7 @@ CODEDOGGY_DARK = Style.from_dict(
         "reporter.waiting": "#6f8791 bold",
         "reporter.failed": "#ff2d9a bold",
         "report": "#dce9e9",
+        "report.more": "#16dfe8 bold",
         "input": "bg:#071014 #f5f5f7",
         "input.placeholder": "bg:#071014 #536b75",
         "prompt": "bg:#071014 #f2ca55 bold",
@@ -316,7 +317,12 @@ class CodeDoggyTUI:
         )
         # before_render throttle + splash cache (ESC/modal close snappiness)
         self._last_sync_runtime_at = 0.0
+        self._paint_clock = 0.0  # one monotonic sample per paint (no extra invalidate)
         self._doggy_empty_cache: tuple[tuple[Any, ...], StyleAndTextTuples] | None = None
+        # Full task-list fragment cache: skip card rebuild when content unchanged.
+        # more-marker animation is 2Hz and only enters the key when needed.
+        self._task_paint_cache: tuple[Any, ...] | None = None
+        self._task_more_anim = False
         # Keep the newest task card fully in view until the user scrolls away.
         self._follow_latest_task = True
         # Live tool/activity lines from on_live_message (effect layer, not truth).
@@ -1010,10 +1016,7 @@ class CodeDoggyTUI:
         )
         if status in {"pending", "running"}:
             self.ledger.set_task_phase(task_id, "parallel")
-        try:
-            self.app.invalidate()
-        except Exception:  # noqa: BLE001
-            pass
+        self._request_redraw()
 
     def _build_key_bindings(self) -> KeyBindings:
         keys = KeyBindings()
@@ -1084,8 +1087,9 @@ class CodeDoggyTUI:
         @keys.add("tab", filter=~modal)
         def _next_task_or_focus(event: Any) -> None:
             if event.app.layout.has_focus(self._input):
-                self._render_tasks()
-                if self._task_refs:
+                # Leaving the prompt always lands on the newest task, not the
+                # last Tab-browsed selection.
+                if self._focus_latest_task():
                     event.app.layout.focus(self._task_window)
                     event.app.invalidate()
             else:
@@ -1096,8 +1100,7 @@ class CodeDoggyTUI:
         @keys.add("s-tab", filter=~modal)
         def _previous_task_or_focus(event: Any) -> None:
             if event.app.layout.has_focus(self._input):
-                self._render_tasks()
-                if self._task_refs:
+                if self._focus_latest_task():
                     event.app.layout.focus(self._task_window)
                     event.app.invalidate()
             else:
@@ -1529,6 +1532,9 @@ class CodeDoggyTUI:
 
     def _before_render(self) -> None:
         """prompt_toolkit before_render hook — keep off the hot path when idle."""
+        # Single clock sample for this paint. Animations (spinners, ==>) read it;
+        # they must never schedule their own invalidate / full redraw storms.
+        self._paint_clock = time.monotonic()
         self._sync_runtime()
 
     def _sync_runtime(self) -> None:
@@ -1987,8 +1993,7 @@ class CodeDoggyTUI:
             elif action == "login":
                 self._open_auth_wizard()
             elif action == "tasks":
-                self._render_tasks()
-                if self._task_refs:
+                if self._focus_latest_task():
                     self.app.layout.focus(self._task_window)
             elif action == "next":
                 self._move_task(1)
@@ -2073,10 +2078,13 @@ class CodeDoggyTUI:
 
         cur = str(snap.get("provider") or "—")
         cur_model = str(snap.get("model") or "")
+        cur_reason = str(snap.get("reasoning") or "")
         cur_ok = bool(snap.get("current_ok"))
         status_word = "AUTH ON" if cur_ok else ("AUTH OFF" if pulse else "LOGIN ›")
         status_style = ok_style if cur_ok else warn_style
         now_label = f"{cur}/{cur_model}" if cur_model else cur
+        if cur_reason:
+            now_label = f"{now_label} {cur_reason}"
 
         fragments: StyleAndTextTuples = []
         # row 0 border title — rounded plate + dog face
@@ -2084,8 +2092,8 @@ class CodeDoggyTUI:
         fragments.extend(line(title_style, top[:width]))
         fragments.append((bg, "\n", open_handler))
 
-        # row 1 status — provider/model from connection truth
-        mid1 = f"│ {status_word:<10}  NOW {now_label[:18]:<18}"
+        # row 1 status — provider/model/reasoning from connection truth
+        mid1 = f"│ {status_word:<10}  NOW {now_label[:22]:<22}"
         mid1 = mid1[: width - 1] + "│"
         fragments.append((status_style, mid1[:14], open_handler))
         fragments.append((cyan if cur_ok else dim, mid1[14:], open_handler))
@@ -2166,7 +2174,8 @@ class CodeDoggyTUI:
                 self._task_refs = []
                 self._agent_refs = []
                 empty: StyleAndTextTuples = [("", "\n")]
-                self._set_task_line_count(empty)
+                # Underlay line count only — do not clamp free-scroll _selected_line.
+                self._task_line_count = self._count_fragment_lines(empty)
                 return empty
             # Agent detail on top: still keep task_refs in sync for selection keys,
             # but avoid re-walking every agent line under the float each frame.
@@ -2177,7 +2186,7 @@ class CodeDoggyTUI:
                     self._selected_task = len(tasks) - 1
                 self._selected_task %= len(tasks)
             empty = [("", "\n")]
-            self._set_task_line_count(empty)
+            self._task_line_count = self._count_fragment_lines(empty)
             return empty
 
         # Launch splash only — first task dismisses it for the whole session.
@@ -2190,8 +2199,31 @@ class CodeDoggyTUI:
             self._task_refs = []
             self._agent_refs = []
             self._selected_task = 0
+            self._task_more_anim = False
+            self._task_paint_cache = None
             fr = _render_doggy_idle_panel(width)
             self._set_task_line_count(fr)
+            return fr
+
+        # Cheap path: reuse last card walk when ledger/selection/width are unchanged.
+        # more-marker is 2Hz and only participates when a prior paint saw truncation.
+        cache_key = self._task_paint_cache_key(tasks, width)
+        cached = self._task_paint_cache
+        if cached is not None and cached[0] == cache_key:
+            (
+                _key,
+                fr,
+                task_refs,
+                agent_refs,
+                selected_line,
+                line_count,
+                more_anim,
+            ) = cached
+            self._task_refs = task_refs
+            self._agent_refs = agent_refs
+            self._selected_line = selected_line
+            self._task_line_count = line_count
+            self._task_more_anim = more_anim
             return fr
 
         self._task_refs = [task.id for task in tasks]
@@ -2206,6 +2238,7 @@ class CodeDoggyTUI:
         has_frame = width >= 20
         selected_line_start = 0
         selected_line_end = 0
+        saw_truncated_brief = False
 
         for task_index, task in enumerate(tasks):
             selected = list_focused and task_index == self._selected_task
@@ -2353,8 +2386,9 @@ class CodeDoggyTUI:
                 label = _truncate_display(reporter, label_width)
                 padded_label = label + " " * max(0, label_width - get_cwidth(label))
                 report_width = max(1, available - label_width)
-                # First line longer, second a bit shorter — easier to scan.
-                brief_lines = _brief_two_lines(report, report_width)
+                brief_lines, brief_truncated = _brief_two_lines(report, report_width)
+                if brief_truncated:
+                    saw_truncated_brief = True
                 append_task_line(
                     [
                         (spine_style, prefix),
@@ -2364,13 +2398,26 @@ class CodeDoggyTUI:
                 )
                 blank_label = " " * label_width
                 if len(brief_lines) > 1 and brief_lines[1]:
-                    append_task_line(
-                        [
-                            (spine_style, prefix),
-                            ("", blank_label),
-                            ("class:report", brief_lines[1]),
-                        ]
-                    )
+                    second = brief_lines[1]
+                    if brief_truncated and report_width > _MORE_HINT_WIDTH:
+                        mark = _more_hint(now=self._paint_clock)
+                        # Body already reserved room for the animated more-marker.
+                        append_task_line(
+                            [
+                                (spine_style, prefix),
+                                ("", blank_label),
+                                ("class:report", second),
+                                ("class:report.more", mark),
+                            ]
+                        )
+                    else:
+                        append_task_line(
+                            [
+                                (spine_style, prefix),
+                                ("", blank_label),
+                                ("class:report", second),
+                            ]
+                        )
 
             if has_frame:
                 fragments.append((border_style, "╰" + "─" * inner_width + "╯\n"))
@@ -2397,7 +2444,67 @@ class CodeDoggyTUI:
             self._selected_line = selected_line_start
             self._pinned_task_for_line = pin_task
         self._set_task_line_count(fragments)
+        self._task_more_anim = saw_truncated_brief
+        # Recompute key after pin so selected_line matches what we store.
+        store_key = self._task_paint_cache_key(tasks, width)
+        self._task_paint_cache = (
+            store_key,
+            fragments,
+            list(self._task_refs),
+            list(refs),
+            int(self._selected_line),
+            int(self._task_line_count),
+            saw_truncated_brief,
+        )
         return fragments
+
+    def _task_paint_cache_key(self, tasks: list[TaskView], width: int) -> tuple[Any, ...]:
+        """Stable identity for task-list paint; excludes free-scroll noise.
+
+        more-frame only enters the key when a prior paint saw truncation, so
+        idle lists without overflow do not rebuild 10×/s just for a timer tick.
+        """
+        rows: list[tuple[Any, ...]] = []
+        for task in tasks:
+            agents: list[tuple[Any, ...]] = []
+            for agent in task.agents:
+                live = ""
+                if agent.status in {"pending", "running"}:
+                    live = self._activity.line(task.id, agent.id)
+                agents.append(
+                    (
+                        agent.id,
+                        agent.label,
+                        agent.status,
+                        agent.output,
+                        live,
+                    )
+                )
+            rows.append(
+                (
+                    task.id,
+                    task.title,
+                    task.phase,
+                    task.status,
+                    task.report,
+                    task.reporter,
+                    self._selected_agent_by_task.get(task.id, 0),
+                    tuple(agents),
+                )
+            )
+        more_frame = 0
+        if self._task_more_anim:
+            more_frame = int(self._paint_clock * 2) % len(_MORE_HINT_FRAMES)
+        return (
+            width,
+            int(self._selected_task),
+            bool(self._follow_latest_task),
+            self._pinned_task_for_line,
+            int(self._selected_line),
+            self._task_list_has_focus(),
+            more_frame,
+            tuple(rows),
+        )
 
     def _task_list_has_focus(self) -> bool:
         """True only when the task pane owns keyboard focus (not the prompt)."""
@@ -2902,6 +3009,19 @@ class CodeDoggyTUI:
         self._selected_agent_by_task[task.id] = index
         return index
 
+    def _focus_latest_task(self) -> bool:
+        """Select the newest task and refresh refs. False when ledger is empty."""
+        tasks = self.ledger.snapshots()
+        if not tasks:
+            self._task_refs = []
+            return False
+        self._selected_task = len(tasks) - 1
+        self._follow_latest_task = True
+        # Force re-pin of cursor line onto the latest card on next paint.
+        self._pinned_task_for_line = None
+        self._render_tasks()
+        return bool(self._task_refs)
+
     def _move_task(self, delta: int) -> None:
         tasks = self.ledger.snapshots()
         if not tasks:
@@ -2948,9 +3068,16 @@ class CodeDoggyTUI:
         self._modal_kind = "auth"
         self._modal_ref = None
         self._reset_detail_cursor_state()
+        snap = session_surface.active_connection(self.session)
         self._auth_wizard.open(
             active_provider=session_surface.provider_id(self.session),
             active_model=session_surface.model_id(self.session),
+            active_reasoning_effort=(
+                snap.reasoning_effort if snap is not None else "high"
+            ),
+            active_reasoning_enabled=(
+                snap.reasoning_enabled if snap is not None else True
+            ),
         )
         self._detail_input.text = ""
         self._modal_open = True
@@ -3079,13 +3206,25 @@ class CodeDoggyTUI:
                 snap = self._reload_model_client(
                     getattr(action, "provider", None),
                     model=getattr(action, "model", None),
+                    reasoning_effort=getattr(action, "reasoning_effort", None),
+                    reasoning_enabled=getattr(action, "reasoning_enabled", None),
                 )
                 if snap is not None:
+                    # Commit connection truth only after apply succeeds.
                     self._auth_wizard.active_provider = snap.provider
                     self._auth_wizard.active_model = snap.model
+                    self._auth_wizard.active_reasoning_effort = snap.reasoning_effort
+                    self._auth_wizard.active_reasoning_enabled = snap.reasoning_enabled
+                    self._auth_wizard.pending_model = ""
+                    # After effort confirm, land on provider menu (not stuck on reasoning).
+                    if self._auth_wizard.step is WizardStep.REASONING:
+                        self._auth_wizard.step = WizardStep.PROVIDER
+                        self._auth_wizard.provider = snap.provider
+                        self._auth_wizard.cursor = 0
                     if self._auth_wizard.step in {
                         WizardStep.PROVIDER,
                         WizardStep.MODEL,
+                        WizardStep.REASONING,
                         WizardStep.RESULT,
                         WizardStep.HOME,
                     }:
@@ -3149,12 +3288,16 @@ class CodeDoggyTUI:
         provider: str | None = None,
         *,
         model: str | None = None,
+        reasoning_effort: str | None = None,
+        reasoning_enabled: bool | None = None,
     ) -> Any:
-        """Apply provider/model through ConnectionService only."""
+        """Apply provider/model/reasoning through ConnectionService only."""
         return session_surface.apply_connection(
             self.session,
             provider=provider,
             model=model,
+            reasoning_effort=reasoning_effort,
+            reasoning_enabled=reasoning_enabled,
             require_auth=True,
             source="panel",
         )
@@ -3239,7 +3382,11 @@ def subagent_text(snapshot: Any) -> str:
 
 
 def task_report_from_agent(text: str, *, max_chars: int = 260) -> str:
-    """Keep the boss view brief while preserving MAIN's own final wording."""
+    """Keep the boss view brief while preserving MAIN's own final wording.
+
+    Hard-caps length without ``…`` — the task list paints an animated ``==>``
+    when the brief is visually truncated.
+    """
     clean = text.strip()
     if not clean:
         return "任务已结束。"
@@ -3248,7 +3395,7 @@ def task_report_from_agent(text: str, *, max_chars: int = 260) -> str:
     report = re.sub(r"^#{1,6}\s+", "", report)
     if len(report) <= max_chars:
         return report
-    return report[: max_chars - 1].rstrip() + "…"
+    return report[:max_chars].rstrip()
 
 
 def _turn_status(status: TurnStatus | Any) -> str:
@@ -3784,33 +3931,86 @@ def _wrap_display_lines(text: str, width: int, *, max_lines: int = 40) -> list[s
     return lines or [""]
 
 
-def _brief_two_lines(text: str, full_width: int) -> list[str]:
-    """Task brief: longer first line, slightly shorter second (ragged right)."""
-    full_width = max(8, int(full_width))
-    # ~88% / ~72% of available report columns — first longer, second a bit shorter.
-    w1 = max(6, min(full_width, int(full_width * 0.88)))
-    w2 = max(5, min(full_width - 1, int(full_width * 0.72)))
-    raw = " ".join((text or "").replace("\r", "\n").split())
-    if not raw:
-        return [""]
-    if get_cwidth(raw) <= w1:
-        return [raw]
-    # Fill line 1 to w1, line 2 to w2 (ellipsis if more remains).
-    line1_chars: list[str] = []
+_MORE_HINT_WIDTH = 3
+# 2Hz cycle (not 10Hz): ride Application.refresh_interval paints without
+# thrashing the task-list fragment cache every tick.
+_MORE_HINT_FRAMES = (
+    "  >",
+    " =>",
+    "==>",
+    "=> ",
+    ">  ",
+    "==>",
+    " =>",
+    "==>",
+)
+
+
+def _more_hint(*, now: float | None = None) -> str:
+    """Animated more-marker (fixed width 3) for truncated task briefs.
+
+    Paint-time only — never schedules invalidate. Prefer ``now=_paint_clock``
+    so one frame uses one marker glyph.
+    """
+    clock = time.monotonic() if now is None else now
+    return _MORE_HINT_FRAMES[int(clock * 2) % len(_MORE_HINT_FRAMES)]
+
+
+def _strip_legacy_ellipsis(text: str) -> str:
+    """Remove trailing … / ... left by older report storage — UI owns more-hint."""
+    raw = text
+    while True:
+        if raw.endswith("..."):
+            raw = raw[:-3].rstrip()
+            continue
+        if raw.endswith("…"):
+            raw = raw[:-1].rstrip()
+            continue
+        break
+    return raw
+
+
+def _fill_display_width(text: str, width: int) -> tuple[str, str]:
+    """Take a prefix of ``text`` that fits in ``width`` cells; return (prefix, rest)."""
+    width = max(0, int(width))
+    if width <= 0:
+        return "", text
+    out: list[str] = []
     used = 0
-    rest = raw
-    for i, ch in enumerate(raw):
+    for i, ch in enumerate(text):
         cw = get_cwidth(ch)
-        if used + cw > w1:
-            rest = raw[i:]
-            break
-        line1_chars.append(ch)
+        if used + cw > width:
+            return "".join(out), text[i:]
+        out.append(ch)
         used += cw
-    else:
-        return ["".join(line1_chars)]
-    line1 = "".join(line1_chars).rstrip()
+    return "".join(out), ""
+
+
+def _brief_two_lines(text: str, full_width: int) -> tuple[list[str], bool]:
+    """Task brief: up to two full-width lines.
+
+    Returns ``(lines, truncated)``. When ``truncated`` is True the second line
+    is body-only (room reserved for the animated ``==>`` more-marker); the
+    caller paints the marker with ``class:report.more``.
+    """
+    # Honor the caller's column budget (do not force min 8 — narrow cards overflow).
+    full_width = max(1, int(full_width))
+    raw = _strip_legacy_ellipsis(
+        " ".join((text or "").replace("\r", "\n").split())
+    )
+    if not raw:
+        return [""], False
+    if get_cwidth(raw) <= full_width:
+        return [raw], False
+    line1, rest = _fill_display_width(raw, full_width)
+    line1 = line1.rstrip()
     rest = rest.lstrip()
     if not rest:
-        return [line1]
-    line2 = _truncate_display(rest, w2)
-    return [line1, line2]
+        return [line1], False
+    if get_cwidth(rest) <= full_width:
+        return [line1, rest], False
+    # Reserve marker only when at least one body cell remains.
+    reserve = _MORE_HINT_WIDTH if full_width > _MORE_HINT_WIDTH else 0
+    body_w = max(1, full_width - reserve)
+    body, _leftover = _fill_display_width(rest, body_w)
+    return [line1, body.rstrip()], True

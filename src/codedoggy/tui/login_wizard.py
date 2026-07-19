@@ -2,8 +2,9 @@
 
 Steps:
   home       → pick Grok / Claude / Codex / API-key providers / refresh
-  provider   → login / paste token / select model / apply / back
+  provider   → login / paste token / select model / reasoning / apply / back
   model      → pick from catalog (or custom id)
+  reasoning  → pick effort after model (low/medium/high/xhigh/off)
   waiting    → background browser login in progress
   paste      → enter API key / token / custom model id
   result     → success or failure summary
@@ -21,11 +22,21 @@ from codedoggy.model.catalog import suggested_models
 from codedoggy.model.profile_registry import get_profile
 from codedoggy.model.registry import create_client, model_config_from_env
 
+# UI order for reasoning effort (product default high).
+_REASONING_CHOICES: tuple[tuple[str, str, str], ...] = (
+    ("low", "低 · low", "更快更省"),
+    ("medium", "中 · medium", "平衡"),
+    ("high", "高 · high", "默认 · 更强推理"),
+    ("xhigh", "极高 · xhigh", "最重推理"),
+    ("off", "关闭 · off", "不请求 reasoning effort"),
+)
+
 
 class WizardStep(str, Enum):
     HOME = "home"
     PROVIDER = "provider"
     MODEL = "model"
+    REASONING = "reasoning"
     WAITING = "waiting"
     PASTE = "paste"
     RESULT = "result"
@@ -55,6 +66,8 @@ class WizardAction:
     ] = "none"
     provider: str | None = None
     model: str | None = None
+    reasoning_effort: str | None = None
+    reasoning_enabled: bool | None = None
     message: str = ""
     feedback_kind: str = "info"
 
@@ -77,12 +90,20 @@ class AuthWizard:
     # Session connection truth (set by TUI on open)
     active_provider: str = ""
     active_model: str = ""
+    active_reasoning_effort: str = "high"
+    active_reasoning_enabled: bool = True
+    # Model chosen before effort step (may equal active_model).
+    pending_model: str = ""
+    # Where Esc returns from the reasoning menu.
+    _reasoning_from: str = "model"  # model | provider
 
     def open(
         self,
         *,
         active_provider: str | None = None,
         active_model: str | None = None,
+        active_reasoning_effort: str | None = None,
+        active_reasoning_enabled: bool | None = None,
     ) -> None:
         self.step = WizardStep.HOME
         self.cursor = 0
@@ -92,11 +113,26 @@ class AuthWizard:
         self.busy = False
         self.result_ok = None
         self.body_note = ""
+        self.pending_model = ""
+        self._reasoning_from = "model"
         if active_provider is not None:
             self.active_provider = str(active_provider or "").strip()
         if active_model is not None:
             self.active_model = str(active_model or "").strip()
+        if active_reasoning_effort is not None:
+            effort = str(active_reasoning_effort or "high").strip().lower() or "high"
+            self.active_reasoning_effort = effort
+        if active_reasoning_enabled is not None:
+            self.active_reasoning_enabled = bool(active_reasoning_enabled)
+            if not self.active_reasoning_enabled:
+                self.active_reasoning_effort = "off"
         self._rebuild()
+
+    @property
+    def active_reasoning_label(self) -> str:
+        if not self.active_reasoning_enabled or self.active_reasoning_effort == "off":
+            return "推理:off"
+        return f"推理:{self.active_reasoning_effort or 'high'}"
 
     def _rebuild(self) -> None:
         if self.step == WizardStep.HOME:
@@ -105,6 +141,8 @@ class AuthWizard:
             self._build_provider()
         elif self.step == WizardStep.MODEL:
             self._build_model()
+        elif self.step == WizardStep.REASONING:
+            self._build_reasoning()
         elif self.step == WizardStep.WAITING:
             self.items = [
                 MenuItem("cancel", "取消等待", "Esc", enabled=True, style="danger"),
@@ -238,13 +276,21 @@ class AuthWizard:
                 style="accent",
             )
         )
+        items.append(
+            MenuItem(
+                "pick_reasoning",
+                "推理强度",
+                f"当前 · {self.active_reasoning_label}",
+                style="accent",
+            )
+        )
 
         can_apply = bool(st.logged_in) or pid == "ollama"
         items.append(
             MenuItem(
                 "reload",
                 "应用此 Provider",
-                "切换连接真源 · 使用当前/默认 model",
+                f"切换连接 · model + {self.active_reasoning_label}",
                 enabled=can_apply,
                 style="ok" if can_apply else "muted",
             )
@@ -261,7 +307,7 @@ class AuthWizard:
         if not current and prof is not None:
             current = prof.default_model or ""
         self.subtitle = f"选择 model · 当前 {current or '—'}"
-        self.body_note = "选中后立即写入连接真源并热切换"
+        self.body_note = "选中后进入推理强度，再写入连接"
 
         items: list[MenuItem] = []
         for mid in suggested_models(pid):
@@ -270,7 +316,7 @@ class AuthWizard:
                 MenuItem(
                     f"model:{mid}",
                     f"{mark}{mid}",
-                    "Apply 到本会话",
+                    "下一步 · 推理强度",
                     style="ok" if mark else "normal",
                 )
             )
@@ -278,12 +324,63 @@ class AuthWizard:
             MenuItem(
                 "custom_model",
                 "自定义 model id…",
-                "输入任意模型名",
+                "输入后选择推理强度",
                 style="accent",
             )
         )
         items.append(MenuItem("back", "返回", "Esc", style="muted"))
         self.items = items
+
+    def _build_reasoning(self) -> None:
+        pid = self.provider or self.active_provider or "ollama"
+        mid = self.pending_model or self.active_model or "—"
+        self.title = "推理强度"
+        self.subtitle = f"{pid}/{mid} · 当前 {self.active_reasoning_label}"
+        self.body_note = "确认后写入连接真源并热切换"
+
+        current = (
+            "off"
+            if not self.active_reasoning_enabled
+            else (self.active_reasoning_effort or "high")
+        )
+        items: list[MenuItem] = []
+        for effort_id, label, hint in _REASONING_CHOICES:
+            mark = "✓ " if effort_id == current else ""
+            items.append(
+                MenuItem(
+                    f"effort:{effort_id}",
+                    f"{mark}{label}",
+                    hint,
+                    style="ok" if mark else ("accent" if effort_id == "high" else "normal"),
+                )
+            )
+        items.append(MenuItem("back", "返回", "Esc", style="muted"))
+        self.items = items
+
+    def _enter_reasoning(self, *, from_step: str, model: str | None = None) -> WizardAction:
+        """Open effort menu. Do not mutate connection-truth actives until apply."""
+        if from_step == "model" and model is not None and str(model).strip():
+            self.pending_model = str(model).strip()
+        elif from_step == "provider":
+            # Reasoning-only: never reuse a pending model from another pick path,
+            # and never ship the previous provider's model id with a new provider.
+            self.pending_model = ""
+        # else: keep pending_model if re-entering from paste/custom
+        self._reasoning_from = from_step
+        self.step = WizardStep.REASONING
+        self.cursor = 0
+        # Park cursor on the active effort row.
+        current = (
+            "off"
+            if not self.active_reasoning_enabled
+            else (self.active_reasoning_effort or "high")
+        )
+        self._rebuild()
+        for i, item in enumerate(self.items):
+            if item.id == f"effort:{current}":
+                self.cursor = i
+                break
+        return WizardAction(kind="blur_input")
 
     def move(self, delta: int) -> None:
         if not self.items or self.busy:
@@ -320,6 +417,7 @@ class AuthWizard:
                 self._rebuild()
                 return WizardAction(message="状态已刷新", feedback_kind="info")
             self.provider = item.id
+            self.pending_model = ""
             self.step = WizardStep.PROVIDER
             self.cursor = 0
             self._rebuild()
@@ -330,6 +428,7 @@ class AuthWizard:
                 self.step = WizardStep.HOME
                 self.cursor = 0
                 self.provider = None
+                self.pending_model = ""
                 self._rebuild()
                 return WizardAction()
             if item.id == "login":
@@ -355,21 +454,35 @@ class AuthWizard:
                 self._rebuild()
                 return WizardAction(kind="focus_input")
             if item.id == "pick_model":
+                self.pending_model = ""
                 self.step = WizardStep.MODEL
                 self.cursor = 0
                 self._rebuild()
                 return WizardAction()
+            if item.id == "pick_reasoning":
+                return self._enter_reasoning(from_step="provider")
             if item.id == "reload":
+                # Only ship a pending model when it was chosen for this provider.
+                mid = self.pending_model.strip() or None
                 return WizardAction(
                     kind="reload_client",
                     provider=self.provider,
-                    model=None,
-                    message="已应用 Provider（默认/当前 model）",
+                    model=mid,
+                    reasoning_effort=(
+                        None
+                        if not self.active_reasoning_enabled
+                        else (self.active_reasoning_effort or "high")
+                    ),
+                    reasoning_enabled=bool(self.active_reasoning_enabled),
+                    message=(
+                        f"已应用 Provider · {self.active_reasoning_label}"
+                    ),
                     feedback_kind="success",
                 )
 
         if self.step == WizardStep.MODEL:
             if item.id == "back":
+                self.pending_model = ""
                 self.step = WizardStep.PROVIDER
                 self.cursor = 0
                 self._rebuild()
@@ -384,14 +497,39 @@ class AuthWizard:
                 return WizardAction(kind="focus_input")
             if item.id.startswith("model:"):
                 mid = item.id[len("model:") :]
-                self.active_model = mid
-                if self.provider:
-                    self.active_provider = self.provider
+                return self._enter_reasoning(from_step="model", model=mid)
+
+        if self.step == WizardStep.REASONING:
+            if item.id == "back":
+                # Abort effort confirm — drop uncommitted model pick.
+                if self._reasoning_from == "provider":
+                    self.pending_model = ""
+                    self.step = WizardStep.PROVIDER
+                else:
+                    self.step = WizardStep.MODEL
+                self.cursor = 0
+                self._rebuild()
+                return WizardAction()
+            if item.id.startswith("effort:"):
+                effort = item.id[len("effort:") :]
+                enabled = effort != "off"
+                pid = self.provider or self.active_provider
+                # Only attach an explicit model when the user just picked one.
+                # Reasoning-only / cross-provider: model=None → apply uses
+                # profile default (or keeps connection model for same provider).
+                if self._reasoning_from == "model" and self.pending_model.strip():
+                    mid: str | None = self.pending_model.strip()
+                else:
+                    mid = None
+                label = f"推理:{effort}" if enabled else "推理:off"
+                model_label = mid or self.active_model or "—"
                 return WizardAction(
                     kind="reload_client",
-                    provider=self.provider,
+                    provider=pid,
                     model=mid,
-                    message=f"已切换模型 · {self.provider}/{mid}",
+                    reasoning_effort=effort if enabled else "off",
+                    reasoning_enabled=enabled,
+                    message=f"已连接 {pid}/{model_label} · {label}",
                     feedback_kind="success",
                 )
 
@@ -445,22 +583,11 @@ class AuthWizard:
 
         if self.paste_kind == "model":
             mid = token
-            self.active_model = mid
             if self.provider:
                 self.active_provider = self.provider
-            self.step = WizardStep.RESULT
-            self.result_ok = True
-            self.body_note = f"模型 {self.provider}/{mid}"
             self.paste_kind = "token"
-            self.cursor = 0
-            self._rebuild()
-            return WizardAction(
-                kind="reload_client",
-                provider=self.provider,
-                model=mid,
-                message=f"已切换模型 · {self.provider}/{mid}",
-                feedback_kind="success",
-            )
+            # Custom model id → same path as catalog: pick effort before apply.
+            return self._enter_reasoning(from_step="model", model=mid)
 
         pid = self.provider or "custom"
         env_map = {
@@ -534,6 +661,14 @@ class AuthWizard:
             return WizardAction()
         if self.step == WizardStep.HOME:
             return WizardAction(kind="close")
+        if self.step == WizardStep.REASONING:
+            if self._reasoning_from == "provider":
+                self.step = WizardStep.PROVIDER
+            else:
+                self.step = WizardStep.MODEL
+            self.cursor = 0
+            self._rebuild()
+            return WizardAction(kind="blur_input")
         if self.step == WizardStep.MODEL:
             self.step = WizardStep.PROVIDER
             self.cursor = 0

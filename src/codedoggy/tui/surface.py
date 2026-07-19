@@ -84,10 +84,23 @@ def session_mode_label(session: Any) -> str:
     }.get(str(raw_mode or "normal"), str(raw_mode or "auto"))
 
 
+def reasoning_text(session: Any) -> str:
+    """Reasoning effort label from active connection (e.g. ``推理:high``)."""
+    snap = active_connection(session)
+    if snap is None:
+        return ""
+    return snap.reasoning_label
+
+
 def model_and_mode_text(session: Any) -> str:
+    """Prompt caption: ``model · 推理:high · auto``."""
     snap = active_connection(session)
     model = snap.model if snap is not None else "model"
-    return f"{model} · {session_mode_label(session)}"
+    mode = session_mode_label(session)
+    reason = snap.reasoning_label if snap is not None else ""
+    if reason:
+        return f"{model} · {reason} · {mode}"
+    return f"{model} · {mode}"
 
 
 def budget_text(session: Any) -> str:
@@ -145,6 +158,9 @@ def hud_projection(session: Any) -> dict[str, Any]:
     return {
         "provider": cur,
         "model": snap.model if snap is not None else "",
+        "reasoning": snap.reasoning_label if snap is not None else "",
+        "reasoning_effort": snap.reasoning_effort if snap is not None else "",
+        "reasoning_enabled": bool(snap.reasoning_enabled) if snap is not None else False,
         "any_logged_in": any_in,
         "rows": rows,
         "current_ok": current_ok,
@@ -166,6 +182,8 @@ def apply_connection(
     *,
     provider: str | None = None,
     model: str | None = None,
+    reasoning_effort: str | None = None,
+    reasoning_enabled: bool | None = None,
     require_auth: bool = True,
     source: str = "panel",
 ) -> ActiveConnection:
@@ -176,6 +194,8 @@ def apply_connection(
     return svc.apply(
         provider=provider,
         model=model,
+        reasoning_effort=reasoning_effort,
+        reasoning_enabled=reasoning_enabled,
         require_auth=require_auth,
         source=source,  # type: ignore[arg-type]
     )
