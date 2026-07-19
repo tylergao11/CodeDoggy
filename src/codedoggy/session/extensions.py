@@ -29,6 +29,7 @@ class SessionExtensions:
     graph: Any | None = None
     policy: Any | None = None  # WorkspacePolicy
     kernel: Any | None = None  # RuntimeKernel (state spine)
+    connection: Any | None = None  # ConnectionService — model/provider truth
 
     def _copy(self, **kwargs: Any) -> SessionExtensions:
         base = {
@@ -41,6 +42,7 @@ class SessionExtensions:
             "graph": self.graph,
             "policy": self.policy,
             "kernel": self.kernel,
+            "connection": self.connection,
         }
         base.update(kwargs)
         return SessionExtensions(**base)
@@ -59,3 +61,6 @@ class SessionExtensions:
 
     def with_kernel(self, kernel: Any) -> SessionExtensions:
         return self._copy(kernel=kernel)
+
+    def with_connection(self, connection: Any) -> SessionExtensions:
+        return self._copy(connection=connection)

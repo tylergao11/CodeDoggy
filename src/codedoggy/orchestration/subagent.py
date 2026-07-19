@@ -165,6 +165,46 @@ class SubagentCoordinator:
         self._entries: dict[str, _Entry] = {}
         self._pool = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="subagent")
         self._closed = False
+        # Mid-run live subscribers: cb(snapshot, message|None) — may run on worker threads.
+        self._listeners: list[Callable[[SubagentSnapshot, Any], None]] = []
+
+    def add_listener(
+        self, callback: Callable[[SubagentSnapshot, Any], None]
+    ) -> None:
+        """Subscribe to mid-run live message publishes (and final snapshot writes)."""
+        with self._lock:
+            if callback not in self._listeners:
+                self._listeners.append(callback)
+
+    def remove_listener(
+        self, callback: Callable[[SubagentSnapshot, Any], None]
+    ) -> None:
+        with self._lock:
+            self._listeners = [c for c in self._listeners if c is not callback]
+
+    def publish_live_message(self, subagent_id: str, message: Any) -> None:
+        """Append one live transcript message while a child is still running.
+
+        Called from the child ``on_archive_message`` path so the parent TUI can
+        update without waiting for the child future to finish.
+        """
+        with self._lock:
+            entry = self._entries.get(subagent_id)
+            if entry is None:
+                return
+            serialized = _serialize_messages([message])
+            if serialized:
+                entry.live_messages.append(serialized[0])
+                entry.snapshot.live_messages = list(entry.live_messages)
+            if entry.snapshot.status in {"pending", "running", ""}:
+                entry.snapshot.status = "running"
+            snap = _copy_snap(entry.snapshot)
+            listeners = list(self._listeners)
+        for cb in listeners:
+            try:
+                cb(snap, message)
+            except Exception:  # noqa: BLE001
+                logger.debug("subagent live listener failed", exc_info=True)
 
     def lookup(self, subagent_id: str) -> SubagentSnapshot | None:
         with self._lock:
@@ -859,6 +899,20 @@ def make_child_runner(
                 persona_instructions=request.persona,
             )
 
+        coord = _parent_resource(parent_session, "subagent_coordinator")
+
+        def _on_archive(msg: Any) -> None:
+            if coord is None:
+                return
+            try:
+                coord.publish_live_message(request.id, msg)
+            except Exception:  # noqa: BLE001
+                logger.debug(
+                    "publish_live_message failed id=%s",
+                    request.id,
+                    exc_info=True,
+                )
+
         try:
             loop = run_agent_loop(
                 user_text=request.prompt,
@@ -875,6 +929,7 @@ def make_child_runner(
                 tool_extra=tool_extra,
                 context_compactor=compactor,
                 prior_messages=prior,
+                on_archive_message=_on_archive,
             )
         finally:
             # Keep passive child state for Grok-style in-process resume. Active

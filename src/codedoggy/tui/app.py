@@ -35,7 +35,6 @@ from prompt_toolkit.styles import Style
 from prompt_toolkit.utils import get_cwidth
 from prompt_toolkit.widgets import TextArea
 
-from codedoggy.model.auth import auth_status, is_imperial
 from codedoggy.session.types import TurnStatus
 from codedoggy.tui.agent_detail import (
     DETAIL_FILTERS,
@@ -46,8 +45,10 @@ from codedoggy.tui.agent_detail import (
     render_detail_body,
     snapshot_from_messages,
 )
-from codedoggy.tui.login_wizard import AuthWizard, WizardStep, hud_snapshot, run_browser_login
+from codedoggy.tui.activity import LiveActivityBoard
+from codedoggy.tui.login_wizard import AuthWizard, WizardStep, run_browser_login
 from codedoggy.tui.model import AgentView, TaskLedger, TaskView
+from codedoggy.tui import surface as session_surface
 from codedoggy.turn.types import Message, Role
 
 
@@ -187,6 +188,14 @@ class CodeDoggyTUI:
         self._auth_wizard = AuthWizard()
         self._auth_login_worker: threading.Thread | None = None
         self._pending_prompt: str | None = None
+        # One-shot startup brand (concept art). Dismissed forever on first task;
+        # not "empty ledger" — finished tasks never bring the splash back.
+        self._startup_brand = not bool(
+            initial_prompt and str(initial_prompt).strip()
+        )
+        # Live tool/activity lines from on_live_message (effect layer, not truth).
+        self._activity = LiveActivityBoard()
+        self._subagent_listener_bound = False
 
         self._task_control = FormattedTextControl(
             text=self._render_tasks,
@@ -257,6 +266,22 @@ class CodeDoggyTUI:
                     Condition(
                         lambda: self._modal_kind == "auth"
                         and self._auth_wizard.step == WizardStep.PASTE
+                        and self._auth_wizard.paste_kind != "model"
+                        and (
+                            not getattr(self, "_detail_input", None)
+                            or not self._detail_input.text
+                        )
+                    ),
+                ),
+                ConditionalProcessor(
+                    AfterInput(
+                        "输入 model id…",
+                        style="class:input.placeholder",
+                    ),
+                    Condition(
+                        lambda: self._modal_kind == "auth"
+                        and self._auth_wizard.step == WizardStep.PASTE
+                        and self._auth_wizard.paste_kind == "model"
                         and (
                             not getattr(self, "_detail_input", None)
                             or not self._detail_input.text
@@ -460,6 +485,7 @@ class CodeDoggyTUI:
 
     def run(self) -> None:
         def pre_run() -> None:
+            self._bind_subagent_listener()
             if self.initial_prompt:
                 self._start_task(self.initial_prompt)
 
@@ -467,9 +493,95 @@ class CodeDoggyTUI:
             self.app.run(pre_run=pre_run)
         finally:
             self._closing = True
+            self._unbind_subagent_listener()
             if self._worker is not None and self._worker.is_alive():
                 self.session.cancel()
                 self._worker.join(timeout=3)
+
+    def _subagent_coordinator(self) -> Any | None:
+        kernel = getattr(self.session.extensions, "kernel", None)
+        return getattr(kernel, "subagent_coordinator", None)
+
+    def _bind_subagent_listener(self) -> None:
+        if self._subagent_listener_bound:
+            return
+        coord = self._subagent_coordinator()
+        if coord is None or not hasattr(coord, "add_listener"):
+            return
+        coord.add_listener(self._on_subagent_live)
+        self._subagent_listener_bound = True
+
+    def _unbind_subagent_listener(self) -> None:
+        if not self._subagent_listener_bound:
+            return
+        coord = self._subagent_coordinator()
+        if coord is not None and hasattr(coord, "remove_listener"):
+            try:
+                coord.remove_listener(self._on_subagent_live)
+            except Exception:  # noqa: BLE001
+                pass
+        self._subagent_listener_bound = False
+
+    def _on_subagent_live(self, snap: Any, message: Any = None) -> None:
+        """Worker-thread callback: schedule UI apply on the prompt_toolkit thread."""
+        if self._closing:
+            return
+
+        def apply() -> None:
+            self._apply_subagent_live(snap, message)
+
+        try:
+            self.app.call_from_executor(apply)
+        except Exception:  # noqa: BLE001
+            if not self._closing:
+                apply()
+
+    def _apply_subagent_live(self, snap: Any, message: Any = None) -> None:
+        """Same-tier push path for child agents (mirrors MAIN on_live_message)."""
+        sub_id = str(getattr(snap, "subagent_id", "") or "")
+        if not sub_id:
+            return
+        task_id = self._subagent_task.get(sub_id)
+        if task_id is None:
+            active = self._active_task_id
+            if active is None:
+                return
+            baseline = self._subagent_baselines.get(active, set())
+            if sub_id in baseline:
+                return
+            self._subagent_task[sub_id] = active
+            task_id = active
+
+        status = str(getattr(snap, "status", "") or "running")
+        description = str(getattr(snap, "description", "") or "").strip()
+        raw_label = description or str(getattr(snap, "subagent_type", "") or "agent")
+        label = _truncate_display(raw_label, 18).upper()
+
+        live = getattr(snap, "live_messages", None)
+        if live is not None:
+            self._detail_messages[(task_id, sub_id)] = list(live)
+
+        activity = ""
+        if message is not None:
+            activity = self._activity.observe(task_id, sub_id, message)
+        elif live:
+            activity = self._activity.rebuild(task_id, sub_id, list(live))
+
+        output = activity or subagent_text(snap)
+        self.ledger.update_agent(
+            task_id,
+            sub_id,
+            label=label,
+            status=status,
+            output=output,
+            description=description,
+        )
+        if status in {"pending", "running"}:
+            self.ledger.set_task_phase(task_id, "parallel")
+        try:
+            self.app.invalidate()
+        except Exception:  # noqa: BLE001
+            pass
 
     def _build_key_bindings(self) -> KeyBindings:
         keys = KeyBindings()
@@ -669,9 +781,12 @@ class CodeDoggyTUI:
         return True
 
     def _start_task(self, prompt: str) -> None:
+        self._dismiss_startup_brand()
+        self._bind_subagent_listener()
         task = self.ledger.create(prompt)
         self._active_task_id = task.id
         self._detail_messages[(task.id, f"{task.id}:main")] = []
+        self._activity.clear_task(task.id)
         self._task_started_at = time.monotonic()
         self._subagent_baselines[task.id] = {
             item.subagent_id for item in self._subagents()
@@ -687,6 +802,13 @@ class CodeDoggyTUI:
         worker.start()
         self.app.invalidate()
 
+    def _dismiss_startup_brand(self) -> None:
+        """Hide the launch splash for the rest of this process."""
+        self._startup_brand = False
+
+    def _showing_startup_brand(self) -> bool:
+        return self._startup_brand and not self.ledger.snapshots()
+
     def _run_task(self, task_id: str, prompt: str) -> None:
         runner = getattr(self.session.extensions, "turn_runner", None)
         sampler = getattr(runner, "sampler", None)
@@ -697,21 +819,35 @@ class CodeDoggyTUI:
         old_delta = getattr(sampler, "on_delta", None)
         old_live_message = getattr(runner, "on_live_message", None)
 
+        main_agent_id = f"{task_id}:main"
+
         def on_live_message(message: Any) -> None:
             turn_messages.append(message)
+            activity = self._activity.observe(task_id, main_agent_id, message)
+            if activity:
+                # Prefer tool/activity line on the boss list while running.
+                self.ledger.update_agent(
+                    task_id,
+                    main_agent_id,
+                    label="MAIN",
+                    status="running",
+                    output=activity,
+                )
             if callable(old_live_message):
                 old_live_message(message)
             self.app.invalidate()
 
         def on_delta(piece: str) -> bool:
             streamed.append(str(piece or ""))
-            self.ledger.update_agent(
-                task_id,
-                f"{task_id}:main",
-                label="MAIN",
-                status="running",
-                output="".join(streamed),
-            )
+            # Text stream fills the card only when no open tool activity.
+            if not self._activity.line(task_id, main_agent_id).startswith("→"):
+                self.ledger.update_agent(
+                    task_id,
+                    main_agent_id,
+                    label="MAIN",
+                    status="running",
+                    output="".join(streamed),
+                )
             self.app.invalidate()
             return not self._closing
 
@@ -824,7 +960,19 @@ class CodeDoggyTUI:
             )
             live_messages = getattr(snap, "live_messages", None)
             if live_messages is not None:
-                self._detail_messages[(task_id, snap.subagent_id)] = list(live_messages)
+                msgs = list(live_messages)
+                self._detail_messages[(task_id, snap.subagent_id)] = msgs
+                # Effect: rebuild activity from child transcript (poll path).
+                line = self._activity.rebuild(task_id, snap.subagent_id, msgs)
+                if line and str(snap.status or "") in {"pending", "running"}:
+                    self.ledger.update_agent(
+                        task_id,
+                        snap.subagent_id,
+                        label=label,
+                        status=str(snap.status or "waiting"),
+                        output=line,
+                        description=description,
+                    )
 
         for task in self.ledger.snapshots():
             if task.phase in {"done", "failed", "cancelled"}:
@@ -922,7 +1070,11 @@ class CodeDoggyTUI:
             None,
         )
         label = _task_activity_text(active) if active is not None else "等待响应…"
-        budget = _budget_text(self.session)
+        if active is not None:
+            live = self._activity.main_line(active.id)
+            if live:
+                label = live
+        budget = session_surface.budget_text(self.session)
         stop = "[停]" if width < 36 else "[停止]"
         trailing = "  " if width >= 12 else ""
         prefix = f"  {spinner} "
@@ -999,7 +1151,9 @@ class CodeDoggyTUI:
 
     def _render_prompt_bottom(self) -> StyleAndTextTuples:
         width = max(16, _terminal_width())
-        caption_text = _truncate_display(_model_and_mode_text(self.session), width - 7)
+        caption_text = _truncate_display(
+            session_surface.model_and_mode_text(self.session), width - 7
+        )
         caption = f" {caption_text} "
         fill = max(1, width - 4 - get_cwidth(caption))
         border = self._prompt_border_class()
@@ -1139,7 +1293,7 @@ class CodeDoggyTUI:
     def _render_header(self) -> StyleAndTextTuples:
         width = max(1, _terminal_width())
         left = "  ==DOGGY=="
-        right = _budget_text(self.session)
+        right = session_surface.budget_text(self.session)
         if width < get_cwidth(left):
             return [("class:brand", _truncate_display(left, width))]
 
@@ -1165,7 +1319,7 @@ class CodeDoggyTUI:
     def _render_street_hud(self) -> StyleAndTextTuples:
         """Auth gate surface (login entry). Click / Ctrl+L opens wizard."""
         width = 44
-        snap = hud_snapshot(self._current_provider_id())
+        snap = session_surface.hud_projection(self.session)
         frame = int(time.monotonic() * 4)
         pulse = frame % 2
         open_handler = self._hud_open_mouse
@@ -1182,9 +1336,11 @@ class CodeDoggyTUI:
         bg = "class:hud.bg"
 
         cur = str(snap.get("provider") or "—")
+        cur_model = str(snap.get("model") or "")
         cur_ok = bool(snap.get("current_ok"))
         status_word = "AUTH ON" if snap.get("any_logged_in") else ("AUTH OFF" if pulse else "LOGIN ›")
         status_style = ok_style if snap.get("any_logged_in") else warn_style
+        now_label = f"{cur}/{cur_model}" if cur_model else cur
 
         fragments: StyleAndTextTuples = []
         # row 0 border title
@@ -1192,8 +1348,8 @@ class CodeDoggyTUI:
         fragments.extend(line(title_style, top[:width]))
         fragments.append((bg, "\n", open_handler))
 
-        # row 1 status
-        mid1 = f"│ {status_word:<10}  NOW {cur[:12]:<12}"
+        # row 1 status — provider/model from connection truth
+        mid1 = f"│ {status_word:<10}  NOW {now_label[:18]:<18}"
         mid1 = mid1[: width - 1] + "│"
         fragments.append((status_style, mid1[:14], open_handler))
         fragments.append((cyan if cur_ok else dim, mid1[14:], open_handler))
@@ -1260,8 +1416,15 @@ class CodeDoggyTUI:
         line = 0
         width = max(1, _terminal_width() - 2)
 
-        if not tasks:
+        # Launch splash only — first task dismisses it for the whole session.
+        if self._showing_startup_brand():
             return _render_doggy_empty(width)
+
+        if not tasks:
+            self._agent_refs = []
+            self._selected_agent = 0
+            self._selected_line = 0
+            return [("", "")]
 
         for task_index, task in enumerate(tasks):
             active = task.phase in {"dispatching", "parallel", "reporting"}
@@ -1324,7 +1487,11 @@ class CodeDoggyTUI:
                 ]
             )
             line += 1
-            for reporter, report, agent_status in _task_briefs(task):
+            for reporter, report, agent_status, agent_id in _task_briefs_with_ids(task):
+                if agent_status in {"pending", "running"}:
+                    live = self._activity.line(task.id, agent_id)
+                    if live:
+                        report = live
                 available = max(2, width - get_cwidth(prefix))
                 label_width = min(14, max(1, available // 3))
                 label = _truncate_display(reporter, label_width)
@@ -1668,7 +1835,10 @@ class CodeDoggyTUI:
     def _open_auth_wizard(self) -> None:
         self._modal_kind = "auth"
         self._modal_ref = None
-        self._auth_wizard.open()
+        self._auth_wizard.open(
+            active_provider=session_surface.provider_id(self.session),
+            active_model=session_surface.model_id(self.session),
+        )
         self._detail_input.text = ""
         self._modal_open = True
         self.app.layout.focus(self._detail_window)
@@ -1716,26 +1886,11 @@ class CodeDoggyTUI:
             self._close_modal()
 
     def _current_provider_id(self) -> str:
-        try:
-            runner = getattr(self.session.extensions, "turn_runner", None)
-            sampler = getattr(runner, "sampler", None)
-            client = getattr(sampler, "client", None)
-            config = getattr(client, "config", None)
-            return str(getattr(config, "provider", "") or "")
-        except Exception:  # noqa: BLE001
-            return ""
+        return session_surface.provider_id(self.session)
 
     def _ensure_auth_ready(self) -> bool:
-        """True when current provider can issue requests."""
-        pid = self._current_provider_id() or "ollama"
-        if not is_imperial(pid):
-            # API-key providers: allow if key present or non-imperial local
-            st = auth_status(pid)
-            if pid == "ollama":
-                return True
-            return bool(st.logged_in)
-        st = auth_status(pid)
-        return bool(st.logged_in)
+        """True when connection truth says we can sample."""
+        return session_surface.ready_to_sample(self.session)
 
     def _dispatch_wizard_action(self, action: Any) -> None:
         kind = getattr(action, "kind", "none")
@@ -1757,10 +1912,26 @@ class CodeDoggyTUI:
             return
         if kind == "reload_client":
             try:
-                self._reload_model_client(getattr(action, "provider", None))
-                self._set_feedback(message or "模型客户端已重载", "success")
+                snap = self._reload_model_client(
+                    getattr(action, "provider", None),
+                    model=getattr(action, "model", None),
+                )
+                if snap is not None:
+                    self._auth_wizard.active_provider = snap.provider
+                    self._auth_wizard.active_model = snap.model
+                    if self._auth_wizard.step in {
+                        WizardStep.PROVIDER,
+                        WizardStep.MODEL,
+                        WizardStep.RESULT,
+                        WizardStep.HOME,
+                    }:
+                        self._auth_wizard._rebuild()
+                self._set_feedback(
+                    message or f"已连接 {snap.label if snap else ''}".strip(),
+                    "success",
+                )
             except Exception as exc:  # noqa: BLE001
-                self._set_feedback(f"重载失败: {exc}", "warning")
+                self._set_feedback(f"切换失败: {exc}", "warning")
             self.app.invalidate()
             return
         if kind == "start_login":
@@ -1804,27 +1975,20 @@ class CodeDoggyTUI:
         )
         self._auth_login_worker.start()
 
-    def _reload_model_client(self, provider: str | None = None) -> None:
-        from codedoggy.model.chat_sampler import ChatSampler
-        from codedoggy.model.provider_switch import rewrite_system_model_identity
-        from codedoggy.model.registry import create_client, model_config_from_env
-
-        cfg = model_config_from_env(provider=provider or None)
-        client = create_client(cfg, require_auth=True)
-        runner = getattr(self.session.extensions, "turn_runner", None)
-        if runner is None:
-            return
-        old = getattr(runner, "sampler", None)
-        stream = bool(getattr(old, "stream", False))
-        on_delta = getattr(old, "on_delta", None)
-        runner.sampler = ChatSampler(client, stream=stream, on_delta=on_delta)
-        # Hermes: rewrite runtime system identity after provider switch so the
-        # agent does not misreport model while keeping static prefix otherwise.
-        sp = getattr(runner, "system_prompt", None)
-        if isinstance(sp, str) and sp:
-            runner.system_prompt = rewrite_system_model_identity(
-                sp, model=cfg.model, provider=cfg.provider
-            )
+    def _reload_model_client(
+        self,
+        provider: str | None = None,
+        *,
+        model: str | None = None,
+    ) -> Any:
+        """Apply provider/model through ConnectionService only."""
+        return session_surface.apply_connection(
+            self.session,
+            provider=provider,
+            model=model,
+            require_auth=True,
+            source="panel",
+        )
 
 
 def run_tui(session: Any, *, initial_prompt: str | None = None) -> None:
@@ -1896,40 +2060,6 @@ def _terminal_height() -> int:
         return shutil.get_terminal_size(fallback=(100, 30)).lines
 
 
-def _budget_text(session: Any) -> str:
-    context = getattr(session.extensions, "context", None)
-    budget = getattr(context, "budget", None)
-    used = getattr(budget, "last_prompt_tokens", None)
-    total = getattr(budget, "context_window", None)
-    if not total:
-        return ""
-    used_text = "—" if used is None else _compact_number(int(used))
-    return f"{used_text} / {_compact_number(int(total))}"
-
-
-def _compact_number(value: int) -> str:
-    if value >= 1_000_000:
-        return f"{value / 1_000_000:.1f}m"
-    if value >= 1_000:
-        return f"{value / 1_000:.0f}k"
-    return str(value)
-
-
-def _model_and_mode_text(session: Any) -> str:
-    runner = getattr(session.extensions, "turn_runner", None)
-    sampler = getattr(runner, "sampler", None)
-    client = getattr(sampler, "client", None)
-    config = getattr(client, "config", None)
-    model = str(getattr(config, "model", "") or "model")
-    kernel = getattr(session.extensions, "kernel", None)
-    mode_state = getattr(kernel, "session_mode_state", None)
-    raw_mode = getattr(getattr(mode_state, "mode", None), "value", None)
-    mode = {"normal": "auto", "goal": "goal", "plan": "plan"}.get(
-        str(raw_mode or "normal"), str(raw_mode or "auto")
-    )
-    return f"{model} · {mode}"
-
-
 def _format_elapsed(seconds: float) -> str:
     if seconds < 10:
         return f"{seconds:.1f}s"
@@ -1984,7 +2114,15 @@ def _task_status_style(task: TaskView) -> str:
 
 def _task_briefs(task: TaskView) -> list[tuple[str, str, str]]:
     """Return one boss-readable first paragraph per reporting Agent."""
-    briefs: list[tuple[str, str, str]] = []
+    return [
+        (label, report, status)
+        for label, report, status, _agent_id in _task_briefs_with_ids(task)
+    ]
+
+
+def _task_briefs_with_ids(task: TaskView) -> list[tuple[str, str, str, str]]:
+    """Briefs plus agent id for live activity overlay."""
+    briefs: list[tuple[str, str, str, str]] = []
     report_matched = False
     for agent in task.agents:
         raw = agent.output
@@ -1993,10 +2131,23 @@ def _task_briefs(task: TaskView) -> list[tuple[str, str, str]]:
             report_matched = True
         if raw.strip():
             briefs.append(
-                (agent.label, task_report_from_agent(raw), agent.status)
+                (
+                    agent.label,
+                    task_report_from_agent(raw),
+                    agent.status,
+                    agent.id,
+                )
             )
     if task.report and not report_matched:
-        briefs.append((task.reporter, task_report_from_agent(task.report), task.status))
+        main_id = task.agents[0].id if task.agents else ""
+        briefs.append(
+            (
+                task.reporter,
+                task_report_from_agent(task.report),
+                task.status,
+                main_id,
+            )
+        )
     if not briefs:
         main = task.agents[0] if task.agents else None
         briefs.append(
@@ -2004,6 +2155,7 @@ def _task_briefs(task: TaskView) -> list[tuple[str, str, str]]:
                 main.label if main is not None else "MAIN",
                 _task_activity_text(task),
                 main.status if main is not None else task.status,
+                main.id if main is not None else "",
             )
         )
     return briefs
@@ -2019,247 +2171,286 @@ def _reporter_style(status: str) -> str:
     return "class:reporter.waiting"
 
 
-_DOGGY_CITY_ART = (
-    "........................FFF......FF.............................",
-    "........................FMFF....FFF.....SSS.....................",
-    "........................FMMF....FMFF...FSSS.....................",
-    "............MM..........FMMFFFFFFMMF..SSSS......................",
-    "............MM..........FMMFFFFFFFF...SSS.......................",
-    ".......M....MM..........FFFFFFFFFFF...SSSSS.....................",
-    ".......M.....M...........FFFFFWFFFFW...SSSS.....................",
-    ".......M....MMM...........FF.WWFFFWW..SSS.......................",
-    "..M...MMM..MMMM..........FFFFFFFFFFF..SFS.......................",
-    "..M...MMM..MMM...........FFFFFFDDDFF.SSS........................",
-    "M.M...MMM..M.M...........GFFFFDDDDGWWM..........................",
-    "MMM...MMMMMM.M.MM.....CC.GGGFDDDDDCCCC..........................",
-    "MMM.M.MMM.MM.F.M.CCCCCCCFFGGGFFFGGFFCCCCCC......................",
-    "MMM.M..MM.M..CCCCC..CCC.FFFGGGFGGGFFF....CCC....................",
-    "MMM.M.....CCCCCCCCCCCCCCFFFFFGGGGDD..DD.CC.CCCC.................",
-    "MMM.M.CCCCCCCC.C.CCCCC.CCCFFFCCGD.DDD.D.CCCC..CCCC..............",
-    "M...CCCBCCCCCCCCCCCCCCCCCCCC..CCCCCCCCCCCCCCCCCCCCCCCC..........",
-    "M..CCCCCBCCCCBCCCCCCCCCCCBCCCC....CC..........CCC...CCCC........",
-    "MM.CCCCCCCC.CCCC...CCCCDCCDDCCCCCC.CCC..........CC....CCC.......",
-    "MM.CCCCCCCC..CCB....CCCCCCCBBCCCWCCCCCC...........CC.CCWCC......",
-    "MMMCCDCC.CC..CC.....CCCDCCCCCBCCWWW.CCCC.......CC..CCCCWWCC.....",
-    "...CCGCCC.CC.CC.....CCDDDCCCCCCCCCWCCC.CCCCCCCCCCCCCCCCCCCC.....",
-    "MMMCCGCCC..CCCCCC...CCDGDCCDDD..CCCCC...CC.....GGG....C..CCC....",
-    ".MM.CDCCCC..CCCCCCCCCCDG.CCBB....CCCCCCCCCCCCCCCCCCCCCCCCCC.....",
-    "MMM.CDCCCC......CCCCCCDDDCCB....CCD......CC..........CC...C.....",
-    "....CCC.CCCCCCCCCC..CCCDCCCCC..CCD......CCCCCCCCCCCCCC...CC.....",
-    "MMMM.DD..MM...CCCCCCCCCCCDC.CC.CCC.....CCCCCCCCCCCCCCCCCCCC.....",
-    "..MMMMMM..MMMMMM......CCC.CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC.....",
-    "......MMMMMM...M..MMM..D........................................",
-    "..........MMMMMM....MMMM........................................",
-    ".............MMMMMMM....MMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMM...",
-    ".................MMMMMM.........................................",
+# Startup brand: neon street couple (concept image) — black void, not car city.
+# Keys: F fur · H golden fur · D dark cloth · B shades · M pink · C cyan ·
+# Y gold · W white · P hot pink · N nose · L cream shoe · S soft · . void
+_DOGGY_COUPLE_ART = (
+    "....................................................",
+    "........HHH.........HHHH............................",
+    "........HHSF.......HHHHF............................",
+    "........H..HH......FHHSH............................",
+    "........HSH.HH.HHHHHSFHF............................",
+    "........HFF.HFHHHHFFHHHF............................",
+    "........HFF.HFFFFFFFFFH.............................",
+    "........HHHHFFFFHHFFFHHH............................",
+    "........FHHFFHHHHSHS....FH..........................",
+    "........SHHHS.....H.....SS........HHHH.MMM..........",
+    "........HHHHHH....FFFFFSHHHS....HHHHHHHMMM.M........",
+    "........HHFFFH...HFLLFF...F....HHHFFFFHMMMMMM.......",
+    ".......HFFFFFLFFFLLLLLFF..F...HHHFFFFFHHHHMM........",
+    ".......HHFFFFLLLFFLLLLLLFFF...HHHFFFFFFFFHSSH.......",
+    "........HFFFLLLLFHFFFFFFHFF...FHHHFFFHFFFFHHH.......",
+    "..........HFFLLLLLFFFFFFFH...HHHFFFFHHHFFHFFFH......",
+    ".........MSHFFLLLLLLLFFFFSM..HHFF.HFFFFFFHHFFH......",
+    ".......MMMS..FFFFFFFF...MMMMSFHFFSFFFFLFHHFFFFH.....",
+    ".......MMMS.SFFFFFFFF..MMMMCCSHFFHFFHFLFFHFFFFHH....",
+    ".......MMHMMHFFFFFFFH.MMS.....HHFFFFFLLFHHFFFFFH....",
+    ".......CC.SM.HFFFFFH.MM..........HFFFLFH..HFFFFH....",
+    ".......C...MSHHFFF.HSS............HFFFS....HSHH.....",
+    "......C.....SSH...HHS........CC..MSHSMMM.HFFFS......",
+    ".....CC.....S.HH.HF.S..MM...CCHSSHHHMSHSHSHHHS......",
+    ".....CC.....S..HHH.SS..MMM..CSH.HFHHHFH.FHHFFFH.....",
+    ".....C..C...S..SSS.CC.MMMMS.CHH.HFFFFFHHFHFHFFF.....",
+    "....C...CC..M..HSH.CC..MMM..CHS.HHHHHH.FH.HHFHF.....",
+    "...CC...CC..M..HHH.CC..SSS..CCS..SSM....H..HHHH.....",
+    "..CC....CC..M......CC.......CC...MMMM...HC.HH.C.....",
+    "..C.....C..S.......CC.......CCC..MMM.....CC...CC....",
+    "..C..CCCC..S.......CC.......C.C...M.....CCC....C....",
+    "..C....C...M.......CC.......C.C.........C.C....CC...",
+    "..C.......SM.......CC.......C.CSHHHHHHHHC.CC....C...",
+    "..CC..MM..S.FFFF...CC.......C.CHFFFFFFFFSC.C....CC..",
+    "..CC.SMSHSS.FFFFHFHCC......SS.CCSSSSHHHSCC.C.....C..",
+    "...C.MHFH...........M...MSSS..CCCCCCCCCCCC.CC....C..",
+    "....CSHFS....C.C....SS..MSSS.C...CCC.....C..C...CC..",
+    ".....CSH.....CC.......SMS....C.C...C..C..CC.CCCCC...",
+    ".......C......C......CC.C...CC.C...C..S...C..CSSH...",
+    ".......C.....CC........CC..CC.S...C....C..CC..HHFH..",
+    ".......CC....C.........CC..S..S...S....S...SS.FHFH..",
+    "........C....C........CC..SSS.S...S....M..SSM.HSFH..",
+    "........CC..C......S..C...SMMMMMMSMMMMSMMMMMM...HH..",
+    ".........C..C......C..C......MMHMSSHHHHSMHM..H......",
+    ".........CCCC.....CC.C.........H..FFFFFF....HH......",
+    "..........CC.........CC........HHSFFFFFH.HHHFH......",
+    "..........SC......C.C.CC..HH...HHHFFFFFS.HFFFS......",
+    "..........CC.....C.CC..CFFFFH...HHFFFFH.C.HFH.......",
+    "..........C......C.C...CCHFH.....FFFFFH.SS..........",
+    ".........CC.....C..C....CHH......FFFFF...CS.........",
+    "........CCCCC...C.CC...CSH......SFFFFH..CCSH........",
+    "........C....CC...C...CC..H....CSSHFFH.CC..H........",
+    ".......FFFFH..SC.CC.CCC..FF.....FCCSH.SC...F........",
+    "......FFHHFFH..CSC..SH...F...HFFF..CS..H..HH........",
+    "......F.....FF..CC.HH...FF...F..FF..S.HS..H.....M...",
+    "......HS....FF..C.HS....F....F...HF.SS...HH.....M...",
+    "CCCCC..HH....HLHS..FFFFFH.SS.HH...FHSSFHFH.CCSSCCCCC",
+    "........SH....HF...SSSSS......SH...FF.SSS...........",
+    "MM.C.C...HFFFFFF..CCCCCCCCC....SFFFF...S...MM.SSS.MM",
+    "....................................................",
 )
 
 _DOGGY_CORNER_ART = (
     "........................",
-    "...GG..........GG.......",
-    "..GDDG........GDDG......",
-    "..GFDG........GDFG......",
-    "..GGGGGGGGGGGGGGGG......",
-    "...GGDDDDGGDDDDGGG......",
-    "...GDWDDGGDDWDGGG.......",
-    "...GGDDDDDDDDDDGGG......",
-    "....GGGGDFFFDGGGG.......",
-    ".....GGFFFFFFFFGG.......",
-    "......GGFFDDFFGG........",
-    "....GGGGGGGGGGGGGG......",
-    "...GGGGGGGGGGGGGGGG.....",
-    "...GGGGCCCCCCCCGGGG.....",
-    "...GGGGGGCCCCGGGGGG.....",
-    "..GGGGGFFFFFFFFGGGG.D...",
-    "..GGGGFFFFFFFFFFGGG.DD..",
-    "...GGGFFFFFFFFFFGG.GG...",
-    "...GGGG...FFFF...GGGG...",
-    "..GGGG....FFFF....GGGG..",
-    "..GG......G..G......GG..",
+    "....FFFF......HHHH.M....",
+    "...FFBBFF....HHHHMMM....",
+    "...FFFFFF....HHHHHHH....",
+    "....DMMMD.....MMPMM.....",
+    "....DFFFD.....MMMMM.....",
+    "....DDDDD.....MMMMM.....",
+    "....D..D......MM.MM.....",
+    "....W..W......W...W.....",
     "........................",
 )
 
 _DOGGY_ART_PALETTE = {
     ".": "#0b0b0d",
-    "C": "#16dfe8",
-    "M": "#ff2d9a",
+    "C": "#00bac5",
+    "M": "#ee4b8d",
     "c": "#0b6670",
     "m": "#8f1b58",
     "G": "#ff7a32",
-    "Y": "#ffd43b",
-    "T": "#ff9a3c",
-    "P": "#ff2d9a",
+    "Y": "#d9ad32",
+    "T": "#f2ca55",
+    "P": "#ff68ad",
     "R": "#071014",
-    "F": "#f0c7a4",
+    "F": "#e1d2ae",
+    "H": "#c9a978",
     "D": "#2c2c2e",
-    "S": "#8e8e93",
+    "S": "#75644a",
     "W": "#f5f5f7",
     "B": "#1c1c1e",
+    "N": "#3a2a22",
+    "L": "#f0e6cc",
+    "K": "#050507",
 }
 
 _DOGGY_ART_PRIORITY = {
     ".": 0,
     "B": 1,
     "D": 2,
+    "N": 2,
     "S": 3,
     "c": 4,
     "m": 4,
     "F": 4,
+    "H": 4,
+    "L": 4,
+    "R": 1,
     "C": 5,
     "M": 6,
+    "P": 7,
     "G": 7,
     "Y": 8,
     "T": 8,
-    "P": 8,
-    "R": 1,
     "W": 9,
+    "K": 10,
 }
 
-# The large idle art is still portable ANSI/Unicode, but these overlays add
-# the details that matter at terminal resolution: sunglasses, gold chain,
-# moving cigarette smoke and a separate exhaust plume behind the car.
-_DOGGY_GLASSES_PIXELS = {
-    (26, 6): "D", (27, 6): "W", (28, 6): "D", (29, 6): "D", (30, 6): "D",
-    (32, 6): "D", (33, 6): "W", (34, 6): "D", (35, 6): "D", (36, 6): "D",
-    (26, 7): "D", (27, 7): "D", (28, 7): "D", (29, 7): "D", (30, 7): "D",
-    (31, 7): "D",
-    (32, 7): "D", (33, 7): "D", (34, 7): "D", (35, 7): "D", (36, 7): "D",
-    (27, 8): "D", (28, 8): "D", (29, 8): "D", (30, 8): "D",
-    (32, 8): "D", (33, 8): "D", (34, 8): "D", (35, 8): "D",
-}
+_DOGGY_COUPLE_FRAMES = 12
 
-_DOGGY_CHAIN_PIXELS = (
-    (25, 10), (34, 10),
-    (25, 11), (26, 11), (27, 11),
-    (26, 12), (27, 12), (28, 12), (32, 12), (33, 12),
-    (27, 13), (28, 13), (29, 13), (31, 13), (32, 13), (33, 13),
-    (29, 14), (30, 14), (31, 14), (32, 14),
-    (31, 15),
+# High-priority facial pixels survive terminal resizing instead of dissolving
+# into the surrounding tan fur.
+_DOGGY_FACE_DETAILS = (
+    (34, 14), (38, 14),
+    (35, 17), (36, 17),
+    (34, 19), (37, 19),
+    (35, 20), (36, 20),
 )
 
-_DOGGY_SMOKE_FRAMES = (
-    ((38, 9), (38, 8), (39, 7), (39, 6), (40, 5), (40, 4), (39, 3), (40, 2), (41, 1)),
-    ((38, 9), (39, 8), (39, 7), (40, 6), (41, 5), (40, 4), (41, 3), (42, 2), (43, 1)),
-    ((38, 9), (38, 8), (40, 7), (41, 6), (41, 5), (42, 4), (41, 3), (43, 2), (44, 1)),
-    ((38, 9), (39, 8), (40, 7), (39, 6), (40, 5), (41, 4), (42, 3), (42, 2), (44, 1)),
+_DOGGY_FEMALE_CROWN_SPANS = (
+    (8, 35, 41, "H"),
+    (9, 32, 39, "H"),
 )
 
-_DOGGY_EXHAUST_FRAMES = (
-    ((4, 23), (3, 24), (2, 25), (1, 25), (0, 26)),
-    ((4, 24), (3, 24), (2, 24), (1, 25), (0, 25)),
-    ((4, 23), (3, 24), (2, 24), (1, 24), (0, 25)),
-    ((4, 24), (3, 25), (2, 25), (1, 26), (0, 26)),
+_DOGGY_FEMALE_MUZZLE_SPANS = (
+    (16, 34, 40, "F"),
+    (17, 33, 41, "L"),
+    (18, 33, 41, "L"),
+    (19, 34, 40, "L"),
+    (20, 35, 39, "F"),
 )
 
-_DOGGY_WHEEL_CENTERS = ((5, 22), (23, 22))
-_DOGGY_WHEEL_SPOKES = (
-    ((0, -1), (0, 1)),
-    ((-1, -1), (1, 1)),
-    ((-1, 0), (1, 0)),
-    ((1, -1), (-1, 1)),
+_DOGGY_FEMALE_BOW_DETAILS = (
+    (42, 8, "M"), (44, 8, "M"),
+    (41, 9, "M"), (42, 9, "P"), (43, 9, "M"),
+    (44, 9, "M"), (45, 9, "M"),
+)
+
+_DOGGY_CHAIN_DETAILS = (
+    (17, 20), (18, 21), (19, 22),
+    (23, 20), (22, 21), (21, 22),
+    (20, 23), (36, 23),
 )
 
 
-def _animate_doggy_city(rows: tuple[str, ...], frame: int) -> tuple[str, ...]:
-    """Return one refined animation frame without mutating the source art."""
+def _animate_doggy_couple(rows: tuple[str, ...], frame: int) -> tuple[str, ...]:
+    """Keep the portrait still while tiny jewellery and bow highlights breathe."""
 
-    canvas = [list(row.replace("S", ".")) for row in rows]
-    # Remove the two legacy hot-pink masses called out in the visual review:
-    # the solid skyline behind the rear half of the car and the horizontal
-    # under-car trail. Procedural skyline, palms and diagonal track stay intact.
-    for y, row in enumerate(canvas):
-        for x, value in enumerate(row):
-            if value == "M" and ((x < 24 and y < 28) or y >= 27):
-                canvas[y][x] = "."
-    for (x, y), value in _DOGGY_GLASSES_PIXELS.items():
-        canvas[y][x] = value
-    canvas[6][27] = "D"
-    canvas[6][33] = "D"
-    glint_shift = frame % 3
-    canvas[6][27 + glint_shift] = "W"
-    canvas[6][33 + glint_shift] = "W"
-    for x, y in _DOGGY_CHAIN_PIXELS:
-        canvas[y][x] = "Y"
-    for x, y in _DOGGY_SMOKE_FRAMES[frame % len(_DOGGY_SMOKE_FRAMES)]:
-        canvas[y][x] = "S"
-    for x, y in _DOGGY_EXHAUST_FRAMES[frame % len(_DOGGY_EXHAUST_FRAMES)]:
-        canvas[y][x] = "S"
-    ring = (
-        (-1, -2), (0, -2), (1, -2),
-        (-2, -1), (2, -1),
-        (-2, 0), (2, 0),
-        (-2, 1), (2, 1),
-        (-1, 2), (0, 2), (1, 2),
-    )
-    for center_x, center_y in _DOGGY_WHEEL_CENTERS:
-        for dx, dy in ring:
-            canvas[center_y + dy][center_x + dx] = "D"
-        for dy in (-1, 0, 1):
-            for dx in (-1, 0, 1):
-                canvas[center_y + dy][center_x + dx] = "B"
-        for dx, dy in _DOGGY_WHEEL_SPOKES[frame % len(_DOGGY_WHEEL_SPOKES)]:
-            canvas[center_y + dy][center_x + dx] = "W"
-        canvas[center_y][center_x] = "Y"
-    # Cigarette ember flickers independently from the smoke ribbon.
-    canvas[10][37] = "Y" if frame % 2 else "M"
+    canvas = [list(row) for row in rows]
+    height = len(canvas)
+    width = len(canvas[0]) if canvas else 0
+    phase = frame % _DOGGY_COUPLE_FRAMES
+
+    for y, start, end, value in _DOGGY_FEMALE_CROWN_SPANS:
+        if 0 <= y < height:
+            for x in range(start, min(end + 1, width)):
+                canvas[y][x] = value
+
+    for y, start, end, value in _DOGGY_FEMALE_MUZZLE_SPANS:
+        if 0 <= y < height:
+            for x in range(start, min(end + 1, width)):
+                canvas[y][x] = value
+
+    for x, y, value in _DOGGY_FEMALE_BOW_DETAILS:
+        if 0 <= y < height and 0 <= x < width:
+            canvas[y][x] = value
+
+    for x, y in _DOGGY_FACE_DETAILS:
+        if 0 <= y < height and 0 <= x < width:
+            canvas[y][x] = "K"
+
+    for index, (x, y) in enumerate(_DOGGY_CHAIN_DETAILS):
+        if 0 <= y < height and 0 <= x < width:
+            canvas[y][x] = "T" if index == phase % len(_DOGGY_CHAIN_DETAILS) else "Y"
+
+    bow_pixels = [
+        (x, y)
+        for y in range(min(14, height))
+        for x in range(38, width)
+        if canvas[y][x] == "M"
+    ]
+    if bow_pixels:
+        x, y = bow_pixels[(phase // 2) % len(bow_pixels)]
+        canvas[y][x] = "P"
+
     return tuple("".join(row) for row in canvas)
 
 
-def _compose_doggy_scene(
+def _compose_doggy_night(
     art_rows: tuple[str, ...],
     width: int,
     scene_time: float,
 ) -> tuple[str, ...]:
-    """Compose the diagonal road behind the foreground dog-and-car art."""
+    """Place the locked portrait in the reference image's sparse neon night."""
 
-    height = len(art_rows)
+    height = max(len(art_rows), 2)
+    if height % 2:
+        height += 1
     scene_width = max(1, width)
-    flicker_tick = int(scene_time * 4)
+    tick = int(scene_time * 5)
     canvas = [["."] * scene_width for _ in range(height)]
 
-    def put(x: int, y: int, value: str, *, overwrite: bool = True) -> None:
+    def put(x: int, y: int, value: str, *, soft: bool = False) -> None:
         if 0 <= x < scene_width and 0 <= y < height:
-            if overwrite or canvas[y][x] == ".":
-                canvas[y][x] = value
+            if soft and canvas[y][x] != ".":
+                return
+            canvas[y][x] = value
 
-    # A diagonal road runs between two parallel rails in exactly the
-    # bottom-right -> top-left direction indicated by the reference arrows.
-    road_top = 3
-    road_span = max(1, height - road_top - 1)
-    road_width = max(24, int(scene_width * 0.68))
-    for y in range(road_top, height):
-        progress = (y - road_top) / road_span
-        left = int(scene_width * (-0.18 + 0.48 * progress))
-        right = left + road_width
-        for x in range(left + 1, min(scene_width, right)):
-            put(x, y, "R")
-        put(left, y, "M")
-        put(left + 1, y, "M")
-        put(right - 1, y, "C")
-        put(right, y, "C")
-        lane = left + road_width // 2
-        if (y + flicker_tick) % 6 < 3:
-            put(lane, y, "Y")
-            put(lane + 1, y, "Y")
+    # Pink crescent from the reference, left of the taller dog.
+    moon_x = max(2, round(scene_width * 0.25))
+    moon_y = max(1, round(height * 0.09))
+    for dy, span in ((0, (1, 2)), (1, (0, 3)), (2, (0, 3)), (3, (1, 2))):
+        for dx in range(span[0], span[1] + 1):
+            put(moon_x + dx, moon_y + dy, "M" if (tick // 3) % 2 == 0 else "m")
+    put(moon_x + 2, moon_y + 1, ".")
+    put(moon_x + 2, moon_y + 2, ".")
 
+    # Sparse pink/cyan stars; only their intensity changes, never their position.
+    spark_seed = (
+        (0.20, 0.25, "C", True),
+        (0.29, 0.17, "M", False),
+        (0.75, 0.13, "M", False),
+        (0.72, 0.29, "C", True),
+        (0.14, 0.38, "C", False),
+        (0.76, 0.48, "M", False),
+        (0.18, 0.62, "M", False),
+        (0.70, 0.70, "M", False),
+        (0.24, 0.78, "C", False),
+        (0.83, 0.58, "C", False),
+    )
+    for i, (fx, fy, color, cross) in enumerate(spark_seed):
+        if (tick + i) % 5 == 0:
+            continue
+        x = int(fx * (scene_width - 1))
+        y = int(fy * (height - 1))
+        dim = "c" if color == "C" else "m"
+        sparkle = color if (tick + i) % 2 == 0 else dim
+        put(x, y, sparkle, soft=True)
+        if cross and (tick + i) % 3:
+            put(x - 1, y, sparkle, soft=True)
+            put(x + 1, y, sparkle, soft=True)
+            put(x, y - 1, sparkle, soft=True)
+            put(x, y + 1, sparkle, soft=True)
+
+    # The couple never bobs: its approved 52x60 height and pose stay locked.
     art_width = len(art_rows[0]) if art_rows else 0
-
-    # Foreground art wins over the procedural road; transparent cells leave
-    # the track visible around and through the vehicle silhouette.
+    art_height = len(art_rows)
     art_left = max(0, (scene_width - art_width) // 2)
+    art_top = max(0, (height - art_height) // 2)
     for y, row in enumerate(art_rows):
+        ty = art_top + y
+        if ty >= height:
+            break
         for x, value in enumerate(row):
             if value != ".":
-                put(art_left + x, y, value)
+                put(art_left + x, ty, value)
+
     return tuple("".join(row) for row in canvas)
 
 
 _DOGGY_DESIGN_WIDTH = 120
-_DOGGY_DESIGN_TASK_HEIGHT = 28
-_DOGGY_DESIGN_TOP_MARGIN = 2
-_DOGGY_DESIGN_BOTTOM_MARGIN = 2
-_DOGGY_DESIGN_RUNWAY_HEIGHT = 8
-_DOGGY_MAX_SCALE = 1.6
+_DOGGY_DESIGN_TASK_HEIGHT = 32
+_DOGGY_DESIGN_TOP_MARGIN = 1
+_DOGGY_DESIGN_BOTTOM_MARGIN = 1
+_DOGGY_MAX_SCALE = 1.5
 
 
 def _render_doggy_empty(
@@ -2267,16 +2458,13 @@ def _render_doggy_empty(
     *,
     now: float | None = None,
 ) -> StyleAndTextTuples:
-    """Render one uniformly scaled Frenchie scene from the small-screen master."""
+    """Render the locked 52x60 neon couple portrait and sparse night field."""
     clock = time.monotonic() if now is None else now
-    art_tick = int(clock * 4)
-    frame = art_tick % len(_DOGGY_SMOKE_FRAMES)
-    rows = _animate_doggy_city(_DOGGY_CITY_ART, frame)
+    art_tick = int(clock * 5)
+    frame = art_tick % _DOGGY_COUPLE_FRAMES
+    rows = _animate_doggy_couple(_DOGGY_COUPLE_ART, frame)
     terminal_height = _terminal_height()
 
-    # The 120x28 small-window composition is the visual source of truth.
-    # Scale its car, road and whitespace together, then centre the whole frame.
-    # Snapping around 1.0 preserves the approved small-screen layout exactly.
     task_height = max(1, terminal_height - 8)
     scale = min(
         width / _DOGGY_DESIGN_WIDTH,
@@ -2284,7 +2472,7 @@ def _render_doggy_empty(
         _DOGGY_MAX_SCALE,
     )
     scale = max(0.25, scale)
-    if 0.92 <= scale <= 1.08:
+    if 1.0 <= scale <= 1.08:
         scale = 1.0
 
     stage_width = max(
@@ -2306,28 +2494,17 @@ def _render_doggy_empty(
     if target_width < len(rows[0]):
         rows = tuple(_fit_art_row(row, target_width) for row in rows)
 
-    rows = _compose_doggy_scene(rows, stage_width, clock)
+    rows = _compose_doggy_night(rows, stage_width, clock)
     art_width = len(rows[0])
     outer = max(0, (width - art_width) // 2)
-    tick = frame % 2
     palette = dict(_DOGGY_ART_PALETTE)
-    if tick:
-        palette["M"] = "#ff5ab3"
-        palette["S"] = "#aeaeb2"
 
     art_height = len(rows) // 2
-    top_margin = max(1, round(_DOGGY_DESIGN_TOP_MARGIN * scale))
+    top_margin = max(0, round(_DOGGY_DESIGN_TOP_MARGIN * scale))
     bottom_margin = max(0, round(_DOGGY_DESIGN_BOTTOM_MARGIN * scale))
-    runway_height = max(0, round(_DOGGY_DESIGN_RUNWAY_HEIGHT * scale))
-    scaled_frame_height = (
-        top_margin + art_height + runway_height + bottom_margin
-    )
+    scaled_frame_height = top_margin + art_height + bottom_margin
     vertical_slack = max(0, task_height - scaled_frame_height)
     top_padding = top_margin + vertical_slack // 2
-    runway_height = min(
-        runway_height,
-        max(0, task_height - top_padding - art_height - bottom_margin),
-    )
 
     fragments: StyleAndTextTuples = [("", "\n" * top_padding)]
     for top, bottom in zip(rows[::2], rows[1::2], strict=True):
@@ -2338,95 +2515,6 @@ def _render_doggy_empty(
             style, glyph = _half_block(pair[0], pair[1], palette)
             fragments.append((style, glyph * count))
         fragments.append(("", "\n"))
-    fragments.extend(
-        _render_neon_track(
-            width,
-            runway_height,
-            int(clock * 6),
-            stage_width=stage_width,
-        )
-    )
-    return fragments
-
-
-def _render_neon_track(
-    width: int,
-    height: int,
-    frame: int,
-    *,
-    stage_width: int | None = None,
-) -> StyleAndTextTuples:
-    """Continue the scene's parallel diagonal rails toward the lower-right."""
-
-    if height <= 0 or width < 12:
-        return []
-    fragments: StyleAndTextTuples = []
-    canvas_width = width
-    stage_width = max(12, min(canvas_width, stage_width or canvas_width))
-    stage_left = max(0, (canvas_width - stage_width) // 2)
-    stage_right = stage_left + stage_width
-    base_style = "bg:#0b0b0d"
-    road_style = "bg:#071014"
-    edge_pink = "fg:#ff2d9a bg:#071014 bold"
-    edge_cyan = "fg:#16dfe8 bg:#071014 bold"
-    glow_pink = "fg:#8f1b58 bg:#071014"
-    glow_cyan = "fg:#0b6670 bg:#071014"
-    lane_orange = "fg:#ff9a3c bg:#071014 bold"
-    road_width = max(24, int(stage_width * 0.68))
-    left_start = stage_left + int(stage_width * 0.30)
-    diagonal_step = max(2, int(stage_width * 0.035))
-    phase = frame % 10
-
-    for y in range(height):
-        chars = [" "] * canvas_width
-        styles = [base_style] * canvas_width
-
-        def put(x: int, glyph: str, style: str) -> None:
-            if 0 <= x < canvas_width:
-                chars[x] = glyph
-                styles[x] = style
-
-        def put_track(x: int, glyph: str, style: str) -> None:
-            if stage_left <= x < stage_right:
-                put(x, glyph, style)
-
-        left = left_start + y * diagonal_step
-        right = left + road_width
-        for x in range(max(stage_left, left + 1), min(stage_right, right)):
-            styles[x] = road_style
-            if (x + y * 2 + phase // 2) % 17 == 0:
-                put(x, "·", "fg:#0b6670 bg:#071014")
-
-        put_track(left, "\\", edge_pink)
-        put_track(left + 1, "\\", edge_pink)
-        put_track(right - 1, "\\", edge_cyan)
-        put_track(right, "\\", edge_cyan)
-
-        lane = left + road_width // 2
-        if (y + phase - 2) % 8 == 0:
-            put_track(lane, "╲", lane_orange)
-
-        # Sparse roadside reflectors retreat up-left beneath the right-facing
-        # car. Deriving x from y follows the road perspective instead of
-        # sweeping sideways or piling up into barcode-like clusters.
-        pink_tail = (y + phase) % 10
-        if pink_tail in (0, 1):
-            marker = left + road_width // 3
-            put_track(marker, "╲", edge_pink if pink_tail == 0 else glow_pink)
-            if pink_tail == 0:
-                put_track(marker + 1, "╲", edge_pink)
-
-        cyan_tail = (y + phase - 5) % 10
-        if cyan_tail in (0, 1):
-            marker = left + road_width * 2 // 3
-            put_track(marker, "╲", edge_cyan if cyan_tail == 0 else glow_cyan)
-            if cyan_tail == 0:
-                put_track(marker + 1, "╲", edge_cyan)
-
-        for (style, glyph), cells in groupby(zip(styles, chars, strict=True)):
-            count = sum(1 for _ in cells)
-            fragments.append((style, glyph * count))
-        fragments.append((base_style, "\n"))
     return fragments
 
 

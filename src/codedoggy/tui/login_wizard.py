@@ -1,10 +1,11 @@
-"""Auth login wizard — Hermes-style menu, keyboard + mouse friendly.
+"""Auth + model connection wizard — Hermes-style menu, keyboard + mouse friendly.
 
 Steps:
   home       → pick Grok / Claude / Codex / API-key providers / refresh
-  provider   → login / paste token / status / back
+  provider   → login / paste token / select model / apply / back
+  model      → pick from catalog (or custom id)
   waiting    → background browser login in progress
-  paste      → enter API key / token
+  paste      → enter API key / token / custom model id
   result     → success or failure summary
 """
 
@@ -12,10 +13,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Callable, Literal
+from typing import Any, Literal
 
 from codedoggy.model.auth import auth_status, begin_login, is_imperial
 from codedoggy.model.auth.base import AuthStatus
+from codedoggy.model.catalog import suggested_models
 from codedoggy.model.profile_registry import get_profile
 from codedoggy.model.registry import create_client, model_config_from_env
 
@@ -23,6 +25,7 @@ from codedoggy.model.registry import create_client, model_config_from_env
 class WizardStep(str, Enum):
     HOME = "home"
     PROVIDER = "provider"
+    MODEL = "model"
     WAITING = "waiting"
     PASTE = "paste"
     RESULT = "result"
@@ -50,6 +53,7 @@ class WizardAction:
         "blur_input",
     ] = "none"
     provider: str | None = None
+    model: str | None = None
     message: str = ""
     feedback_kind: str = "info"
 
@@ -65,18 +69,32 @@ class AuthWizard:
     body_note: str = ""
     paste_buffer: str = ""
     paste_prompt: str = ""
+    paste_kind: str = "token"  # token | model
     last_status: AuthStatus | None = None
     busy: bool = False
     result_ok: bool | None = None
+    # Session connection truth (set by TUI on open)
+    active_provider: str = ""
+    active_model: str = ""
 
-    def open(self) -> None:
+    def open(
+        self,
+        *,
+        active_provider: str | None = None,
+        active_model: str | None = None,
+    ) -> None:
         self.step = WizardStep.HOME
         self.cursor = 0
         self.provider = None
         self.paste_buffer = ""
+        self.paste_kind = "token"
         self.busy = False
         self.result_ok = None
         self.body_note = ""
+        if active_provider is not None:
+            self.active_provider = str(active_provider or "").strip()
+        if active_model is not None:
+            self.active_model = str(active_model or "").strip()
         self._rebuild()
 
     def _rebuild(self) -> None:
@@ -84,6 +102,8 @@ class AuthWizard:
             self._build_home()
         elif self.step == WizardStep.PROVIDER:
             self._build_provider()
+        elif self.step == WizardStep.MODEL:
+            self._build_model()
         elif self.step == WizardStep.WAITING:
             self.items = [
                 MenuItem("cancel", "取消等待", "Esc", enabled=not self.busy, style="danger"),
@@ -101,8 +121,11 @@ class AuthWizard:
         self.cursor = max(0, min(self.cursor, max(0, len(self.items) - 1)))
 
     def _build_home(self) -> None:
-        self.title = "AUTH GATE"
-        self.subtitle = "Grok / Claude / Codex 网页授权 · 其它走 API Key · ↑↓ Enter · 点击"
+        self.title = "连接"
+        cur = ""
+        if self.active_provider or self.active_model:
+            cur = f"当前 {self.active_provider or '—'}/{self.active_model or '—'}"
+        self.subtitle = cur or "Provider · Model · 登录 · ↑↓ Enter · Esc"
         items: list[MenuItem] = []
         for pid, label, hint in (
             ("grok", "Grok (xAI)", "浏览器 device-code · 订阅优先"),
@@ -111,27 +134,30 @@ class AuthWizard:
         ):
             st = auth_status(pid)
             badge = "✓ 已登录" if st.logged_in else "○ 未登录"
+            active = " · 使用中" if pid == self.active_provider else ""
             items.append(
                 MenuItem(
                     pid,
-                    f"{label}  {badge}",
+                    f"{label}  {badge}{active}",
                     st.detail or hint,
                     style="ok" if st.logged_in else "accent",
                 )
             )
-        # API-key family
         for pid in ("deepseek", "openai", "ollama", "custom"):
             prof = get_profile(pid)
             if prof is None:
                 continue
             st = auth_status(pid)
             badge = "✓ Key" if st.logged_in else "○ 无 Key"
+            if pid == "ollama":
+                badge = "✓ 本地"
+            active = " · 使用中" if pid == self.active_provider else ""
             items.append(
                 MenuItem(
                     pid,
-                    f"{prof.display_name or pid}  {badge}",
-                    "API Key 路径",
-                    style="ok" if st.logged_in else "muted",
+                    f"{prof.display_name or pid}  {badge}{active}",
+                    "API Key 路径" if pid != "ollama" else "本机 Ollama",
+                    style="ok" if (st.logged_in or pid == "ollama") else "muted",
                 )
             )
         items.append(MenuItem("refresh", "刷新状态", "重新探测本机凭证", style="muted"))
@@ -144,13 +170,16 @@ class AuthWizard:
         self.last_status = st
         prof = get_profile(pid)
         name = (prof.display_name if prof else pid) or pid
-        self.title = f"AUTH · {name.upper()}"
+        self.title = f"连接 · {name.upper()}"
         imperial = is_imperial(pid)
-        if st.logged_in:
-            self.subtitle = f"已登录 · source={st.source}"
+        model_hint = self.active_model if pid == self.active_provider else (
+            (prof.default_model if prof else "") or ""
+        )
+        if st.logged_in or pid == "ollama":
+            self.subtitle = f"已就绪 · model={model_hint or '—'}"
             self.body_note = st.detail or ""
         else:
-            self.subtitle = "未登录"
+            self.subtitle = f"未登录 · 可选 model={model_hint or '—'}"
             self.body_note = st.detail or ""
 
         items: list[MenuItem] = []
@@ -180,7 +209,7 @@ class AuthWizard:
                     style="normal",
                 )
             )
-        else:
+        elif pid != "ollama":
             items.append(
                 MenuItem(
                     "paste",
@@ -189,16 +218,60 @@ class AuthWizard:
                     style="accent",
                 )
             )
-        if st.logged_in:
+
+        items.append(
+            MenuItem(
+                "pick_model",
+                "选择模型",
+                f"当前候选 · {model_hint or 'catalog'}",
+                style="accent",
+            )
+        )
+
+        can_apply = bool(st.logged_in) or pid == "ollama"
+        items.append(
+            MenuItem(
+                "reload",
+                "应用此 Provider",
+                "切换连接真源 · 使用当前/默认 model",
+                enabled=can_apply,
+                style="ok" if can_apply else "muted",
+            )
+        )
+        items.append(MenuItem("back", "返回列表", "Esc", style="muted"))
+        self.items = items
+
+    def _build_model(self) -> None:
+        pid = self.provider or self.active_provider or "ollama"
+        prof = get_profile(pid)
+        name = (prof.display_name if prof else pid) or pid
+        self.title = f"模型 · {name.upper()}"
+        current = self.active_model if pid == self.active_provider else ""
+        if not current and prof is not None:
+            current = prof.default_model or ""
+        self.subtitle = f"选择 model · 当前 {current or '—'}"
+        self.body_note = "选中后立即写入连接真源并热切换"
+
+        items: list[MenuItem] = []
+        for mid in suggested_models(pid):
+            mark = "✓ " if mid == self.active_model and pid == self.active_provider else ""
             items.append(
                 MenuItem(
-                    "reload",
-                    "重新加载客户端",
-                    "用当前凭证热切换 sampler",
-                    style="ok",
+                    f"model:{mid}",
+                    f"{mark}{mid}",
+                    "Apply 到本会话",
+                    style="ok" if mark else "normal",
                 )
             )
-        items.append(MenuItem("back", "返回列表", "Esc", style="muted"))
+        items.append(
+            MenuItem(
+                "custom_model",
+                "自定义 model id…",
+                "输入任意模型名",
+                style="accent",
+            )
+        )
+        items.append(MenuItem("back", "返回", "Esc", style="muted"))
         self.items = items
 
     def move(self, delta: int) -> None:
@@ -206,7 +279,6 @@ class AuthWizard:
             return
         n = len(self.items)
         self.cursor = (self.cursor + delta) % n
-        # skip disabled
         for _ in range(n):
             if self.items[self.cursor].enabled:
                 break
@@ -254,6 +326,7 @@ class AuthWizard:
                 )
             if item.id == "paste":
                 self.step = WizardStep.PASTE
+                self.paste_kind = "token"
                 self.paste_buffer = ""
                 self.paste_prompt = (
                     "粘贴 API Key / OAuth Token，然后 Enter"
@@ -263,11 +336,44 @@ class AuthWizard:
                 self.cursor = 0
                 self._rebuild()
                 return WizardAction(kind="focus_input")
+            if item.id == "pick_model":
+                self.step = WizardStep.MODEL
+                self.cursor = 0
+                self._rebuild()
+                return WizardAction()
             if item.id == "reload":
                 return WizardAction(
                     kind="reload_client",
                     provider=self.provider,
-                    message="客户端已按当前凭证重载",
+                    model=None,
+                    message="已应用 Provider（默认/当前 model）",
+                    feedback_kind="success",
+                )
+
+        if self.step == WizardStep.MODEL:
+            if item.id == "back":
+                self.step = WizardStep.PROVIDER
+                self.cursor = 0
+                self._rebuild()
+                return WizardAction()
+            if item.id == "custom_model":
+                self.step = WizardStep.PASTE
+                self.paste_kind = "model"
+                self.paste_buffer = ""
+                self.paste_prompt = "输入 model id，然后 Enter"
+                self.cursor = 0
+                self._rebuild()
+                return WizardAction(kind="focus_input")
+            if item.id.startswith("model:"):
+                mid = item.id[len("model:") :]
+                self.active_model = mid
+                if self.provider:
+                    self.active_provider = self.provider
+                return WizardAction(
+                    kind="reload_client",
+                    provider=self.provider,
+                    model=mid,
+                    message=f"已切换模型 · {self.provider}/{mid}",
                     feedback_kind="success",
                 )
 
@@ -281,8 +387,11 @@ class AuthWizard:
 
         if self.step == WizardStep.PASTE:
             if item.id == "back":
-                self.step = WizardStep.PROVIDER
+                self.step = (
+                    WizardStep.MODEL if self.paste_kind == "model" else WizardStep.PROVIDER
+                )
                 self.cursor = 0
+                self.paste_kind = "token"
                 self._rebuild()
                 return WizardAction(kind="blur_input")
             if item.id == "submit":
@@ -307,10 +416,29 @@ class AuthWizard:
     def _submit_paste(self) -> WizardAction:
         token = self.paste_buffer.strip()
         if not token:
-            self.body_note = "凭证为空"
-            return WizardAction(message="请粘贴非空凭证", feedback_kind="warning")
+            self.body_note = "输入为空"
+            return WizardAction(message="请输入非空内容", feedback_kind="warning")
+
+        if self.paste_kind == "model":
+            mid = token
+            self.active_model = mid
+            if self.provider:
+                self.active_provider = self.provider
+            self.step = WizardStep.RESULT
+            self.result_ok = True
+            self.body_note = f"模型 {self.provider}/{mid}"
+            self.paste_kind = "token"
+            self.cursor = 0
+            self._rebuild()
+            return WizardAction(
+                kind="reload_client",
+                provider=self.provider,
+                model=mid,
+                message=f"已切换模型 · {self.provider}/{mid}",
+                feedback_kind="success",
+            )
+
         pid = self.provider or "custom"
-        # Store on process env so resolve() picks it up
         env_map = {
             "grok": "XAI_API_KEY",
             "xai": "XAI_API_KEY",
@@ -324,7 +452,6 @@ class AuthWizard:
         }
         import os
 
-        # Prefer OAuth-shaped env for claude when token looks like oauth
         if pid in {"claude", "anthropic"} and not token.startswith("sk-ant-api"):
             os.environ["ANTHROPIC_TOKEN"] = token
             os.environ.pop("ANTHROPIC_API_KEY", None)
@@ -373,6 +500,11 @@ class AuthWizard:
             return WizardAction()
         if self.step == WizardStep.HOME:
             return WizardAction(kind="close")
+        if self.step == WizardStep.MODEL:
+            self.step = WizardStep.PROVIDER
+            self.cursor = 0
+            self._rebuild()
+            return WizardAction(kind="blur_input")
         if self.step in {WizardStep.PROVIDER, WizardStep.RESULT}:
             self.step = WizardStep.HOME
             self.cursor = 0
@@ -380,8 +512,11 @@ class AuthWizard:
             self._rebuild()
             return WizardAction(kind="blur_input")
         if self.step == WizardStep.PASTE:
-            self.step = WizardStep.PROVIDER
+            self.step = (
+                WizardStep.MODEL if self.paste_kind == "model" else WizardStep.PROVIDER
+            )
             self.cursor = 0
+            self.paste_kind = "token"
             self._rebuild()
             return WizardAction(kind="blur_input")
         if self.step == WizardStep.WAITING:
@@ -393,7 +528,7 @@ class AuthWizard:
 
 
 def hud_snapshot(current_provider: str | None = None) -> dict[str, Any]:
-    """Data for street HUD auth panel."""
+    """Legacy helper — prefer ``tui.surface.hud_projection(session)``."""
     rows = []
     for pid in ("grok", "claude", "codex"):
         st = auth_status(pid)
@@ -406,12 +541,6 @@ def hud_snapshot(current_provider: str | None = None) -> dict[str, Any]:
             }
         )
     cur = (current_provider or "").strip().lower()
-    if not cur:
-        try:
-            cfg = model_config_from_env()
-            cur = cfg.provider
-        except Exception:  # noqa: BLE001
-            cur = ""
     any_in = any(r["logged_in"] for r in rows)
     return {
         "provider": cur,
@@ -427,6 +556,6 @@ def run_browser_login(provider: str) -> AuthStatus:
 
 
 def reload_chat_client(provider: str | None = None) -> Any:
-    """Build a ChatClient with hard auth for the given/current provider."""
+    """Legacy: build client without ConnectionService (tests / scripts)."""
     cfg = model_config_from_env(provider=provider)
     return create_client(cfg, require_auth=True)

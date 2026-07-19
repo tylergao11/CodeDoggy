@@ -24,6 +24,13 @@ from codedoggy.model.auth import (
     resolve_credential,
 )
 from codedoggy.model.chat_sampler import ChatSampler
+from codedoggy.model.catalog import resolve_model_choice, suggested_models
+from codedoggy.model.connection import (
+    ActiveConnection,
+    ConnectionService,
+    connection_from_config,
+    connection_of,
+)
 from codedoggy.model.openai_compat import ModelError, OpenAICompatClient
 from codedoggy.model.profile import (
     API_ANTHROPIC_MESSAGES,
@@ -52,6 +59,7 @@ __all__ = [
     "AUTH_MODE_API_KEY",
     "AUTH_MODE_OAUTH",
     "AUTH_OAUTH",
+    "ActiveConnection",
     "AnthropicMessagesClient",
     "AuthCredential",
     "AuthStatus",
@@ -60,6 +68,7 @@ __all__ = [
     "ChatSampler",
     "CodexResponsesClient",
     "CompletionResult",
+    "ConnectionService",
     "IMPERIAL_OAUTH",
     "LoginRequired",
     "ModelConfig",
@@ -72,7 +81,11 @@ __all__ = [
     "auth_kind_for_provider",
     "auth_status",
     "begin_login",
+    "connection_from_config",
+    "connection_of",
     "create_client",
+    "resolve_model_choice",
+    "suggested_models",
     "get_profile",
     "is_imperial",
     "list_profiles",

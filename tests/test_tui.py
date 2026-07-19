@@ -215,7 +215,7 @@ def test_task_report_is_the_agents_first_brief_paragraph() -> None:
     assert task_report_from_agent("x" * 400).endswith("…")
 
 
-def test_empty_state_is_only_neon_doggy_city_art_without_overflow() -> None:
+def test_startup_brand_is_neon_couple_art_without_overflow() -> None:
     narrow_fragments = _render_doggy_empty(36, now=0.0)
     pulse_fragments = _render_doggy_empty(36, now=0.25)
     wide_fragments = _render_doggy_empty(80, now=0.0)
@@ -238,12 +238,44 @@ def test_empty_state_is_only_neon_doggy_city_art_without_overflow() -> None:
     ):
         assert accidental_label not in narrow
     styles = " ".join(fragment[0] for fragment in wide_fragments)
-    assert "#16dfe8" in styles
-    assert "#ff2d9a" in styles
-    assert "#f0c7a4" in styles
+    # Neon + figure colors vary by scale/frame; require at least one brand accent
+    # and one fur tone so we still catch "empty black" regressions.
+    neon = ("#16dfe8", "#5af0f7", "#0b6670", "#ff2d9a", "#ff5ab3", "#ee4b8d", "#8f1b58")
+    fur = ("#f0c7a4", "#e8b878", "#c9a978", "#75644a")
+    assert any(c in styles for c in neon)
+    assert any(c in styles for c in fur)
     assert narrow_fragments != pulse_fragments
     assert all(get_cwidth(line) <= 36 for line in narrow.splitlines())
     assert all(get_cwidth(line) <= 80 for line in wide.splitlines())
+
+
+def test_startup_brand_is_one_shot_and_never_returns_after_first_task() -> None:
+    """Brand art is launch-only: first task dismisses it for the process."""
+    with create_pipe_input() as pipe_input:
+        tui = CodeDoggyTUI(_Session(), input=pipe_input, output=DummyOutput())
+        assert tui._showing_startup_brand() is True
+        body = "".join(fragment[1] for fragment in tui._render_tasks())
+        assert body.strip()  # neon doggy scene, not blank
+
+        tui._start_task("first job")
+        assert tui._startup_brand is False
+        assert tui._showing_startup_brand() is False
+        assert _wait_until(lambda: not tui._is_running())
+
+        # Even if the ledger were empty again, splash must not return.
+        tui.ledger = TaskLedger()
+        assert tui._showing_startup_brand() is False
+        assert "".join(fragment[1] for fragment in tui._render_tasks()).strip() == ""
+
+    with create_pipe_input() as pipe_input:
+        boot = CodeDoggyTUI(
+            _Session(),
+            initial_prompt="skip splash",
+            input=pipe_input,
+            output=DummyOutput(),
+        )
+        assert boot._startup_brand is False
+        assert boot._showing_startup_brand() is False
 
 
 def test_parallel_runtime_uses_child_descriptions_as_clickable_participants() -> None:

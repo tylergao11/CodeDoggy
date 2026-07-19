@@ -105,3 +105,53 @@ def test_go_back_from_home_closes() -> None:
     w.open()
     action = w.go_back()
     assert action.kind == "close"
+
+
+def test_wizard_pick_model_emits_apply_action() -> None:
+    w = AuthWizard()
+    w.open(active_provider="ollama", active_model="qwen3:8b")
+    w.provider = "ollama"
+    w.step = WizardStep.PROVIDER
+    w._rebuild()
+    assert any(i.id == "pick_model" for i in w.items)
+    for i, item in enumerate(w.items):
+        if item.id == "pick_model":
+            w.cursor = i
+            break
+    w.activate()
+    assert w.step == WizardStep.MODEL
+    assert any(i.id.startswith("model:") for i in w.items)
+    for i, item in enumerate(w.items):
+        if item.id.startswith("model:") and "qwen" not in item.id:
+            w.cursor = i
+            mid = item.id.split(":", 1)[1]
+            break
+    else:
+        # fall back to first catalog row
+        for i, item in enumerate(w.items):
+            if item.id.startswith("model:"):
+                w.cursor = i
+                mid = item.id.split(":", 1)[1]
+                break
+    action = w.activate()
+    assert action.kind == "reload_client"
+    assert action.provider == "ollama"
+    assert action.model == mid
+
+
+def test_wizard_custom_model_paste() -> None:
+    w = AuthWizard()
+    w.provider = "ollama"
+    w.step = WizardStep.MODEL
+    w._rebuild()
+    for i, item in enumerate(w.items):
+        if item.id == "custom_model":
+            w.cursor = i
+            break
+    action = w.activate()
+    assert action.kind == "focus_input"
+    assert w.paste_kind == "model"
+    action = w.submit_paste_text("my-custom:7b")
+    assert action.kind == "reload_client"
+    assert action.model == "my-custom:7b"
+    assert action.provider == "ollama"

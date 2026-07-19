@@ -10,6 +10,7 @@ from codedoggy.memory.manager import MemoryManager
 from codedoggy.memory.session_store import SessionStore, default_session_db_path
 from codedoggy.memory.store import MemoryStore
 from codedoggy.model.chat_sampler import ChatSampler
+from codedoggy.model.connection import ConnectionService
 from codedoggy.model.profiles import ModelProfiles, model_profiles_from_env
 from codedoggy.model.provider import ChatClient
 from codedoggy.session.extensions import SessionExtensions
@@ -184,6 +185,14 @@ def build_session(
         context_compactor=compactor,
     )
 
+    # Unified model/provider truth — env is import-only after this point.
+    connection = ConnectionService.bootstrap(
+        prof.main,
+        aux=prof.aux,
+        client=main,
+        runner=runner,
+    )
+
     from codedoggy.session.kernel import RuntimeKernel
 
     # Temporary session id if not provided (Session.create assigns one)
@@ -203,6 +212,7 @@ def build_session(
             session_store=session_store,
             policy=policy,
             graph=graph,
+            connection=connection,
         ),
     )
 
@@ -246,6 +256,7 @@ def build_session(
         session_store=session_store,
         policy=policy,
         graph=graph,
+        connection=connection,
         session_mode_state=mode_state,
         interjection_buffer=interjections,
         prompt_queue=prompt_queue,

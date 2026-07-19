@@ -38,6 +38,7 @@ class RuntimeKernel:
     session_store: Any = None
     policy: Any = None
     graph: Any = None
+    connection: Any = None  # ConnectionService — unified model truth
     mcp_runtime: Any = None
     # Grok orchestration handles
     session_mode_state: Any = None  # SessionModeState
