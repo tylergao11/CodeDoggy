@@ -3,8 +3,8 @@
 Sample with no tool_calls is *sample-done*, not *task-done*. Before finishing
 successfully, refuse when open todos / running children / bg shell tasks remain.
 
-Plan-first (RequirePlanArtifact) is enforced only at tool prepare — not here.
-Unmet plan must not block prose COMPLETED (go-steer: mutate gate, not turn end).
+Plan mode is a session edit gate (enter/exit), not a completion gate.
+Unmet plans must not block prose COMPLETED.
 
 Single source for the loop; no per-call hardcoded lists elsewhere.
 """
@@ -54,7 +54,10 @@ def running_subagent_ids(extra: dict[str, Any] | None) -> list[str]:
     for snap in snaps:
         status = getattr(snap, "status", None)
         if status in {"pending", "running"}:
-            out.append(str(getattr(snap, "id", "") or ""))
+            # SubagentSnapshot field is subagent_id (not id). Accept id as
+            # fallback for duck-typed test doubles.
+            sid = getattr(snap, "subagent_id", None) or getattr(snap, "id", None)
+            out.append(str(sid or ""))
     return [x for x in out if x]
 
 
@@ -62,24 +65,34 @@ def incomplete_work_reasons(extra: dict[str, Any] | None) -> list[str]:
     """Human/model-facing reasons the turn must not complete yet."""
     bag = dict(extra or {})
     reasons: list[str] = []
+    is_child = bool(bag.get("is_subagent"))
 
-    todos = open_todo_ids(bag.get("todo_state"))
-    if not todos:
+    # Todos are session-scoped: MAIN only its list; child only its own.
+    # Never let a child's checklist block MAIN completion (or vice versa).
+    if is_child:
+        todos = open_todo_ids(bag.get("todo_state"))
+    else:
         kernel = bag.get("kernel")
-        if kernel is not None:
+        if kernel is not None and hasattr(kernel, "todo_state"):
+            # Prefer kernel even when empty (completed-only must not fall back
+            # to a polluted bag.todo_state from child tooling).
             todos = open_todo_ids(getattr(kernel, "todo_state", None))
+        else:
+            todos = open_todo_ids(bag.get("todo_state"))
     if todos:
         preview = ", ".join(todos[:5])
-        more = f" (+{len(todos) - 5} more)" if len(todos) > 5 else ""
+        more = f"（另{len(todos) - 5}项）" if len(todos) > 5 else ""
+        scope = "子 agent" if is_child else "MAIN"
         reasons.append(
-            f"open todos still pending/in_progress: {preview}{more}"
+            f"未完成 todo（{scope} · pending/in_progress）: {preview}{more}"
         )
 
-    runners = running_subagent_ids(bag)
+    # Only MAIN waits on children; a child does not gate on siblings.
+    runners = [] if is_child else running_subagent_ids(bag)
     if runners:
         preview = ", ".join(runners[:5])
-        more = f" (+{len(runners) - 5} more)" if len(runners) > 5 else ""
-        reasons.append(f"subagents still running: {preview}{more}")
+        more = f"（另{len(runners) - 5}个）" if len(runners) > 5 else ""
+        reasons.append(f"子 agent 仍在运行: {preview}{more}")
 
     tm = bag.get("task_manager")
     if tm is None:
@@ -99,22 +112,23 @@ def incomplete_work_reasons(extra: dict[str, Any] | None) -> list[str]:
             bg = []
         if bg:
             preview = ", ".join(bg[:5])
-            more = f" (+{len(bg) - 5} more)" if len(bg) > 5 else ""
-            reasons.append(f"background shell tasks still running: {preview}{more}")
+            more = f"（另{len(bg) - 5}个）" if len(bg) > 5 else ""
+            reasons.append(f"后台 shell 任务仍在运行: {preview}{more}")
 
     # Goal mode is often a session constraint ("only touch auth"), not a
     # completion checklist — do not block prose-stop solely on goal flags.
     # Completion of checklist-style goals is enforced via todos / update_goal.
-    # Plan-first stays at tool prepare only (see tool_pipeline plan_first_denial).
 
     return reasons
 
 
 def format_incomplete_work_nudge(reasons: list[str]) -> str:
+    """Model-facing steer after prose-stop with open work (Chinese primary)."""
     bullets = "\n".join(f"- {r}" for r in reasons)
     return (
-        "[incomplete_work] You stopped without tool calls, but open work remains:\n"
+        "[incomplete_work] 你已停止发起工具调用，但仍有未完成工作：\n"
         f"{bullets}\n"
-        "Do not claim the task is done. Continue with tools (or update todos / "
-        "wait for subagents) until the work is actually finished."
+        "不要声称任务已完成。请继续使用工具（更新 todo / 等待或汇总子 agent），"
+        "直到工作真正做完。\n"
+        "(Do not claim done — continue with tools until open work is finished.)"
     )

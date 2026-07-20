@@ -214,6 +214,16 @@ class SubagentCoordinator:
             e = self._entries.get(subagent_id)
             return None if e is None else _copy_snap(e.snapshot)
 
+    def todo_state_for(self, subagent_id: str) -> Any | None:
+        """Child-local TodoState (never MAIN's). For TUI / resume inspect."""
+        with self._lock:
+            e = self._entries.get(subagent_id)
+            if e is None:
+                return None
+            rs = getattr(e.request, "_child_runtime_state", None) or {}
+            res = rs.get("resources")
+            return getattr(res, "todo_state", None) if res is not None else None
+
     def list_for_parent(self, parent_session_id: str) -> list[SubagentSnapshot]:
         with self._lock:
             return [
@@ -815,19 +825,45 @@ def make_child_runner(
 
                 parent_scheduler = Scheduler()
 
-        from codedoggy.tools.grok_build.todo_logic import TodoState
+        from codedoggy.tools.grok_build.todo_logic import (
+            TodoState,
+            load_todo_state,
+            save_todo_state,
+        )
 
+        # Grok: each subagent has its own TodoState. Never share MAIN's list —
+        # only resume *this* child's prior resources (same subagent_id).
         todo_state = (
             prior_resources.todo_state if prior_resources is not None else None
         )
         if not isinstance(todo_state, TodoState):
             todo_state = TodoState()
+        parent_todo = _parent_resource(parent_session, "todo_state")
+        if parent_todo is not None and todo_state is parent_todo:
+            todo_state = TodoState()
+        # Disk resume under *parent* cwd (survive worktree cleanup).
+        # Child session_id is ``parent:subagent_id`` (same as loop).
+        child_todo_sid = f"{request.parent_session_id}:{request.id}"
+        todo_disk_cwd = Path(parent_cwd).resolve()
+        if todo_state.is_empty():
+            try:
+                disk_todo = load_todo_state(
+                    cwd=todo_disk_cwd, session_id=child_todo_sid
+                )
+                if disk_todo is not None and not disk_todo.is_empty():
+                    todo_state = disk_todo
+            except Exception:  # noqa: BLE001
+                logger.debug("load child todo_state failed", exc_info=True)
 
         mode_state = (
             prior_resources.session_mode_state
             if prior_resources is not None
             else None
         )
+        # Fresh child: Inactive plan tracker (do not inherit parent plan gate).
+        parent_mode = _parent_resource(parent_session, "session_mode_state")
+        if mode_state is not None and parent_mode is not None and mode_state is parent_mode:
+            mode_state = None
         if definition.session_mode.value == "plan" and mode_state is None:
             from codedoggy.orchestration.session_mode import SessionModeState
 
@@ -856,15 +892,13 @@ def make_child_runner(
             ),
         )
 
-        # go-steer Q3: children inherit parent's planRecorded via shared gate
-        parent_plan_first = _parent_resource(parent_session, "plan_first_gate")
-
         tool_extra: dict[str, Any] = {
             "kernel": child_resources,
             "is_subagent": True,
             "subagent_id": request.id,
             "subagent_type": request.subagent_type,
             "parent_session_id": request.parent_session_id,
+            "session_id": child_todo_sid,
             "platform": "subagent",
             "session_mode_state": mode_state,
             "task_manager": parent_task_manager,
@@ -874,8 +908,6 @@ def make_child_runner(
             "isolation": isolation_mode.value,
             "resumed": is_resume,
         }
-        if parent_plan_first is not None:
-            tool_extra["plan_first_gate"] = parent_plan_first
         # Media extras follow the parent's ActiveConnection (same login as MAIN).
         parent_connection = _parent_resource(parent_session, "connection")
         if parent_connection is not None:
@@ -1040,6 +1072,32 @@ def make_child_runner(
                 logger.debug("parent on_delegation failed", exc_info=True)
 
         live = _serialize_messages(loop.messages)
+        todo_meta: dict[str, Any] = {}
+        try:
+            from codedoggy.tools.grok_build.todo_logic import count_todos
+
+            if isinstance(todo_state, TodoState):
+                # Flush under parent cwd so worktree cleanup cannot drop it.
+                try:
+                    save_todo_state(
+                        todo_state, cwd=todo_disk_cwd, session_id=child_todo_sid
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.debug("save child todo_state failed", exc_info=True)
+                if not todo_state.is_empty():
+                    badge = count_todos(todo_state).badge_text()
+                    todo_meta["todo_badge"] = badge
+                    todo_meta["todos"] = [
+                        {
+                            "id": tid,
+                            "content": item.content,
+                            "status": item.status,
+                        }
+                        for tid, item in todo_state.todo_items_with_ids()
+                    ]
+        except Exception:  # noqa: BLE001
+            logger.debug("child todo metadata failed", exc_info=True)
+
         return SubagentSnapshot(
             subagent_id=request.id,
             subagent_type=request.subagent_type,
@@ -1066,6 +1124,7 @@ def make_child_runner(
                 ),
                 "resumed": is_resume,
                 "message_count": len(live),
+                **todo_meta,
             },
         )
 

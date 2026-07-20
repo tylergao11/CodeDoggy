@@ -147,8 +147,9 @@ _GROK_PRODUCT_IDS: list[str] = [
     "Doggy:ask_user_question",
     "Doggy:web_search",
     "Doggy:web_fetch",
-    "Doggy:memory_search",
-    "Doggy:memory_get",
+    # NOTE: Grok has memory_search/memory_get in upstream toolset, but
+    # CodeDoggy memory is Hermes-only (memory + session_search). Do not list
+    # Grok read-memory tools on the product surface — they are opt-in wire only.
     "Doggy:lsp",
     "Doggy:apply_patch",
     "Doggy:image_gen",
@@ -157,13 +158,12 @@ _GROK_PRODUCT_IDS: list[str] = [
     "Doggy:reference_to_video",
 ]
 
-# CodeDoggy-only tools — never claim these are Grok product surface.
+# CodeDoggy fusion extras (Hermes memory + product parallel) — not "Grok memory".
 _DOGGY_ENHANCEMENT_IDS: list[str] = [
-    "Doggy:memory",  # Hermes write surface
-    "Doggy:session_search",
+    "Doggy:memory",  # Hermes curated write
+    "Doggy:session_search",  # Hermes FTS past turns
     "Doggy:code_nav",
-    "Doggy:parallel_tasks",  # MAIN aggressive parallel fan-out + aggregate
-    "Doggy:record_plan",  # go-steer plan-first RequirePlanArtifact escape valve
+    "Doggy:parallel_tasks",  # MAIN opt-in multi-spawn
 ]
 
 

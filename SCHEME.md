@@ -2,13 +2,30 @@
 
 CodeDoggy 的运行时结构说明。实现以本仓库源码为准。
 
+**整合定位：** **GrokBuild** 基础工程 + **Hermes** 记忆，在 CodeDoggy 壳上融合。
+不是完整 Grok pager 或完整 Hermes 宿主的逐文件复刻。
+
+## 融合硬规则（禁止混用）
+
+| 域 | 唯一真源 | 默认产品面 | 禁止 |
+|----|----------|------------|------|
+| **记忆** | Hermes | `memory` + `session_search` + 冻结 MEMORY/USER 注入 SYSTEM；prefetch 围栏进当前 USER | 默认暴露 Grok `memory_search` / `memory_get`；默认注入 `memory_backend` |
+| **基础工程** | GrokBuild | plan 四态、todo、两阶段工具、edit gate、subagent 契约 | 自创 plan 语义；用 Hermes 替代 plan/todo |
+
+**Plan 文件（Grok）：** `{cwd}/.grok/sessions/<session_id>/plan.md`  
+（工具无 session 时的 fallback 才是 `cwd/.grok/plan.md`。）
+
+**Edit gate（Grok）：** 仅 `Active`；`ExitPending` 不挡写。
+
+**Grok 读记忆工具：** 仅 `register_optional_grok_memory_tools()` + `CODEDOGGY_GROK_MEMORY_BACKEND=1` 实验路径。
+
 ## 上位规则
 
 | 角色 | 职责 |
 |------|------|
 | **MAIN** | 主 agent：拆任务、派工、汇总；runtime 不替它自动并行 |
-| **Turn loop** | 采样、两阶段工具、压缩、插话、plan/goal |
-| **Memory** | curated 笔记 + 会话 FTS；prefetch 进当前 USER，不升权 SYSTEM |
+| **Turn loop** | 采样、两阶段工具、压缩、插话、plan/goal（GrokBuild） |
+| **Memory** | Hermes：curated 笔记 + 会话 FTS；prefetch 进当前 USER，不升权 SYSTEM |
 | **Graph** | 代码导航（定义/引用），挂在读能力上 |
 | **Connection** | 登录所选 provider 的凭证与 base_url；聊天与媒体工具共用 |
 
@@ -61,10 +78,11 @@ Session          outer lifecycle, cwd, extensions
 
 Core: `read_file` · `search_replace` · `list_dir` · `grep` · `run_terminal_cmd`  
 Tasks: `get_task_output` · `kill_task` · `monitor` · `spawn_subagent` · `parallel_tasks` · `get_subagent_output`  
-Orchestration: `todo_write` · `update_goal` · `record_plan` · `enter_plan_mode` · `exit_plan_mode` · `ask_user_question`  
+Orchestration: `todo_write` · `update_goal` · `enter_plan_mode` · `exit_plan_mode` · `ask_user_question`  
 Web: `web_search` · `web_fetch`  
 Scheduler: `scheduler_create` · `scheduler_delete` · `scheduler_list`  
 Extras: `memory` · `session_search` · `code_nav` · `image_gen` · `image_edit` · video tools  
+（无默认 `memory_search` / `memory_get` — Hermes 记忆面）  
 
 Host wiring: `RuntimeKernel.task_manager` + `scheduler` via `tool_extra`。
 
@@ -80,10 +98,10 @@ user prompt
        sample(messages, tools)
        archive ASSISTANT
        if no tool_calls → incomplete-work gate
-         (todos / subagents / bg shell tasks only; plan-first is prepare-only)
+         (todos / subagents / bg shell tasks only)
          else → done
        else three-phase tools:
-         Phase1 prepare ALL (schema · pre_tool_use · plan-first · plan gate · policy)
+         Phase1 prepare ALL (schema · pre_tool_use · plan-mode gate · policy)
          Phase2 execute approved (path-lock parallel when safe)
          Phase3 writeback in emission order + after_tool / after_mutation
        exit: completed | max_turns | cancelled | permission_reject | aborted | error
@@ -103,8 +121,7 @@ user prompt
 | Agent config | `AgentDefinition` / `Agent` |
 | Tool prepare/execute | `tool_pipeline.execute_tool_calls_two_phase` |
 | Path lock | `path_lock.lock_path_for_args` |
-| Plan mode | `SessionModeState` + `plan_mode_edit_gate` |
-| Plan-first | go-steer `PlanFirstGate` + `record_plan` (mutate gated until recorded) |
+| Plan mode | `SessionModeState` + `plan_mode_edit_gate` + enter/exit tools (GrokBuild) |
 | Interjection / queue | `InterjectionBuffer` / `PromptQueue` |
 | Subagents | `SubagentCoordinator` + child `run_agent_loop` |
 | Capability | `read-only` / `read-write` / `execute` / `all` |

@@ -11,8 +11,13 @@ Maps 1:1 where practical:
 
 from __future__ import annotations
 
+import json
+import logging
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Iterable, Iterator, Optional
+
+logger = logging.getLogger(__name__)
 
 
 # ── statuses / priority (mod.rs) ─────────────────────────────────────
@@ -111,6 +116,107 @@ class TodoState:
     def get(self, todo_id: str) -> TodoItem | None:
         return self._items.get(todo_id)
 
+    def to_json_dict(self) -> dict[str, Any]:
+        """Serializable snapshot (Grok write_plan_state / tool TodoState)."""
+        todos: list[dict[str, Any]] = []
+        for tid, item in self.todo_items_with_ids():
+            row: dict[str, Any] = {
+                "id": tid,
+                "content": item.content,
+                "status": item.status,
+                "priority": item.priority,
+            }
+            if item.meta is not None:
+                row["meta"] = item.meta
+            todos.append(row)
+        return {"todos": todos}
+
+    @classmethod
+    def from_json_dict(cls, data: dict[str, Any] | None) -> TodoState:
+        state = cls()
+        if not data:
+            return state
+        raw = data.get("todos")
+        if not isinstance(raw, list):
+            return state
+        for row in raw:
+            if not isinstance(row, dict):
+                continue
+            tid = row.get("id")
+            if tid is None:
+                continue
+            tid_s = str(tid)
+            content = row.get("content")
+            content_s = str(content) if content is not None else tid_s
+            status = str(row.get("status") or "pending")
+            if status not in VALID_STATUSES:
+                status = "pending"
+            priority = str(row.get("priority") or "medium")
+            state.push(
+                tid_s,
+                TodoItem(
+                    content=content_s,
+                    status=status,
+                    priority=priority,
+                    meta=row.get("meta"),
+                ),
+            )
+        return state
+
+
+def _safe_session_dir_segment(session_id: str) -> str:
+    """Filesystem-safe session folder name (Windows forbids ``:`` in paths)."""
+    # Child agents use ``parent:sub_id`` as logical session_id — map to parent__sub_id.
+    s = str(session_id or "").strip() or "default"
+    for ch in (":", "/", "\\", "<", ">", "|", "*", "?", '"'):
+        s = s.replace(ch, "__")
+    return s
+
+
+def todo_state_json_path(cwd: Path | str, session_id: str) -> Path:
+    """``{cwd}/.grok/sessions/<session_id>/todo_state.json``."""
+    seg = _safe_session_dir_segment(session_id)
+    return Path(cwd).resolve() / ".grok" / "sessions" / seg / "todo_state.json"
+
+
+def save_todo_state(
+    state: TodoState,
+    *,
+    cwd: Path | str,
+    session_id: str,
+) -> Path | None:
+    """Write todo_state.json; best-effort."""
+    try:
+        path = todo_state_json_path(cwd, session_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(state.to_json_dict(), ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        return path
+    except OSError:
+        logger.debug("save_todo_state failed", exc_info=True)
+        return None
+
+
+def load_todo_state(
+    *,
+    cwd: Path | str,
+    session_id: str,
+) -> TodoState | None:
+    """Load todo_state.json; None if missing/unreadable."""
+    path = todo_state_json_path(cwd, session_id)
+    try:
+        if not path.is_file():
+            return None
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            return None
+        return TodoState.from_json_dict(raw)
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        logger.debug("load_todo_state failed path=%s", path, exc_info=True)
+        return None
+
 
 # ── errors (Display strings from TodoError) ──────────────────────────
 
@@ -186,6 +292,50 @@ def summarize_todo_state(state: TodoState) -> str:
         lines.append(f"- {status_tag(item.status)} {tid}: {item.content}")
     # writeln! leaves a trailing newline on the last line
     return "\n".join(lines) + "\n"
+
+
+@dataclass(frozen=True, slots=True)
+class TodoCounts:
+    """Grok TodoCounts — status-bar plan progress badge."""
+
+    in_progress: int = 0
+    pending: int = 0
+    completed: int = 0
+    cancelled: int = 0
+
+    def total(self) -> int:
+        return self.in_progress + self.pending + self.completed + self.cancelled
+
+    def total_excluding_cancelled(self) -> int:
+        """Denominator of done/total badge (cancelled excluded)."""
+        return self.in_progress + self.pending + self.completed
+
+    def badge_text(self) -> str | None:
+        """``2/5`` style fraction, or None when nothing to show."""
+        total = self.total_excluding_cancelled()
+        if total <= 0:
+            return None
+        return f"{self.completed}/{total}"
+
+
+def count_todos(state: TodoState | None) -> TodoCounts:
+    """Aggregate status counts (Grok TodoPane::counts)."""
+    if state is None or state.is_empty():
+        return TodoCounts()
+    ip = pend = done = canc = 0
+    for item in state.todo_items():
+        st = (item.status or "pending").lower()
+        if st == "in_progress":
+            ip += 1
+        elif st == "completed":
+            done += 1
+        elif st == "cancelled":
+            canc += 1
+        else:
+            pend += 1
+    return TodoCounts(
+        in_progress=ip, pending=pend, completed=done, cancelled=canc
+    )
 
 
 def effective_merge(merge: bool, state: TodoState, updates: list[TodoUpdate]) -> bool:

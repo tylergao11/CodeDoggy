@@ -164,4 +164,39 @@ class TodoWriteTool(Tool):
 
         # Grok prompt_text = summary_for_prompt (or DuplicateId string).
         # No "Todos updated." prefix.
-        return apply_todo_write(state, merge=merge, updates=updates)
+        out = apply_todo_write(state, merge=merge, updates=updates)
+        bag = ctx.extra if ctx.extra is not None else {}
+        # Persist then notify host (Grok write_plan_state after mutation).
+        # Child agents use session_id ``parent:sub_id`` (isolated todo file).
+        kernel = bag.get("kernel")
+        if kernel is not None and hasattr(kernel, "persist_todo_state"):
+            try:
+                kernel.persist_todo_state()
+            except Exception:  # noqa: BLE001
+                pass
+        else:
+            try:
+                from codedoggy.tools.grok_build.todo_logic import save_todo_state
+
+                sid = str(
+                    getattr(ctx, "session_id", None)
+                    or bag.get("session_id")
+                    or (
+                        f"{bag.get('parent_session_id')}:{bag.get('subagent_id')}"
+                        if bag.get("parent_session_id") and bag.get("subagent_id")
+                        else ""
+                    )
+                    or getattr(kernel, "session_id", None)
+                    or ""
+                )
+                if sid and ctx.cwd is not None:
+                    save_todo_state(state, cwd=ctx.cwd, session_id=sid)
+            except Exception:  # noqa: BLE001
+                pass
+        notify = bag.get("todo_changed_fn")
+        if callable(notify):
+            try:
+                notify()
+            except Exception:  # noqa: BLE001
+                pass
+        return out

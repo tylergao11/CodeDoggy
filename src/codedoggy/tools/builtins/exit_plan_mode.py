@@ -10,10 +10,11 @@ Ported from grok-build:
 Host vs Grok Resources (honest X/C):
   - Plan file read from disk (NOT from tool args) — same as Grok
   - Empty model input ``{}`` — approval UI is client/host side
-  - PlanModeExited notification → host inject kernel.exit_plan_mode /
-    session_mode_state.exit_plan when wired; optional plan_mode_exit_fn for
-    ACP-style outcome (approved/cancelled/abandoned)
-  - Does **not** invent a full plan kernel or accept plan content as input
+  - PlanModeExited → host ``plan_mode_exit_fn`` (approved/cancelled/abandoned);
+    cancelled keeps plan active (Grok Cancelled)
+  - Resume re-park: kernel ``wait_or_resolve_parked_plan_approval`` re-invokes
+    the same host exit_fn when ``awaiting_plan_approval`` (no full ACP bus)
+  - Does **not** invent ACP ``x.ai/exit_plan_mode`` JSON-RPC
 """
 
 from __future__ import annotations
@@ -125,38 +126,54 @@ class ExitPlanModeTool(Tool):
             elif isinstance(result, str):
                 host_outcome = result
 
-        # Session mode switch (NotificationHandle stand-in) — best-effort
-        approved = host_outcome not in {"cancelled", "abandoned"}
+        # Session mode switch (NotificationHandle stand-in) — best-effort.
+        # Grok shell: Cancelled keeps plan mode Active; Abandoned deactivates;
+        # Approved deactivates after user OK.
         kernel = bag.get("kernel")
         mode_state = bag.get("session_mode_state")
         if mode_state is None and kernel is not None:
             mode_state = getattr(kernel, "session_mode_state", None)
 
-        if host_outcome in {"cancelled", "abandoned"}:
-            # Host rejected — exit plan mode without "approved" model message
+        if host_outcome == "cancelled":
+            # Stay in plan mode (Grok PlanApprovalOutcome::Cancelled).
+            return _revise_plan_message(
+                plan_content=plan_content,
+                feedback=host_feedback,
+            )
+
+        if host_outcome == "abandoned":
             if kernel is not None and hasattr(kernel, "exit_plan_mode"):
                 try:
-                    kernel.exit_plan_mode(approved=False)
+                    kernel.exit_plan_mode(approved=False, reason="abandoned")
+                except TypeError:
+                    try:
+                        kernel.exit_plan_mode(approved=False)
+                    except Exception:  # noqa: BLE001
+                        pass
                 except Exception:  # noqa: BLE001
                     pass
             elif mode_state is not None and hasattr(mode_state, "exit_plan"):
-                mode_state.exit_plan(approved=False)
-            if host_outcome == "cancelled":
-                if host_feedback:
-                    return (
-                        "Plan mode exit cancelled. User feedback: "
-                        f"{host_feedback}"
-                    )
-                return "Plan mode exit cancelled."
+                try:
+                    mode_state.exit_plan(approved=False, reason="abandoned")
+                except TypeError:
+                    mode_state.exit_plan(approved=False)
             return "Plan mode exit abandoned."
 
         if kernel is not None and hasattr(kernel, "exit_plan_mode"):
             try:
-                kernel.exit_plan_mode(approved=True)
+                kernel.exit_plan_mode(approved=True, reason="approved")
+            except TypeError:
+                try:
+                    kernel.exit_plan_mode(approved=True)
+                except Exception:  # noqa: BLE001
+                    pass
             except Exception:  # noqa: BLE001
                 pass
         elif mode_state is not None and hasattr(mode_state, "exit_plan"):
-            mode_state.exit_plan(approved=True)
+            try:
+                mode_state.exit_plan(approved=True, reason="approved")
+            except TypeError:
+                mode_state.exit_plan(approved=True)
 
         bag["last_plan_content"] = plan_content
         bag["plan_file_path"] = plan_file_path
@@ -168,3 +185,23 @@ class ExitPlanModeTool(Tool):
                 plan_file_path=plan_file_path,
             )
         return format_exit_plan_empty(message=EMPTY_PLAN_MESSAGE)
+
+
+def _revise_plan_message(
+    *,
+    plan_content: str | None,
+    feedback: str | None,
+) -> str:
+    """Grok shell revise_plan_message / cancelled-with-empty-plan strings."""
+    if plan_content is None:
+        return (
+            "The user does not want to exit plan mode. "
+            "Continue planning and ask the user what they would like to do."
+        )
+    fb = (feedback or "").strip()
+    if not fb:
+        return (
+            "The user wants to revise the plan. "
+            "Ask the user what changes they would like to make."
+        )
+    return f"The user wants to revise the plan. The user said:\n{fb}"

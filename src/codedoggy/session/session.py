@@ -258,6 +258,91 @@ class Session:
             return
         raise SessionError("session mode not available (no orchestration kernel)")
 
+    def _resolve_parked_plan_then_remind(self, request: TurnRequest) -> TurnRequest:
+        """Grok resume re-park then normal plan turn reminders."""
+        kernel = self._kernel or getattr(self._ext, "kernel", None)
+        injects: list[str] = []
+        if kernel is not None and hasattr(kernel, "wait_or_resolve_parked_plan_approval"):
+            try:
+                parked = kernel.wait_or_resolve_parked_plan_approval()
+            except Exception:  # noqa: BLE001
+                logger.exception("parked plan approval failed")
+                parked = None
+            if parked and str(parked).strip():
+                injects.append(str(parked).strip())
+        request = self._inject_plan_mode_turn_reminder(request)
+        if not injects:
+            return request
+        block = "\n\n".join(
+            f"<system-reminder>\n{p}\n</system-reminder>" for p in injects
+        )
+        text = request.text or ""
+        text = f"{block}\n\n{text}" if text.strip() else block
+        return TurnRequest(
+            text=text,
+            prompt_id=request.prompt_id,
+            metadata=dict(request.metadata or {}),
+        )
+
+    def _inject_plan_mode_turn_reminder(self, request: TurnRequest) -> TurnRequest:
+        """Pending→Active + inject plan/exit system-reminders (Grok turn start)."""
+        kernel = self._kernel or getattr(self._ext, "kernel", None)
+        state = getattr(kernel, "session_mode_state", None) if kernel else None
+        if state is None or not hasattr(state, "begin_turn"):
+            return request
+        try:
+            body = state.begin_turn()
+        except Exception:  # noqa: BLE001
+            logger.exception("plan mode begin_turn failed")
+            return request
+        if kernel is not None:
+            if hasattr(kernel, "refresh_tool_extra"):
+                try:
+                    kernel.refresh_tool_extra()
+                except Exception:  # noqa: BLE001
+                    pass
+            if hasattr(kernel, "persist_plan_mode_state"):
+                try:
+                    kernel.persist_plan_mode_state()
+                except Exception:  # noqa: BLE001
+                    pass
+        if not body or not str(body).strip():
+            return request
+        reminder = f"<system-reminder>\n{body.strip()}\n</system-reminder>"
+        text = request.text or ""
+        if text.strip():
+            text = f"{reminder}\n\n{text}"
+        else:
+            text = reminder
+        return TurnRequest(
+            text=text,
+            prompt_id=request.prompt_id,
+            metadata=dict(request.metadata or {}),
+        )
+
+    def _complete_plan_mode_turn(self) -> None:
+        """ExitPending → Inactive after turn (Grok complete_deferred_exit)."""
+        kernel = self._kernel or getattr(self._ext, "kernel", None)
+        state = getattr(kernel, "session_mode_state", None) if kernel else None
+        if state is None or not hasattr(state, "end_turn"):
+            return
+        try:
+            state.end_turn()
+        except Exception:  # noqa: BLE001
+            logger.exception("plan mode end_turn failed")
+            return
+        if kernel is not None:
+            if hasattr(kernel, "refresh_tool_extra"):
+                try:
+                    kernel.refresh_tool_extra()
+                except Exception:  # noqa: BLE001
+                    pass
+            if hasattr(kernel, "persist_plan_mode_state"):
+                try:
+                    kernel.persist_plan_mode_state()
+                except Exception:  # noqa: BLE001
+                    pass
+
     def enter_goal_mode(self) -> None:
         self._ensure_open()
         kernel = self._kernel or getattr(self._ext, "kernel", None)
@@ -503,6 +588,8 @@ class Session:
                 result = TurnResult(status=TurnStatus.CANCELLED)
                 return result
 
+            request = self._resolve_parked_plan_then_remind(request)
+
             runner = self._ext.turn_runner or StubTurnRunner()
             result = runner.run(request, session=self)
             with self._lock:
@@ -516,6 +603,7 @@ class Session:
             return result
         finally:
             self._notify_turn_listeners("end", request, result)
+            self._complete_plan_mode_turn()
             with self._lock:
                 closing = self._closing
                 if not closing and not self._closed:

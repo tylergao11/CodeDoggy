@@ -102,7 +102,9 @@ def test_detail_body_emits_clickable_image_line(tmp_path: Path) -> None:
 
         return handler
 
-    frags = render_detail_body(snap, 80, path_mouse=path_mouse)
+    frags = render_detail_body(
+        snap, 80, active_filter="tool", path_mouse=path_mouse
+    )
     text = "".join(f[1] for f in frags)
     assert "点击打开" in text
     # At least one fragment carries a mouse handler (3-tuple)

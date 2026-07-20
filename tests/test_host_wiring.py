@@ -28,13 +28,16 @@ def test_memory_backend_search_shapes(tmp_path: Path) -> None:
 
 
 def test_memory_search_tool_with_backend(tmp_path: Path) -> None:
-    from codedoggy.tools import ToolRegistryBuilder
+    from codedoggy.tools.builtins import register_optional_grok_memory_tools
+    from codedoggy.tools.registry import ToolRegistryBuilder
 
     store = MemoryStore(memory_dir=tmp_path / "m")
     store.load_from_disk()
     store.add("memory", "prefer small diffs")
     be = build_memory_backend(store)
-    tools = ToolRegistryBuilder.new().finalize()
+    b = ToolRegistryBuilder.new()
+    register_optional_grok_memory_tools(b)
+    tools = b.finalize(product_surface=False)
     ctx = ToolCallContext(
         cwd=tmp_path,
         extra={"memory_store": store, "memory_backend": be},

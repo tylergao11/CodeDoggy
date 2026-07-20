@@ -49,8 +49,6 @@ class RuntimeKernel:
     task_manager: Any = None  # BackgroundTaskManager
     scheduler: Any = None  # Scheduler
     agent: Any = None  # optional Agent config package
-    # go-steer plan-first (RequirePlanArtifact / planRecorded)
-    plan_first_gate: Any = None  # PlanFirstGate
     # Goal / todo state (model tools)
     todo_state: Any = None
     goal_log: list = field(default_factory=list)
@@ -91,7 +89,6 @@ class RuntimeKernel:
             "graph",
             "mcp_runtime",
             "session_mode_state",
-            "plan_first_gate",
             "interjection_buffer",
             "subagent_coordinator",
             "subagent_run_fn",
@@ -118,6 +115,9 @@ class RuntimeKernel:
             "scheduler_tick",
             "shell_state",
             "plan_file_path",
+            "plan_mode_consent_fn",
+            "plan_mode_exit_fn",
+            "todo_changed_fn",
             "goal_ack_fn",
         }
     )
@@ -151,8 +151,13 @@ class RuntimeKernel:
                 populate(extra)
         if self.session_mode_state is not None:
             extra["session_mode_state"] = self.session_mode_state
-        if self.plan_first_gate is not None:
-            extra["plan_first_gate"] = self.plan_first_gate
+            # Always publish authoritative session plan path (Grok PlanFilePath).
+            try:
+                extra["plan_file_path"] = self._resolve_plan_file_path(
+                    getattr(self.session_mode_state, "plan_file", None) or None
+                )
+            except Exception:  # noqa: BLE001
+                pass
         if self.interjection_buffer is not None:
             extra["interjection_buffer"] = self.interjection_buffer
         if self.subagent_coordinator is not None:
@@ -185,53 +190,254 @@ class RuntimeKernel:
         self.refresh_tool_extra()
         return wire_default_host_extras(self, **opts)
 
+    def _resolve_plan_file_path(self, plan_file: str | None = None) -> str:
+        """Grok PlanModeTracker: ``session_dir/plan.md`` for this session.
+
+        Fallback without session id: tool-layer ``cwd/.grok/plan.md``.
+        """
+        if not plan_file:
+            from codedoggy.orchestration.session_mode import plan_file_for_session
+
+            sid = str(getattr(self, "session_id", "") or "").strip()
+            if sid:
+                return str(plan_file_for_session(self.cwd, sid).resolve())
+            from codedoggy.tools.grok_build.plan_mode import PLAN_FILE_RELATIVE_PATH
+
+            return str((Path(self.cwd) / PLAN_FILE_RELATIVE_PATH).resolve())
+        p = Path(plan_file)
+        if p.is_absolute():
+            return str(p)
+        return str((Path(self.cwd) / p).resolve())
+
+    def persist_plan_mode_state(self) -> None:
+        """Write plan_mode.json after every lifecycle transition (Grok)."""
+        state = self.session_mode_state
+        if state is None:
+            return
+        try:
+            from codedoggy.orchestration.session_mode import save_plan_mode_state
+
+            save_plan_mode_state(
+                state, cwd=self.cwd, session_id=str(self.session_id)
+            )
+        except Exception:  # noqa: BLE001
+            logger.debug("persist_plan_mode_state failed", exc_info=True)
+
+    def load_plan_mode_state(self) -> bool:
+        """Restore plan_mode.json into session_mode_state. Returns True if loaded."""
+        try:
+            from codedoggy.orchestration.session_mode import (
+                load_plan_mode_state,
+            )
+
+            plan_file = self._resolve_plan_file_path(None)
+            restored = load_plan_mode_state(
+                cwd=self.cwd,
+                session_id=str(self.session_id),
+                plan_file=plan_file,
+            )
+            if restored is None:
+                return False
+            self.session_mode_state = restored
+            self.refresh_tool_extra()
+            logger.info(
+                "kernel restored plan_mode session_id=%s phase=%s awaiting=%s",
+                self.session_id,
+                restored.plan_phase,
+                restored.awaiting_plan_approval,
+            )
+            return True
+        except Exception:  # noqa: BLE001
+            logger.debug("load_plan_mode_state failed", exc_info=True)
+            return False
+
+    def persist_todo_state(self) -> None:
+        """Write todo_state.json (Grok write_plan_state / tool TodoState)."""
+        st = self.todo_state
+        if st is None:
+            bag = self.tool_extra if isinstance(self.tool_extra, dict) else {}
+            st = bag.get("todo_state")
+        if st is None:
+            return
+        try:
+            from codedoggy.tools.grok_build.todo_logic import save_todo_state
+
+            save_todo_state(st, cwd=self.cwd, session_id=str(self.session_id))
+        except Exception:  # noqa: BLE001
+            logger.debug("persist_todo_state failed", exc_info=True)
+
+    def load_todo_state(self) -> bool:
+        """Restore todo_state.json. Returns True if loaded."""
+        try:
+            from codedoggy.tools.grok_build.todo_logic import load_todo_state
+
+            restored = load_todo_state(
+                cwd=self.cwd, session_id=str(self.session_id)
+            )
+            if restored is None:
+                return False
+            self.todo_state = restored
+            self.refresh_tool_extra()
+            logger.info(
+                "kernel restored todo_state session_id=%s items=%s",
+                self.session_id,
+                sum(1 for _ in restored.todo_items()),
+            )
+            return True
+        except Exception:  # noqa: BLE001
+            logger.debug("load_todo_state failed", exc_info=True)
+            return False
+
     def enter_plan_mode(self, plan_file: str | None = None) -> None:
-        """Grok enter plan mode — hard gate on non-plan edits."""
+        """Grok enter plan mode — hard activate (tool path → Active)."""
         state = self.session_mode_state
         if state is None:
             from codedoggy.orchestration.session_mode import SessionModeState
 
             state = SessionModeState()
             self.session_mode_state = state
-        state.enter_plan(plan_file)
+        state.enter_plan(self._resolve_plan_file_path(plan_file))
         self.refresh_tool_extra()
+        self.persist_plan_mode_state()
 
-    def exit_plan_mode(self, *, approved: bool = True) -> None:
+    def enter_plan_mode_pending(self, plan_file: str | None = None) -> bool:
+        """User Tab: Pending until next prompt (Grok enter_pending)."""
+        state = self.session_mode_state
+        if state is None:
+            from codedoggy.orchestration.session_mode import SessionModeState
+
+            state = SessionModeState()
+            self.session_mode_state = state
+        changed = state.enter_plan_pending(self._resolve_plan_file_path(plan_file))
+        self.refresh_tool_extra()
+        self.persist_plan_mode_state()
+        return changed
+
+    def user_exit_plan_mode(self, *, turn_in_flight: bool) -> None:
+        """User Tab off: ExitPending if turn running, else Inactive."""
+        state = self.session_mode_state
+        if state is None:
+            return
+        if hasattr(state, "user_exit"):
+            state.user_exit(turn_in_flight=turn_in_flight)
+        else:
+            state.exit_plan(approved=False)
+        self.refresh_tool_extra()
+        self.persist_plan_mode_state()
+
+    def exit_plan_mode(self, *, approved: bool = True, reason: str | None = None) -> None:
         state = self.session_mode_state
         if state is not None:
-            state.exit_plan(approved=approved)
+            try:
+                state.exit_plan(approved=approved, reason=reason)
+            except TypeError:
+                state.exit_plan(approved=approved)
         self.refresh_tool_extra()
+        self.persist_plan_mode_state()
 
-    def replan(self) -> str | None:
-        """go-steer /replan — revoke latest plan artifact + clear planRecorded.
+    # Grok PLAN_APPROVED_IMPLEMENT_MESSAGE (tool_calls.rs)
+    PLAN_APPROVED_IMPLEMENT_MESSAGE = (
+        "The user approved the plan. Implement the plan in plan.md."
+    )
 
-        Returns archived path (or None if nothing to revoke). Model must call
-        record_plan again before mutating tools work.
+    def wait_or_resolve_parked_plan_approval(self) -> str | None:
+        """Grok resume re-park: if awaiting_plan_approval, run host approval.
+
+        Returns optional text to prepend to the next user turn (implement nudge
+        or revise guidance). Returns None when nothing parked / no inject.
         """
-        from codedoggy.orchestration.plan_first import revoke_latest_plan
+        state = self.session_mode_state
+        if state is None or not getattr(state, "awaiting_plan_approval", False):
+            return None
 
-        gate = self.plan_first_gate
-        if gate is None:
-            return None
-        agents = gate.resolve_agents_dir(self.cwd)
-        if agents is None:
-            gate.clear_plan_recorded()
-            self.refresh_tool_extra()
-            return None
-        revoked = revoke_latest_plan(gate, agents)
+        plan_path = str(getattr(state, "plan_file", "") or "")
+        plan_content: str | None = None
+        try:
+            p = Path(plan_path) if plan_path else None
+            if p is not None and not p.is_absolute():
+                p = (Path(self.cwd) / p).resolve()
+            if p is not None and p.is_file():
+                text = p.read_text(encoding="utf-8", errors="replace")
+                plan_content = text if text.strip() else None
+        except OSError:
+            plan_content = None
+
+        bag = self.tool_extra if isinstance(self.tool_extra, dict) else {}
+        exit_fn = bag.get("plan_mode_exit_fn")
+        outcome = "cancelled"
+        feedback: str | None = None
+        if callable(exit_fn):
+            try:
+                result = exit_fn(
+                    {
+                        "plan_content": plan_content,
+                        "plan_file_path": plan_path,
+                        "resume": True,
+                        "tool_call_id": "resume-plan-approval",
+                    }
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception("parked plan approval host failed")
+                result = {"outcome": "cancelled", "feedback": "approval host failed"}
+            if isinstance(result, dict):
+                outcome = str(result.get("outcome") or "cancelled")
+                fb = result.get("feedback")
+                feedback = str(fb) if fb is not None else None
+            elif isinstance(result, str):
+                outcome = result
+        else:
+            # Headless: leave parked; remind model not to implement yet.
+            return (
+                "Plan mode approval is still outstanding from a previous session. "
+                "Do not implement until the user approves the plan "
+                "(exit_plan_mode / host approval)."
+            )
+
+        if outcome == "approved":
+            self.exit_plan_mode(approved=True, reason="approved")
+            return self.PLAN_APPROVED_IMPLEMENT_MESSAGE
+        if outcome == "abandoned":
+            self.exit_plan_mode(approved=False, reason="abandoned")
+            return (
+                "The user abandoned the plan. Plan mode is off. "
+                "Do not call exit_plan_mode again unless asked to re-enter plan mode."
+            )
+        # cancelled / revise — stay in plan mode; clear park so we do not re-block.
+        state.awaiting_plan_approval = False
+        if state.plan_phase != "active":
+            state.enter_plan(plan_path or None)
+        self.persist_plan_mode_state()
         self.refresh_tool_extra()
-        return str(revoked) if revoked is not None else None
+        if plan_content is None:
+            return (
+                "The user does not want to exit plan mode. "
+                "Continue planning and ask the user what they would like to do."
+            )
+        fb = (feedback or "").strip()
+        if not fb:
+            return (
+                "The user wants to revise the plan. "
+                "Ask the user what changes they would like to make."
+            )
+        return f"The user wants to revise the plan. The user said:\n{fb}"
 
     def enter_goal_mode(self) -> None:
-        """Enter goal mode — hard tool gate when blocked (orchestration)."""
+        """Enter goal mode — hard tool gate when blocked (orchestration).
+
+        Clears plan lifecycle (modes exclusive, Grok session mode spirit).
+        """
         state = self.session_mode_state
         if state is None:
             from codedoggy.orchestration.session_mode import SessionModeState
 
             state = SessionModeState()
             self.session_mode_state = state
+        # Leaving plan while entering goal — cancel outstanding approval park.
+        if getattr(state, "awaiting_plan_approval", False):
+            state.awaiting_plan_approval = False
         state.enter_goal()
         self.refresh_tool_extra()
+        self.persist_plan_mode_state()
 
     def exit_goal_mode(self) -> None:
         state = self.session_mode_state
@@ -241,6 +447,7 @@ class RuntimeKernel:
             except TypeError:
                 state.exit_goal()
         self.refresh_tool_extra()
+        self.persist_plan_mode_state()
 
     def interject(self, text: str, *, prompt_id: str | None = None) -> None:
         """Push a mid-turn user message (Grok pending_interjections).
@@ -388,7 +595,12 @@ class RuntimeKernel:
         """Load the *newest* archived messages (tail), not the oldest.
 
         Grok resume is recent-context first. ORDER BY id DESC LIMIT then reverse.
+        Also restores plan_mode.json lifecycle when present.
         """
+        # Plan mode + todos independent of message rows.
+        self.load_plan_mode_state()
+        self.load_todo_state()
+
         if self.session_store is None or self.turn_runner is None:
             return 0
         try:
@@ -428,6 +640,15 @@ class RuntimeKernel:
         """Tear down runtime: context, live history, memory, subagents, store."""
         if self.closed:
             return
+        # Flush plan/todo before marking closed (Grok persist on session end).
+        try:
+            self.persist_plan_mode_state()
+        except Exception:  # noqa: BLE001
+            logger.debug("close: persist_plan_mode_state failed", exc_info=True)
+        try:
+            self.persist_todo_state()
+        except Exception:  # noqa: BLE001
+            logger.debug("close: persist_todo_state failed", exc_info=True)
         self.closed = True
         # Stop host scheduler tick thread if running
         try:

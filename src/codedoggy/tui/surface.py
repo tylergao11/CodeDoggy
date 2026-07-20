@@ -16,25 +16,11 @@ from codedoggy.model.connection import (
 )
 
 
-def get_connection(session: Any) -> ConnectionService | None:
-    return connection_of(session)
-
-
 def active_connection(session: Any) -> ActiveConnection | None:
     svc = connection_of(session)
     if svc is None:
         return None
     return svc.snapshot()
-
-
-def require_connection(session: Any) -> ConnectionService:
-    svc = connection_of(session)
-    if svc is None:
-        raise RuntimeError(
-            "session has no ConnectionService — build_session must attach "
-            "extensions.connection (unified model truth)"
-        )
-    return svc
 
 
 def provider_id(session: Any) -> str:
@@ -74,8 +60,22 @@ def ready_to_sample(session: Any) -> bool:
 
 
 def session_mode_label(session: Any) -> str:
+    """Session mode chip: plan wins over goal when both flags conflict.
+
+    Grok modes are exclusive; prefer live plan_phase, then goal, then mode enum.
+    """
     kernel = getattr(getattr(session, "extensions", None), "kernel", None)
     mode_state = getattr(kernel, "session_mode_state", None)
+    if mode_state is not None:
+        phase = str(getattr(mode_state, "plan_phase", "") or "")
+        if phase == "pending":
+            return "plan…"
+        if phase == "exit_pending":
+            return "plan↓"
+        if phase == "active" or getattr(mode_state, "is_plan", lambda: False)():
+            return "plan"
+        if getattr(mode_state, "is_goal", lambda: False)():
+            return "goal"
     raw_mode = getattr(getattr(mode_state, "mode", None), "value", None)
     return {
         "normal": "auto",
@@ -84,52 +84,30 @@ def session_mode_label(session: Any) -> str:
     }.get(str(raw_mode or "normal"), str(raw_mode or "auto"))
 
 
-def plan_first_label(session: Any) -> str:
-    """HUD fragment when plan-first gate is active and not yet satisfied."""
-    kernel = getattr(getattr(session, "extensions", None), "kernel", None)
-    bag = {
-        "kernel": kernel,
-        "plan_first_gate": getattr(kernel, "plan_first_gate", None) if kernel else None,
-    }
-    try:
-        from codedoggy.orchestration.plan_first import resolve_plan_first_gate
-
-        gate = resolve_plan_first_gate(bag)
-    except Exception:  # noqa: BLE001
-        return ""
-    if gate is None or not gate.require_plan_artifact:
-        return ""
-    if gate.is_plan_recorded():
-        return "plan✓"
-    return "need-plan"
-
-
-def reasoning_text(session: Any) -> str:
-    """Reasoning effort label from active connection (e.g. ``推理:high``)."""
-    snap = active_connection(session)
-    if snap is None:
-        return ""
-    return snap.reasoning_label
-
-
 def model_and_mode_text(session: Any) -> str:
-    """Prompt caption: ``model · 推理:high · auto · need-plan``."""
+    """Prompt caption: ``model · 推理:high · auto|plan``."""
     snap = active_connection(session)
     model = snap.model if snap is not None else "model"
     mode = session_mode_label(session)
     reason = snap.reasoning_label if snap is not None else ""
-    plan = plan_first_label(session)
     parts = [model]
     if reason:
         parts.append(reason)
     parts.append(mode)
-    if plan:
-        parts.append(plan)
     return " · ".join(parts)
 
 
+# Sticky last-known usage so the header does not flash "—" while the model is
+# sampling / awaiting real usage (compactor clears last_prompt_tokens then).
+_budget_sticky: dict[str, tuple[int | None, int | None]] = {}
+
+
 def budget_text(session: Any) -> str:
-    """Token budget line for header — context stats + connection window."""
+    """Token budget line for header — context stats + connection window.
+
+    When ``last_prompt_tokens`` is temporarily ``None`` (reasoning / compact /
+    provider switch), keep showing the last good used count instead of ``—``.
+    """
     context = getattr(getattr(session, "extensions", None), "context", None)
     budget = getattr(context, "budget", None)
     used = getattr(budget, "last_prompt_tokens", None)
@@ -137,10 +115,35 @@ def budget_text(session: Any) -> str:
     if not total:
         snap = active_connection(session)
         total = snap.context_window if snap is not None else None
-    if not total:
+
+    sid = str(getattr(session, "id", "") or id(session))
+    prev_used, prev_total = _budget_sticky.get(sid, (None, None))
+
+    if total is not None:
+        try:
+            total_i = int(total)
+        except (TypeError, ValueError):
+            total_i = prev_total
+    else:
+        total_i = prev_total
+    if not total_i:
         return ""
-    used_text = "—" if used is None else _compact_number(int(used))
-    return f"{used_text} / {_compact_number(int(total))}"
+
+    used_i: int | None
+    if used is not None:
+        try:
+            used_i = int(used)
+        except (TypeError, ValueError):
+            used_i = prev_used
+    else:
+        used_i = prev_used
+
+    _budget_sticky[sid] = (used_i, total_i)
+
+    if used_i is None:
+        # Unknown used: still show window size, never a bare dash.
+        return f"… / {_compact_number(total_i)}"
+    return f"{_compact_number(used_i)} / {_compact_number(total_i)}"
 
 
 def hud_projection(session: Any) -> dict[str, Any]:
@@ -187,7 +190,6 @@ def hud_projection(session: Any) -> dict[str, Any]:
         "reasoning_effort": snap.reasoning_effort if snap is not None else "",
         "reasoning_enabled": bool(snap.reasoning_enabled) if snap is not None else False,
         "mode": session_mode_label(session),
-        "plan_first": plan_first_label(session),
         "any_logged_in": any_in,
         "rows": rows,
         "current_ok": current_ok,

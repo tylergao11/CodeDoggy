@@ -65,7 +65,7 @@ def test_prepare_unknown_tool_is_soft(tmp_path: Path) -> None:
 
 def test_plan_mode_rejects_non_plan_edit(tmp_path: Path) -> None:
     state = SessionModeState()
-    state.enter_plan("plan.md")
+    state.enter_plan(".grok/plan.md")
     tools = ToolRegistryBuilder.new().finalize()
     pre = prepare_tool_call(
         tools,
@@ -89,9 +89,41 @@ def test_plan_mode_rejects_non_plan_edit(tmp_path: Path) -> None:
         cwd=tmp_path,
         kind=ToolKind.Edit,
         tool_name="search_replace",
-        args={"file_path": "plan.md"},
+        args={"file_path": ".grok/plan.md"},
     )
     assert gate == PlanEditGate.ALLOW
+
+
+def test_plan_mode_allows_shell_and_rejects_apply_patch(tmp_path: Path) -> None:
+    """Grok: non-edit tools pass the plan gate; apply_patch always rejected."""
+    from codedoggy.tools.kinds import ToolKind as TK
+
+    state = SessionModeState()
+    state.enter_plan(".grok/plan.md")
+    shell = plan_mode_edit_gate(
+        state,
+        cwd=tmp_path,
+        kind=TK.Execute,
+        tool_name="run_terminal_command",
+        args={"command": "echo hi"},
+    )
+    assert shell == PlanEditGate.ALLOW
+    spawn = plan_mode_edit_gate(
+        state,
+        cwd=tmp_path,
+        kind=TK.Task,
+        tool_name="spawn_subagent",
+        args={"prompt": "explore", "description": "x"},
+    )
+    assert spawn == PlanEditGate.ALLOW
+    patch = plan_mode_edit_gate(
+        state,
+        cwd=tmp_path,
+        kind=TK.Edit,
+        tool_name="apply_patch",
+        args={"patch": "noop"},
+    )
+    assert patch == PlanEditGate.REJECT_NON_PLAN_FILE
 
 
 def test_update_goal_completed_exits_goal_mode(tmp_path: Path) -> None:

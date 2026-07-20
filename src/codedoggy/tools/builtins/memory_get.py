@@ -1,9 +1,13 @@
-"""memory_get — Grok MemoryGetImpl contract.
+"""memory_get — Grok MemoryGetImpl wire surface only (optional).
 
 Ported from:
   grok-build/crates/codegen/xai-grok-tools/src/implementations/memory/get_tool.rs
   grok-build/crates/codegen/xai-grok-tools/src/implementations/memory/types.rs
   (line-slice semantics mirror xai-grok-memory storage::read_file)
+
+Product memory policy (CodeDoggy): **Hermes** — curated memory is already in
+the system prompt; do not guide the model to call this on every turn. Kept for
+Grok wire fidelity and host backends only.
 
 Function map:
   MemoryGetImpl::run              → MemoryGetTool.run

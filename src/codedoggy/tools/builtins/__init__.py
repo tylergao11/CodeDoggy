@@ -8,6 +8,19 @@ if TYPE_CHECKING:
     from codedoggy.tools.registry import ToolRegistryBuilder
 
 
+def register_optional_grok_memory_tools(builder: "ToolRegistryBuilder") -> None:
+    """Opt-in Grok memory_search / memory_get (NOT Hermes product memory).
+
+    Product fusion: Hermes owns memory. These tools are Grok wire surfaces
+    only — register explicitly in tests or experimental hosts; never default.
+    """
+    from codedoggy.tools.builtins.memory_get import MemoryGetTool
+    from codedoggy.tools.builtins.memory_search import MemorySearchTool
+
+    builder.register(MemorySearchTool())
+    builder.register(MemoryGetTool())
+
+
 def register_builtins(builder: ToolRegistryBuilder) -> None:
     from codedoggy.tools.builtins.apply_patch import ApplyPatchTool
     from codedoggy.tools.builtins.ask_user_question import AskUserQuestionTool
@@ -22,11 +35,8 @@ def register_builtins(builder: ToolRegistryBuilder) -> None:
     from codedoggy.tools.builtins.list_dir import ListDirTool
     from codedoggy.tools.builtins.lsp import LspTool
     from codedoggy.tools.builtins.memory import MemoryTool
-    from codedoggy.tools.builtins.memory_get import MemoryGetTool
-    from codedoggy.tools.builtins.memory_search import MemorySearchTool
     from codedoggy.tools.builtins.monitor import MonitorTool
     from codedoggy.tools.builtins.read_file import ReadFileTool
-    from codedoggy.tools.builtins.record_plan import RecordPlanTool
     from codedoggy.tools.builtins.run_terminal_cmd import RunTerminalCmdTool
     from codedoggy.tools.builtins.scheduler_tools import (
         SchedulerCreateTool,
@@ -71,7 +81,6 @@ def register_builtins(builder: ToolRegistryBuilder) -> None:
     # Orchestration
     builder.register(TodoWriteTool())
     builder.register(UpdateGoalTool())
-    builder.register(RecordPlanTool())  # go-steer plan-first escape valve
     builder.register(EnterPlanModeTool())
     builder.register(ExitPlanModeTool())
     builder.register(AskUserQuestionTool())
@@ -90,10 +99,10 @@ def register_builtins(builder: ToolRegistryBuilder) -> None:
     builder.register(SchedulerCreateTool())
     builder.register(SchedulerDeleteTool())
     builder.register(SchedulerListTool())
-    # Memory
+    # Memory (Hermes only on product surface): write `memory` + `session_search`.
+    # Grok memory_search / memory_get are NOT registered by default — see
+    # register_optional_grok_memory_tools() for wire-fidelity tests only.
     builder.register(MemoryTool())
-    builder.register(MemorySearchTool())
-    builder.register(MemoryGetTool())
-    # CodeDoggy enhancements
     builder.register(SessionSearchTool())
+    # CodeDoggy enhancements
     builder.register(CodeNavTool())

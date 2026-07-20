@@ -224,10 +224,6 @@ def build_session(
     )
 
     # Grok orchestration spine: mode + interjection + subagent coordinator
-    from codedoggy.orchestration.plan_first import (
-        PlanFirstGate,
-        require_plan_artifact_from_env,
-    )
     from codedoggy.orchestration.prompt_queue import InterjectionBuffer, PromptQueue
     from codedoggy.orchestration.session_mode import SessionModeState
     from codedoggy.orchestration.subagent import SubagentCoordinator, make_child_runner
@@ -236,15 +232,6 @@ def build_session(
     # Session-level goal → enter goal mode so hard gates + update_goal apply
     if goal and str(goal).strip():
         mode_state.enter_goal()
-    # go-steer RequirePlanArtifact: substrate is opt-in; product default ON
-    # (force think-before-mutate). Tests/CI: CODEDOGGY_REQUIRE_PLAN_ARTIFACT=0
-    import os as _os_plan
-
-    _plan_default = not bool(_os_plan.environ.get("PYTEST_CURRENT_TEST"))
-    plan_first_gate = PlanFirstGate(
-        require_plan_artifact=require_plan_artifact_from_env(default=_plan_default),
-        agents_dir=str(cwd_path / ".agents"),
-    )
     interjections = InterjectionBuffer()
     prompt_queue = PromptQueue()
     # High pool: main agent defaults to parallel fan-out of many children.
@@ -278,7 +265,6 @@ def build_session(
         graph=graph,
         connection=connection,
         session_mode_state=mode_state,
-        plan_first_gate=plan_first_gate,
         interjection_buffer=interjections,
         prompt_queue=prompt_queue,
         subagent_coordinator=subagent_coord,
@@ -357,8 +343,11 @@ def build_session(
         if _os.environ.get("PYTEST_CURRENT_TEST") and _tick_flag is None:
             _tick = False
 
+        # Memory = Hermes (no default Grok memory_backend / memory_search).
+        # Opt-in: CODEDOGGY_GROK_MEMORY_BACKEND=1 + register_optional_grok_memory_tools.
+        _mem_be = _env_flag("CODEDOGGY_GROK_MEMORY_BACKEND") == "on"
         kernel.wire_host_adapters(
-            enable_memory_backend=True,
+            enable_memory_backend=_mem_be,
             enable_ask_user_cli=_ask,
             enable_scheduler_tick=_tick,
             start_scheduler_thread=_tick,
@@ -384,11 +373,21 @@ def build_session(
                     f"{ownership.requested_cwd!r}: {ownership.reason}; "
                     f"stored workspace={ownership.stored_cwd!r}"
                 )
-        # True restore: hydrate live transcript when resuming an existing id
+        # True restore: hydrate live transcript + plan_mode.json when resuming
         if provisional_id:
             n = kernel.hydrate_from_store()
             if n:
                 pass  # live_messages filled
+        else:
+            # Fresh session id may still reattach if files exist for this id
+            try:
+                kernel.load_plan_mode_state()
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                kernel.load_todo_state()
+            except Exception:  # noqa: BLE001
+                pass
 
     # Grok MCP runtime: Session-owned clients, progressive initialization,
     # dispatcher, config diff/reload, and bounded recovery. Start it last so a

@@ -23,7 +23,7 @@ run_agent_loop(..., tool_extra=…)  ──►  ToolCallContext.extra
 Managed set (`_MANAGED_TOOL_EXTRA_KEYS`):
 
 `kernel`, `memory_store`, `session_store`, `policy`, `memory_manager`, `graph`,
-`audit`, `session_mode_state`, `plan_first_gate`, `interjection_buffer`,
+`audit`, `session_mode_state`, `interjection_buffer`,
 `subagent_coordinator`, `subagent_run_fn`, `task_manager`, `scheduler`, `todo_state`.
 
 ---
@@ -40,7 +40,6 @@ Managed set (`_MANAGED_TOOL_EXTRA_KEYS`):
 | `graph` | `graph` | bound | `code_nav` only — **not** LSP |
 | `audit` | `audit` | bound | audit hooks / P0 |
 | `session_mode_state` | `session_mode_state` | bound | plan/goal gates |
-| `plan_first_gate` | `plan_first_gate` | bound | go-steer RequirePlanArtifact / `record_plan` |
 | `interjection_buffer` | `interjection_buffer` | bound | mid-turn interject drain |
 | `subagent_coordinator` | `subagent_coordinator` | bound | `spawn_subagent`, `get_*_output`, `kill_*`, `parallel_tasks` |
 | `subagent_run_fn` | `subagent_run_fn` | bound | child turn runner |

@@ -15,10 +15,6 @@ from typing import Any, Callable
 
 from codedoggy.orchestration.capability import is_mutating_action, is_read_only_kind
 from codedoggy.orchestration.path_lock import PathLockTable, lock_path_for_args
-from codedoggy.orchestration.plan_first import (
-    plan_first_denial,
-    resolve_plan_first_gate,
-)
 from codedoggy.orchestration.session_mode import (
     PLAN_REJECT_MESSAGE,
     PlanEditGate,
@@ -119,22 +115,6 @@ def prepare_tool_call(
                 reason=reason,
                 hook_name=str(meta.get("hook_name") or "pre_tool_use"),
             )
-
-    # go-steer plan-first pre-check — BEFORE mode/policy (even yolo respects it).
-    # Soft deny (HOOK_DENY): return error observation and keep the batch/turn
-    # alive so the model can call record_plan in the same round. Hard PLAN_REJECT
-    # would cancel siblings and exit the turn as permission_reject — wrong for
-    # the escape-valve workflow.
-    plan_first = resolve_plan_first_gate(extra)
-    denied = plan_first_denial(plan_first, name)
-    if denied is not None:
-        return PrecheckResult(
-            verdict=PrecheckVerdict.HOOK_DENY,
-            observation=f"Error (plan_first): {denied}",
-            tool_name=name,
-            reason=denied,
-            hook_name="plan_first",
-        )
 
     # Plan mode hard gate (Grok plan_mode_edit_gate — independent of yolo)
     if mode_state is not None:

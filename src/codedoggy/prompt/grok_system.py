@@ -35,8 +35,10 @@ _EDIT = "search_replace"
 _EXECUTE = "run_terminal_command"
 _MONITOR = "monitor"
 _BG_OUTPUT = "get_command_or_subagent_output"
-_MEMORY_SEARCH = "memory_search"
-_MEMORY_GET = "memory_get"
+# Memory guidance is Hermes (agent/prompt_builder.py MEMORY_GUIDANCE /
+# SESSION_SEARCH_GUIDANCE) — not Grok memory_search/memory_get reads.
+# Curated MEMORY.md/USER.md is frozen into the system prompt; the model
+# writes via `memory` and recalls past turns via `session_search`.
 
 
 def render_grok_base_prompt(
@@ -229,9 +231,21 @@ Current Date: {current_date}
     )
 
     if memory_enabled:
-        head += f"""
+        # Source: hermes-agent/agent/prompt_builder.py MEMORY_GUIDANCE +
+        # SESSION_SEARCH_GUIDANCE. Do NOT push Grok memory_search/get —
+        # that caused plan-mode "hello" turns to spam memory reads and
+        # freeze the task-detail UI.
+        head += """
 <memory>
-Use `{_MEMORY_SEARCH}` and `{_MEMORY_GET}` to recall past decisions and context. Search memory proactively for prior work or conventions.
+You have persistent memory across sessions. Curated MEMORY.md / USER.md are already injected into this system prompt as a frozen snapshot — do not call tools just to re-read them.
+
+Save durable facts with the `memory` tool (add / replace / remove / batch): user preferences, environment details, tool quirks, stable conventions. Keep entries compact; memory is re-injected every turn.
+
+Prioritize what reduces future user steering. Do NOT save task progress, PR/issue numbers, commit SHAs, "Phase N done", or anything stale in ~7 days — use `session_search` to recall those from past transcripts.
+
+Write declarative facts, not self-instructions: "User prefers concise responses" ✓ — "Always respond concisely" ✗.
+
+When the user references a past conversation or you need cross-session context, use `session_search` before asking them to repeat themselves.
 </memory>
 """
     return head.rstrip() + "\n"
@@ -247,9 +261,9 @@ def codedoggy_product_appendix() -> str:
 ## CodeDoggy product (not Grok template)
 
 - Prefer `code_nav` for go-to-definition / find-references (code graph); `grep` for free text.
-- Use `session_search` for past conversations; curated MEMORY.md is injected at session start when memory is enabled.
+- Memory is Hermes-shaped: curated MEMORY.md/USER.md is frozen into the system prompt; write with `memory`; recall past turns with `session_search`. Do not spam read tools for curated memory (no proactive memory_search/memory_get loops).
 - Workspace policy may deny writes to protected paths (`.git`, `.env`, …).
-- Plan-first (go-steer): when require_plan_artifact is on, call `record_plan` with a non-empty markdown plan before any write / shell / spawn. Research tools stay allowed. Recording the plan unblocks mutation for the session (no user approval step).
+- Plan mode (GrokBuild `plan_mode.rs` + 19-plan-mode.md): for ambiguous work, call `enter_plan_mode` (user may approve), explore and write the plan file, then `exit_plan_mode` for user approval before coding. In plan mode only the plan file is writable. After approval you are in auto mode and may implement (including parallel fan-out).
 
 ### MAIN parallel-first principle (you decide — nothing auto-fans-out)
 The harness does **not** split work or run agents for you. Parallelism happens only when **you** call tools. Your default decision rule is parallel-first: dispatch independent work concurrently whenever it is safe and useful, while keeping ordering-sensitive integration on MAIN.

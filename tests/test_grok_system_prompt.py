@@ -68,7 +68,10 @@ def test_subagent_base_parallelize_tool_calls() -> None:
     assert "AGENTS.md" in text
     assert "Workspace Path: /tmp/ws" in text or "Workspace Path:" in text
     assert "<memory>" in text
-    assert "memory_search" in text
+    # Hermes memory surface — not Grok memory_search/get read spam
+    assert "session_search" in text
+    assert "memory_search" not in text
+    assert "memory_get" not in text
 
 
 def test_subagent_with_role_instructions() -> None:

@@ -129,13 +129,22 @@ def test_bash_description_grok_timeout_enforcement() -> None:
     assert "background" in props
 
 
+def _grok_memory_tools():
+    from codedoggy.tools.builtins import register_optional_grok_memory_tools
+    from codedoggy.tools.registry import ToolRegistryBuilder
+
+    b = ToolRegistryBuilder.new()
+    register_optional_grok_memory_tools(b)
+    return b.finalize(product_surface=False)
+
+
 def test_memory_get_zero_based_from(tmp_path: Path) -> None:
     from codedoggy.memory.store import MemoryStore
 
     mem = MemoryStore(memory_dir=tmp_path / "m")
     mem.load_from_disk()
     (mem.memory_dir / "MEMORY.md").write_text("lineA\nlineB\nlineC\n", encoding="utf-8")
-    tools = ToolRegistryBuilder.new().finalize()
+    tools = _grok_memory_tools()
     ctx = ToolCallContext(cwd=tmp_path, extra={"memory_store": mem})
     out = tools.call(
         "memory_get",
@@ -150,7 +159,7 @@ def test_memory_get_zero_based_from(tmp_path: Path) -> None:
 
 
 def test_memory_get_disabled_soft_message(tmp_path: Path) -> None:
-    tools = ToolRegistryBuilder.new().finalize()
+    tools = _grok_memory_tools()
     ctx = ToolCallContext(cwd=tmp_path, extra={})
     out = tools.call("memory_get", {"path": "MEMORY.md"}, ctx)
     assert "not enabled" in out.lower()

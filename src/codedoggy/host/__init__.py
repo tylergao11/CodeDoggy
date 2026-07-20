@@ -39,12 +39,14 @@ def wire_default_host_extras(kernel: "RuntimeKernel", **opts: Any) -> dict[str, 
     Returns a dict of keys newly set (for tests/logging).
 
     Options:
-      enable_memory_backend: bool = True when memory store present
+      enable_memory_backend: bool = False (Grok memory_search host only; Hermes
+          product path does not inject this — opt-in experimental)
       enable_ask_user_cli: bool = False (opt-in; avoid hanging tests)
       enable_scheduler_tick: bool = False (opt-in; does NOT auto-start a thread —
           only attaches a ``scheduler_tick`` handle with helpers for the host)
     """
-    enable_memory_backend = opts.get("enable_memory_backend", True)
+    # Fusion: Hermes owns memory. Grok memory_backend is opt-in only.
+    enable_memory_backend = opts.get("enable_memory_backend", False)
     enable_ask_user_cli = opts.get("enable_ask_user_cli", False)
     enable_scheduler_tick = opts.get("enable_scheduler_tick", False)
     start_scheduler_thread = opts.get("start_scheduler_thread", True)

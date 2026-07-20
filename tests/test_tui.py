@@ -20,11 +20,13 @@ from codedoggy.tui.app import (
     _compact_task_stage_text,
     _render_doggy_empty,
     _task_activity_text,
+    _task_list_summary,
     _task_status_style,
     _task_stage_text,
     agent_summary_text_from_messages,
     task_report_from_agent,
 )
+from codedoggy.tui import surface as session_surface
 from codedoggy.tui.model import TaskLedger
 from codedoggy.turn import AgentTurnRunner
 from codedoggy.turn.types import Message, Role, SampleResult, ToolCall
@@ -40,7 +42,9 @@ class _Session:
             kernel=SimpleNamespace(
                 subagent_coordinator=SimpleNamespace(
                     list_for_parent=lambda _: list(self.subagents)
-                )
+                ),
+                todo_state=None,
+                tool_extra={},
             ),
             context=SimpleNamespace(
                 budget=SimpleNamespace(last_prompt_tokens=82000, context_window=500000)
@@ -174,14 +178,15 @@ def test_open_agent_uses_full_turn_transcript_including_tool_details() -> None:
 
         detail = "".join(fragment[1] for fragment in tui._render_modal_body())
         assert "我先运行定向测试" in detail
-        assert "$ pytest tests/test_tui.py -q" in detail
-        assert "12 passed in 0.84s" in detail
         filters = "".join(fragment[1] for fragment in tui._render_modal_filters())
-        assert "F1 全部" in filters and "F5 测试" in filters
+        assert "消息" in filters and "工具" in filters
+        assert "全部" not in filters and "F1" not in filters
 
-        tui._set_detail_filter("test")
+        tui._set_detail_filter("tool")
         filtered = "".join(fragment[1] for fragment in tui._render_modal_body())
-        assert "pytest tests/test_tui.py -q" in filtered
+        # Grok collapsed default: one-line tool headline, no body dump.
+        assert "Ran" in filtered and "pytest" in filtered
+        assert "12 passed in 0.84s" not in filtered
         assert "我先运行定向测试" not in filtered
 
 
@@ -220,9 +225,12 @@ def test_real_session_runner_flows_into_clicked_main_detail(tmp_path: Path) -> N
 
             detail = "".join(fragment[1] for fragment in tui._render_modal_body())
             assert "我先读取真实文件" in detail
-            assert "target_file: detail.txt" in detail
-            assert "full transcript payload" in detail
             assert "真实链路读取完成" in detail
+            tui._set_detail_filter("tool")
+            tools = "".join(fragment[1] for fragment in tui._render_modal_body())
+            # Collapsed: Grok-style "Read detail.txt", details on expand.
+            assert "Read" in tools and "detail.txt" in tools
+            assert "full transcript payload" not in tools
     finally:
         session.close()
 
@@ -230,9 +238,11 @@ def test_real_session_runner_flows_into_clicked_main_detail(tmp_path: Path) -> N
 def test_task_report_is_the_agents_first_brief_paragraph() -> None:
     text = "## 已完成\n入口已经接通。\n\n后面是只有点开 Agent 才需要看的大量细节。"
     assert task_report_from_agent(text) == "已完成 入口已经接通。"
-    # Hard-cap only — no ellipsis; list UI paints animated ==> when truncated.
+    # Full first paragraph kept; optional soft cap only when caller asks.
     long = task_report_from_agent("x" * 400)
-    assert len(long) == 260
+    assert len(long) == 400
+    capped = task_report_from_agent("x" * 400, max_chars=260)
+    assert len(capped) == 260
     assert not long.endswith("…")
     assert not long.endswith("...")
 
@@ -341,10 +351,11 @@ def test_parallel_runtime_uses_child_descriptions_as_clickable_participants() ->
         assert snapshot.phase == "parallel"
         assert _task_stage_text(snapshot) == "3 个 Agent 并行中"
         rendered = "".join(fragment[1] for fragment in tui._render_tasks())
-        assert "API 入口" in rendered and "交互验证" in rendered
-        assert rendered.count("╭") >= 3
-        assert "正在检查 API" in rendered
-        assert "正在验证交互" in rendered
+        # Homepage cards stay compact — no ↳ MAIN / child agent rows (avoids jiggle).
+        assert "↳" not in rendered
+        assert "正在检查 API" not in rendered
+        assert "正在验证交互" not in rendered
+        assert "调用中" not in rendered
 
 
 def test_child_agent_detail_uses_serialized_runtime_transcript() -> None:
@@ -389,8 +400,10 @@ def test_child_agent_detail_uses_serialized_runtime_transcript() -> None:
 
         detail = "".join(fragment[1] for fragment in tui._render_modal_body())
         assert "我先读取详情入口" in detail
-        assert "path: src/codedoggy/tui/app.py" in detail
-        assert "def _open_agent" in detail
+        tui._set_detail_filter("tool")
+        tools = "".join(fragment[1] for fragment in tui._render_modal_body())
+        assert "Read" in tools and "app.py" in tools
+        assert "def _open_agent" not in tools
 
 
 def test_running_child_detail_does_not_fake_unavailable_tool_history() -> None:
@@ -414,7 +427,7 @@ def test_running_child_detail_does_not_fake_unavailable_tool_history() -> None:
         tui._open_agent(task.id, "sub_running")
 
         detail = "".join(fragment[1] for fragment in tui._render_modal_body())
-        assert "当前运行时只在本轮结束后同步完整工具记录" in detail
+        assert "进行中" in detail and "结束后会同步" in detail
         assert "正在验证" not in detail
 
 
@@ -487,6 +500,7 @@ def test_task_panel_keeps_reference_layout_across_terminal_widths(
             output="测试计划已准备，等待可执行版本。",
         )
         tui.ledger.set_task_phase(task.id, "parallel")
+        tui.ledger.set_report(task.id, "MAIN", "面板样式与并行状态已对齐。")
 
         monkeypatch.setattr(tui_app, "_terminal_height", lambda: 36)  # type: ignore[attr-defined]
         for width in (20, 24, 32, 36, 48, 80, 120):
@@ -502,22 +516,20 @@ def test_task_panel_keeps_reference_layout_across_terminal_widths(
             assert "DOGGY" in header or "DOG" in header
             assert header.strip().startswith("╭") or "DOGGY" in header
             assert "main ·" not in header
-            # Dog-ear / face markers replace legacy ◆
-            assert ("∪" in rendered) or ("·" in rendered) or ("╭" in rendered)
+            # Compact list: title + stage + one human summary (no dog-ear separators).
+            assert "∪" not in rendered
+            assert "CLI" in rendered or "任务面板" in rendered
             expected_stage = "3 并行" if width < 36 else "3 个 Agent 并行中"
             assert expected_stage in rendered
-            if width >= 36:
-                assert "BUILDER" in rendered and "TESTER" in rendered
-            else:
-                assert "BUI" in rendered and "TES" in rendered
-            # Brief is 2 ragged lines — full phrase may split across rows.
+            # No ↳ agent rows on homepage cards.
+            assert "↳" not in rendered
             compact = rendered.replace("\n", "").replace(" ", "")
-            assert "正在实" in compact
-            assert "测试" in compact
+            assert "面板" in compact or "对齐" in compact
 
-        compact_wide = rendered.replace("\n", "").replace(" ", "")
-        assert "正在实现" in compact_wide or "正在实" in compact_wide
-        assert "测试计划" in compact_wide or "测试" in compact_wide
+        # No tool-call live noise in the list body.
+        assert "调用中" not in "".join(
+            fragment[1] for fragment in tui._render_tasks()
+        )
 
 
 def test_running_status_and_feedback_fit_narrow_terminals(monkeypatch: object) -> None:
@@ -551,6 +563,25 @@ def test_running_status_and_feedback_fit_narrow_terminals(monkeypatch: object) -
             assert get_cwidth(feedback) <= width
 
 
+def test_budget_text_keeps_last_used_while_awaiting_usage() -> None:
+    """Reasoning / compact clears last_prompt_tokens — UI must not flash '—'."""
+    session_surface._budget_sticky.clear()
+
+    class _Budget:
+        last_prompt_tokens: int | None = 12_000
+        context_window = 200_000
+
+    budget = _Budget()
+    session = SimpleNamespace(
+        id="budget-sticky",
+        extensions=SimpleNamespace(context=SimpleNamespace(budget=budget)),
+    )
+    assert session_surface.budget_text(session) == "12k / 200k"
+    budget.last_prompt_tokens = None
+    assert session_surface.budget_text(session) == "12k / 200k"
+    assert "—" not in session_surface.budget_text(session)
+
+
 def test_full_screen_agent_window_is_opaque_and_interactive() -> None:
     with create_pipe_input() as pipe_input:
         tui = CodeDoggyTUI(
@@ -564,17 +595,60 @@ def test_full_screen_agent_window_is_opaque_and_interactive() -> None:
         assert float_layer.top == 1 and float_layer.bottom == 1
         top = "".join(fragment[1] for fragment in tui._render_prompt_top())
         bottom = "".join(fragment[1] for fragment in tui._render_prompt_bottom())
-        shortcuts = "".join(fragment[1] for fragment in tui._render_shortcuts())
+        prefix = "".join(fragment[1] for fragment in tui._render_prompt_prefix())
+        header = "".join(fragment[1] for fragment in tui._render_header())
         assert top.startswith("  ╭") and top.endswith("╮")
+        assert "交代任务" in top
+        assert "∪･ω･∪" not in top
+        assert "∪･ω･∪" not in header
+        assert "›" in prefix
+        assert "∪" not in prefix
+        assert "∪" not in header
         assert bottom.startswith("  ╰") and "model · auto" in bottom
-        assert "Enter:" in shortcuts and "Ctrl+Q:退出" in shortcuts
-        assert "Ctrl+L:登录" in shortcuts or "登录" in shortcuts
+        # Default chrome: Tab=最新任务, S-Tab=Plan/Auto, ^Enter=换行; no arrows.
+        tui.app.layout.focus(tui._input)
+        shortcuts_input = "".join(fragment[1] for fragment in tui._render_shortcuts())
+        assert "Tab:最新任务" in shortcuts_input
+        assert "S-Tab:Plan/Auto" in shortcuts_input
+        assert "^Enter:换行" in shortcuts_input
+        assert "Ctrl+Q:退出" in shortcuts_input
+        assert "↑↓" not in shortcuts_input and "←→" not in shortcuts_input
+
+        # Ctrl+Enter / Ctrl+J inserts a hard newline (does not submit).
+        tui._input.buffer.text = "line1"
+        tui._input.buffer.cursor_position = len("line1")
+
+        class _E:
+            def __init__(self, app: object, buf: object) -> None:
+                self.app = app
+                self.current_buffer = buf
+
+        CodeDoggyTUI._insert_buffer_newline(
+            _E(tui.app, tui._input.buffer), max_lines=8
+        )
+        assert tui._input.buffer.text == "line1\n"
+        # Cap: already max lines → no further insert
+        tui._input.buffer.text = "\n".join(f"L{i}" for i in range(8))
+        before = tui._input.buffer.text
+        CodeDoggyTUI._insert_buffer_newline(
+            _E(tui.app, tui._input.buffer), max_lines=8
+        )
+        assert tui._input.buffer.text == before
+        tui.app.layout.focus(tui._task_window)
+        shortcuts_tasks = "".join(fragment[1] for fragment in tui._render_shortcuts())
+        assert shortcuts_tasks.strip().startswith("Space:输入")
+        assert "Tab:进入" in shortcuts_tasks
+        assert "S-Tab:Plan/Auto" in shortcuts_tasks
         assert tui._input.control.input_processors
 
-        tui._set_feedback("MAIN 已汇总，任务完成", "success")
+        tui._set_feedback("任务完成", "info")
         feedback = "".join(fragment[1] for fragment in tui._render_turn_status())
         assert "任务完成" in feedback
-        assert tui._prompt_border_class() == "class:prompt.border.success"
+        # Feedback must not recolor the prompt border (no green flash).
+        assert tui._prompt_border_class() in {
+            "class:prompt.border",
+            "class:prompt.border.focus",
+        }
 
         thread = threading.Thread(target=tui.run, daemon=True)
         thread.start()
@@ -582,23 +656,375 @@ def test_full_screen_agent_window_is_opaque_and_interactive() -> None:
         assert _wait_until(lambda: tui.ledger.snapshots()[0].phase == "done")
         task_text = "".join(fragment[1] for fragment in tui._render_tasks())
         assert "已完成 · 1 个 Agent" in task_text
-        # Agent chips: ╭ ∪MAIN › ╮ (dog ear prefix)
-        assert "MAIN" in task_text and "╭" in task_text and "╮" in task_text
+        # Compact card: frame + title; summary is MAIN report prose.
+        assert "╭" in task_text and "╮" in task_text
+        assert "实现 CLI" in task_text
         assert "已完成：实现 CLI" in task_text
 
-        pipe_input.send_text("\t\r")
+        # Tab → latest task → Tab enter detail (idle Esc no longer closes).
+        pipe_input.send_text("\t\t")
         assert _wait_until(lambda: tui._modal_open)
         detail_text = "".join(fragment[1] for fragment in tui._render_modal_body())
         assert "已完成：实现 CLI" in detail_text
         assert tui.app.layout.has_focus(tui._detail_window)
 
-        pipe_input.send_text("\x1b")
+        # Tab exits detail (Esc is cancel-only when running).
+        pipe_input.send_text("\t")
         assert _wait_until(lambda: not tui._modal_open)
         pipe_input.send_text("\x11")
         assert _wait_until(lambda: tui._quit_armed_until > time.monotonic())
         pipe_input.send_text("\x11")
         thread.join(timeout=2)
         assert not thread.is_alive()
+
+
+def test_todo_badge_and_pane_render() -> None:
+    """Grok-style 完成/总数 badge in header; click toggles expandable list."""
+    from codedoggy.tools.grok_build.todo_logic import TodoItem, TodoState
+
+    with create_pipe_input() as pipe_input:
+        session = _Session()
+        todos = TodoState()
+        todos.push("1", TodoItem("调研", status="completed"))
+        todos.push("2", TodoItem("实现", status="in_progress"))
+        todos.push("3", TodoItem("测试", status="pending"))
+        session.extensions.kernel.todo_state = todos
+        tui = CodeDoggyTUI(
+            session,
+            input=pipe_input,
+            output=DummyOutput(),
+        )
+        assert tui._todo_badge_label() == "1/3"
+        header = "".join(fragment[1] for fragment in tui._render_header())
+        assert "1/3" in header
+        assert "✓" in header
+        assert "计划" in header
+
+        # Closed by default
+        assert tui._render_todo_pane() == []
+        tui._toggle_todo_pane()
+        assert tui._todo_pane_open
+        pane = "".join(fragment[1] for fragment in tui._render_todo_pane())
+        assert "计划 1/3" in pane
+        assert "调研" in pane and "实现" in pane and "测试" in pane
+        assert "▶" in pane or "○" in pane or "✓" in pane
+
+        # Scroll window: pad many items, ensure offset works
+        for i in range(12):
+            todos.push(f"n{i}", TodoItem(f"extra-{i}", status="pending"))
+        tui._todo_scroll = 0
+        tui._scroll_todo_pane(3)
+        assert tui._todo_scroll == 3
+        pane2 = "".join(fragment[1] for fragment in tui._render_todo_pane())
+        assert "滚动" in pane2 or "/" in pane2
+
+        tui._toggle_todo_pane()
+        assert not tui._todo_pane_open
+
+
+def test_plan_detail_does_not_embed_noisy_todo_progress() -> None:
+    """Plan/agent detail no longer dumps MAIN 进度 checklist into the body."""
+    from codedoggy.tools.grok_build.todo_logic import TodoItem, TodoState
+
+    with create_pipe_input() as pipe_input:
+        session = _Session()
+        todos = TodoState()
+        todos.push("1", TodoItem("step-one", status="completed"))
+        todos.push("2", TodoItem("step-two", status="pending"))
+        session.extensions.kernel.todo_state = todos
+        tui = CodeDoggyTUI(session, input=pipe_input, output=DummyOutput())
+        tui.ledger.create("plan-task")
+        task = tui.ledger.snapshots()[0]
+        tui._modal_open = True
+        tui._modal_kind = "agent"
+        tui._modal_ref = (task.id, f"{task.id}:main")
+        tui._detail_filter = "plan"
+        body = "".join(fragment[1] for fragment in tui._render_modal_body())
+        assert "step-one" not in body
+        assert "todo · MAIN" not in body
+        # Header badge still owns progress chrome.
+        assert tui._todo_badge_label() == "1/2"
+
+
+def test_open_active_main_plan_tab() -> None:
+    from codedoggy.tools.grok_build.todo_logic import TodoItem, TodoState
+
+    with create_pipe_input() as pipe_input:
+        session = _Session()
+        todos = TodoState()
+        todos.push("1", TodoItem("a", status="pending"))
+        session.extensions.kernel.todo_state = todos
+        tui = CodeDoggyTUI(session, input=pipe_input, output=DummyOutput())
+        tui.ledger.create("plan-task")
+        task = tui.ledger.snapshots()[0]
+        tui._active_task_id = task.id
+        tui._open_active_main_plan_tab()
+        assert tui._modal_open
+        assert tui._detail_filter == "plan"
+        assert tui._modal_ref is not None
+        assert tui._modal_ref[0] == task.id
+        assert str(tui._modal_ref[1]).endswith(":main")
+        assert tui._todo_pane_open
+
+
+def test_sync_task_plan_with_session_planning() -> None:
+    from codedoggy.orchestration.session_mode import SessionModeState
+
+    with create_pipe_input() as pipe_input:
+        session = _Session()
+        mode = SessionModeState()
+        mode.enter_plan(".grok/plan.md")
+        session.extensions.kernel.session_mode_state = mode
+        tui = CodeDoggyTUI(session, input=pipe_input, output=DummyOutput())
+        tui.ledger.create("sync-me")
+        tid = tui.ledger.snapshots()[0].id
+        tui._active_task_id = tid
+        assert tui.ledger.snapshots()[0].plan_state == "none"
+        tui._sync_task_plan_with_session()
+        assert tui.ledger.snapshots()[0].plan_state == "planning"
+
+
+def test_ask_user_fn_opens_modal_and_accepts_selection() -> None:
+    """ask_user_question uses a dedicated float — not the plan/agent card."""
+    with create_pipe_input() as pipe_input:
+        tui = CodeDoggyTUI(_Session(), input=pipe_input, output=DummyOutput())
+        tui.ledger.create("plan-task")
+        tui._active_task_id = tui.ledger.snapshots()[0].id
+        questions = [
+            {
+                "question": "用 JWT 还是 session？",
+                "options": [
+                    {"label": "JWT (Recommended)", "description": "无状态"},
+                    {"label": "Session", "description": "有状态"},
+                ],
+            }
+        ]
+
+        def answer_soon() -> None:
+            time.sleep(0.05)
+            assert tui._ask_active and tui._modal_kind == "ask"
+            # Dedicated float: agent modal shell stays closed.
+            assert tui._modal_open is False
+            body = "".join(p[1] for p in tui._render_ask_body())
+            assert "JWT" in body
+            assert "用 JWT" in body
+            title = "".join(p[1] for p in tui._render_ask_dialog_title())
+            assert "问卷" in title
+            # Larger questionnaire styles (bordered Frame host).
+            styles = [p[0] for p in tui._render_ask_body() if p[0]]
+            assert any("ask.question" in s or "ask.option" in s for s in styles)
+            tui._ask_opt_index = 0
+            tui._ask_confirm_current()
+
+        threading.Thread(target=answer_soon, daemon=True).start()
+        result = tui._ask_user_fn(questions)
+        assert result.get("outcome") == "accepted"
+        answers = result.get("answers") or {}
+        assert "JWT (Recommended)" in answers.get("用 JWT 还是 session？", [])
+
+
+def test_ask_user_tab_exits_without_modal_shell() -> None:
+    """Tab exits questionnaire (dedicated float; _modal_open stays False)."""
+    with create_pipe_input() as pipe_input:
+        tui = CodeDoggyTUI(_Session(), input=pipe_input, output=DummyOutput())
+        questions = [
+            {
+                "question": "Q?",
+                "options": [{"label": "A", "description": "a"}],
+            }
+        ]
+
+        def cancel_soon() -> None:
+            time.sleep(0.05)
+            assert tui._ask_active and tui._modal_kind == "ask"
+            assert tui._modal_open is False
+            # Same path as Tab binding.
+            tui._resolve_ask({"outcome": "cancelled"})
+
+        threading.Thread(target=cancel_soon, daemon=True).start()
+        result = tui._ask_user_fn(questions)
+        assert result.get("outcome") == "cancelled"
+
+
+def test_ask_user_fn_up_down_moves_option() -> None:
+    with create_pipe_input() as pipe_input:
+        tui = CodeDoggyTUI(_Session(), input=pipe_input, output=DummyOutput())
+        tui._ask_questions = [
+            {
+                "question": "Q?",
+                "options": [
+                    {"label": "A", "description": "a"},
+                    {"label": "B", "description": "b"},
+                ],
+            }
+        ]
+        tui._ask_q_index = 0
+        tui._ask_opt_index = 0
+        tui._ask_move_option(1)
+        assert tui._ask_opt_index == 1
+        tui._ask_move_option(1)
+        # wraps to Other (index 2) then A
+        assert tui._ask_opt_index == 2
+        tui._ask_move_option(1)
+        assert tui._ask_opt_index == 0
+
+
+def test_finished_task_clears_plan_draft_chrome() -> None:
+    """After the agent finishes talking, card must not stick on「计划起草中」."""
+    ledger = TaskLedger()
+    task = ledger.create("plan then done")
+    ledger.set_plan_state(task.id, "planning")
+    ledger.update_agent(
+        task.id,
+        f"{task.id}:main",
+        label="MAIN",
+        status="completed",
+        output="方案已说明完毕，可以开工。",
+    )
+    ledger.set_report(task.id, "MAIN", "方案已说明完毕，可以开工。")
+    ledger.finish_task(task.id, "completed")
+    snap = ledger.snapshots()[0]
+    assert snap.phase == "done"
+    assert snap.plan_state == "none"
+    assert "起草" not in _task_stage_text(snap)
+    assert "已完成" in _task_stage_text(snap)
+    summary = _task_list_summary(snap)
+    assert "起草" not in summary
+    assert "方案已说明完毕" in summary
+
+
+def test_live_plan_prefers_main_prose_over_draft_placeholder() -> None:
+    ledger = TaskLedger()
+    task = ledger.create("planning live")
+    ledger.set_plan_state(task.id, "planning")
+    ledger.update_agent(
+        task.id,
+        f"{task.id}:main",
+        label="MAIN",
+        status="running",
+        output="我先读入口，再写 plan.md。",
+    )
+    snap = ledger.snapshots()[0]
+    # Still planning phase → stage can say 起草中, but summary shows live prose.
+    assert "起草" in _task_stage_text(snap)
+    assert "我先读入口" in _task_list_summary(snap)
+
+
+def test_toggle_todo_pane_does_not_steal_task_selection() -> None:
+    from codedoggy.tools.grok_build.todo_logic import TodoItem, TodoState
+
+    with create_pipe_input() as pipe_input:
+        session = _Session()
+        todos = TodoState()
+        todos.push("1", TodoItem("a", status="pending"))
+        session.extensions.kernel.todo_state = todos
+        tui = CodeDoggyTUI(session, input=pipe_input, output=DummyOutput())
+        tui.ledger.create("first")
+        tui.ledger.create("second-active")
+        tui._active_task_id = tui.ledger.snapshots()[-1].id
+        tui._selected_task = 0
+        tui._task_selection_active = True
+        tui._todo_pane_open = False
+        tui._toggle_todo_pane()
+        assert tui._todo_pane_open
+        # Opening plan checklist must not jump selection to the active/latest task.
+        assert tui._selected_task == 0
+
+
+def test_incomplete_work_status_hint_zh() -> None:
+    from codedoggy.tools.grok_build.todo_logic import TodoItem, TodoState
+
+    with create_pipe_input() as pipe_input:
+        session = _Session()
+        todos = TodoState()
+        todos.push("1", TodoItem("a", status="pending"))
+        todos.push("2", TodoItem("b", status="in_progress"))
+        session.extensions.kernel.todo_state = todos
+        session.extensions.kernel.session_id = "s1"
+        session.extensions.kernel.subagent_coordinator = SimpleNamespace(
+            list_for_parent=lambda _sid: []
+        )
+        session.extensions.kernel.task_manager = None
+        tui = CodeDoggyTUI(session, input=pipe_input, output=DummyOutput())
+        hint = tui._incomplete_work_status_hint()
+        assert hint is not None
+        assert "待办" in hint
+        assert "2" in hint
+
+
+def test_main_todo_chip_and_agent_chip() -> None:
+    from codedoggy.tools.grok_build.todo_logic import TodoItem, TodoState
+
+    with create_pipe_input() as pipe_input:
+        session = _Session()
+        todos = TodoState()
+        todos.push("1", TodoItem("a", status="completed"))
+        todos.push("2", TodoItem("b", status="pending"))
+        session.extensions.kernel.todo_state = todos
+        session.extensions.kernel.subagent_coordinator = SimpleNamespace(
+            todo_state_for=lambda _id: None,
+            lookup=lambda _id: None,
+        )
+        tui = CodeDoggyTUI(session, input=pipe_input, output=DummyOutput())
+        assert tui._main_todo_chip() == "1/2"
+        assert tui._agent_todo_chip("task_001:main") == "1/2"
+        # Child falls back to None without coordinator data
+        assert tui._agent_todo_chip("child-x") is None
+
+
+def test_todo_state_for_open_agent_uses_main_by_default() -> None:
+    from codedoggy.tools.grok_build.todo_logic import TodoItem, TodoState
+
+    with create_pipe_input() as pipe_input:
+        session = _Session()
+        main_todos = TodoState()
+        main_todos.push("m1", TodoItem("main-only", status="pending"))
+        session.extensions.kernel.todo_state = main_todos
+        tui = CodeDoggyTUI(session, input=pipe_input, output=DummyOutput())
+        st = tui._todo_state_for_open_agent()
+        assert st is main_todos
+        # Simulated open MAIN agent
+        tui._modal_ref = ("task_001", "task_001:main")
+        assert tui._todo_state_for_open_agent() is main_todos
+
+
+def test_shift_tab_plan_exits_goal_mode() -> None:
+    """Shift+Tab toggles Plan/Auto (same helper as the binding)."""
+    from codedoggy.orchestration.session_mode import SessionModeState
+
+    with create_pipe_input() as pipe_input:
+        session = _Session()
+        mode = SessionModeState()
+        mode.enter_goal()
+        session.extensions.kernel.session_mode_state = mode
+        session.extensions.kernel.cwd = Path("C:/workspace")
+        session.extensions.kernel.enter_plan_mode_pending = (
+            lambda p=None: mode.enter_plan_pending(p or ".grok/plan.md")
+        )
+        session.extensions.kernel.enter_plan_mode = lambda p=None: mode.enter_plan(
+            p or ".grok/plan.md"
+        )
+        session.extensions.kernel.persist_plan_mode_state = lambda: None
+        tui = CodeDoggyTUI(session, input=pipe_input, output=DummyOutput())
+        assert mode.is_goal()
+        tui._toggle_session_plan_mode()
+        assert not mode.is_goal()
+        assert mode.is_plan_ui() or mode.is_plan() or mode.plan_phase == "pending"
+
+
+def test_kernel_close_flushes_todo(tmp_path: Path) -> None:
+    from codedoggy.session.kernel import RuntimeKernel
+    from codedoggy.tools.grok_build.todo_logic import TodoItem, TodoState, load_todo_state
+
+    k = RuntimeKernel(cwd=tmp_path, session_id="flush1")
+    st = TodoState()
+    st.push("a", TodoItem("flush-me", status="pending"))
+    k.todo_state = st
+    k.close()
+    restored = load_todo_state(cwd=tmp_path, session_id="flush1")
+    assert restored is not None
+    assert restored.get("a") is not None
+    assert restored.get("a").content == "flush-me"
 
 
 def _wait_until(predicate: object, *, timeout: float = 2.0) -> bool:

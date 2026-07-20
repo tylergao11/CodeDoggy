@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from copy import deepcopy
 from dataclasses import dataclass, field
 from threading import RLock
@@ -29,6 +30,13 @@ class TaskView:
     reporter: str = "MAIN"
     report: str = ""
     agents: list[AgentView] = field(default_factory=list)
+    # GrokBuild plan lifecycle hung on the task card (not go-steer plan-first).
+    # none | consent | planning | awaiting_approval | approved | abandoned
+    plan_state: str = "none"
+    plan_file: str = ""
+    # Wall-clock duration for the homepage card (set on create / terminal).
+    started_at: float = 0.0
+    ended_at: float | None = None
 
 
 class TaskLedger:
@@ -40,15 +48,16 @@ class TaskLedger:
         self._next_task = 1
 
     def create(self, prompt: str) -> TaskView:
-        clean = " ".join(prompt.strip().split())
-        title = clean if len(clean) <= 48 else clean[:47].rstrip() + "…"
+        # Keep full title; the task list wraps instead of hard-cropping storage.
+        title = " ".join(prompt.strip().split()) or "未命名任务"
         with self._lock:
             task_id = f"task_{self._next_task:03d}"
             self._next_task += 1
             task = TaskView(
                 id=task_id,
-                title=title or "未命名任务",
+                title=title,
                 agents=[AgentView(id=f"{task_id}:main", label="MAIN", status="running")],
+                started_at=time.time(),
             )
             self._tasks.append(task)
             return deepcopy(task)
@@ -83,6 +92,11 @@ class TaskLedger:
             if task is None:
                 return
             task.status = status
+            if status in {"completed", "failed", "cancelled", "max_turns"}:
+                if task.ended_at is None:
+                    task.ended_at = time.time()
+                if task.started_at <= 0:
+                    task.started_at = task.ended_at
 
     def finish_task(self, task_id: str, status: str) -> None:
         """Commit the one terminal state used by the task list."""
@@ -95,12 +109,46 @@ class TaskLedger:
                 "completed": "done",
                 "cancelled": "cancelled",
             }.get(status, "failed")
+            if task.ended_at is None:
+                task.ended_at = time.time()
+            if task.started_at <= 0:
+                task.started_at = task.ended_at
+            # Finished cards must not keep draft/review chrome ("计划起草中").
+            if task.plan_state in {
+                "planning",
+                "consent",
+                "awaiting_approval",
+            }:
+                task.plan_state = "none"
 
     def set_task_phase(self, task_id: str, phase: str) -> None:
         with self._lock:
             task = self._find_task(task_id)
             if task is not None:
                 task.phase = phase
+
+    def set_plan_state(
+        self,
+        task_id: str,
+        plan_state: str,
+        *,
+        plan_file: str | None = None,
+    ) -> None:
+        with self._lock:
+            task = self._find_task(task_id)
+            if task is None:
+                return
+            task.plan_state = plan_state
+            if plan_file is not None:
+                task.plan_file = plan_file
+            if plan_state == "planning":
+                task.phase = "planning"
+            elif plan_state == "awaiting_approval":
+                task.phase = "plan_review"
+            elif plan_state in {"approved", "abandoned", "none"}:
+                # Leave execution phases alone once work is underway.
+                if task.phase in {"planning", "plan_review", "dispatching"}:
+                    task.phase = "dispatching"
 
     def update_agent(
         self,

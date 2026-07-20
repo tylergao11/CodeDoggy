@@ -15,7 +15,13 @@ from codedoggy.tools.builtins.memory_get import format_with_line_numbers
 
 
 def _tools():
-    return ToolRegistryBuilder.new().finalize()
+    # Opt-in Grok memory_search/get (not on Hermes product surface).
+    from codedoggy.tools.builtins import register_optional_grok_memory_tools
+    from codedoggy.tools.registry import ToolRegistryBuilder as TRB
+
+    b = TRB.new()
+    register_optional_grok_memory_tools(b)
+    return b.finalize(product_surface=False)
 
 
 class _FakeMemoryBackend:

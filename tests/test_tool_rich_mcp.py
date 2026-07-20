@@ -135,4 +135,6 @@ def test_builtins_include_mcp_and_memory() -> None:
     b = ToolRegistryBuilder.new()
     assert b.has_tool_id("Doggy:search_tool")
     assert b.has_tool_id("Doggy:use_tool")
-    assert b.has_tool_id("Doggy:memory_search")
+    assert b.has_tool_id("Doggy:memory")
+    assert b.has_tool_id("Doggy:session_search")
+    assert not b.has_tool_id("Doggy:memory_search")

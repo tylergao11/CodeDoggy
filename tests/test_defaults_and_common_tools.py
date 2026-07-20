@@ -146,13 +146,14 @@ def test_builtins_registered() -> None:
         "Doggy:scheduler_delete",
         "Doggy:scheduler_list",
         "Doggy:memory",
-        "Doggy:memory_search",
-        "Doggy:memory_get",
         "Doggy:session_search",
         "Doggy:task",
         "Doggy:get_subagent_output",
     ):
         assert b.has_tool_id(qid), qid
+    # Grok read-memory tools are opt-in only (Hermes owns product memory).
+    assert not b.has_tool_id("Doggy:memory_search")
+    assert not b.has_tool_id("Doggy:memory_get")
 
 
 def test_grep_rejects_context_without_rg(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

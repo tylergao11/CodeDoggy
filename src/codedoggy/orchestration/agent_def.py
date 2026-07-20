@@ -127,7 +127,7 @@ Hard constraints:
 Method:
 1. Clarify the question into 1–3 concrete search targets.
 2. Use code_nav for symbols when names are known; else grep then read_file.
-3. Check session_search / memory_search only when prior context may help.
+3. Check session_search only when prior conversation context may help (curated memory is already in the system prompt).
 
 Return to the parent a concise factual report with:
 - Findings (bullet list, with file:line when known)
@@ -180,8 +180,6 @@ def builtin_explore() -> AgentDefinition:
             "code_nav",
             "lsp",
             "session_search",
-            "memory_search",
-            "memory_get",
             "web_search",
             "web_fetch",
         ],
@@ -205,7 +203,6 @@ def builtin_plan() -> AgentDefinition:
             "code_nav",
             "lsp",
             "session_search",
-            "memory_search",
             "search_replace",
             "write",
             "todo_write",

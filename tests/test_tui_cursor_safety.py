@@ -151,7 +151,7 @@ def test_modal_underlay_empty_content_clamps_task_cursor() -> None:
         tui._modal_open = True
         fr = tui._render_tasks()
         pos = tui._task_cursor_position()
-        assert tui._agent_refs == []
+        # Underlay is empty while modal is open — only line count / clamp matter.
         assert tui._task_line_count == _pt_line_count(fr)
         # Cursor position is clamped for paint; free-scroll y is preserved.
         assert 0 <= pos.y < tui._task_line_count
@@ -316,7 +316,7 @@ def test_more_hint_is_paint_time_only_and_2hz() -> None:
 
 
 def test_focus_latest_task_from_prompt_ignores_prior_selection() -> None:
-    """Tab from input must always land on the newest task, not last browse."""
+    """Tab / focus-latest from input lands on the newest task, not last browse."""
     with create_pipe_input() as pin:
         tui = CodeDoggyTUI(_Session(), input=pin, output=DummyOutput())
         for i in range(4):
@@ -328,3 +328,282 @@ def test_focus_latest_task_from_prompt_ignores_prior_selection() -> None:
         assert tui._selected_task == 3
         assert tui._follow_latest_task is True
         assert tui._task_refs[-1] == tui.ledger.snapshots()[-1].id
+
+
+def test_blank_click_clears_selection_not_first_task() -> None:
+    """Void click clears selection; paint must never invent index 0."""
+    from prompt_toolkit.mouse_events import MouseButton, MouseEvent, MouseEventType
+
+    with create_pipe_input() as pin:
+        tui = CodeDoggyTUI(_Session(), input=pin, output=DummyOutput())
+        for i in range(3):
+            tui.ledger.create(f"t{i}")
+        assert tui._selected_task == -1
+        assert tui._task_selection_active is False
+        tui._render_tasks()
+        assert tui._selected_task == -1
+
+        tui._selected_task = 2
+        tui._task_selection_active = True
+        tui._follow_latest_task = True
+        tui._render_tasks()
+
+        class _Pos:
+            x = 1
+            y = 1
+
+        void = tui._task_void_mouse()
+        void(
+            MouseEvent(
+                position=_Pos(),
+                event_type=MouseEventType.MOUSE_UP,
+                button=MouseButton.LEFT,
+                modifiers=None,
+            )
+        )
+        assert tui._selected_task == -1
+        assert tui._task_selection_active is False
+        assert tui._follow_latest_task is False
+
+        fr = tui._render_tasks()
+        plain = "".join(p[1] for p in fr)
+        assert tui._selected_task == -1
+        assert "›" not in plain
+
+
+def test_interject_shows_on_homepage_card() -> None:
+    with create_pipe_input() as pin:
+        tui = CodeDoggyTUI(_Session(), input=pin, output=DummyOutput())
+        t = tui.ledger.create("running")
+        tui.ledger.update_agent(
+            t.id, f"{t.id}:main", label="MAIN", status="running", output="…"
+        )
+        tui._active_task_id = t.id
+        tui._note_interject(t.id, "补充：请用 JWT")
+        preview = tui._interject_preview(t.id)
+        assert preview is not None
+        assert "JWT" in preview
+        from codedoggy.tui.app import _task_list_summary, _task_stage_text
+
+        snap = tui.ledger.snapshots()[0]
+        assert "插入中" in _task_stage_text(snap, interject=preview)
+        assert "插入中" in _task_list_summary(snap, interject=preview)
+
+
+def test_tab_cycle_latest_enter_exit() -> None:
+    """Tab: latest → enter detail → exit back to that card."""
+    with create_pipe_input() as pin:
+        tui = CodeDoggyTUI(_Session(), input=pin, output=DummyOutput())
+        for i in range(3):
+            t = tui.ledger.create(f"t{i}")
+            tui.ledger.update_agent(
+                t.id,
+                f"{t.id}:main",
+                label="MAIN",
+                status="completed",
+                output="ok",
+            )
+
+        # 1) From input → latest task selected, no modal.
+        tui.app.layout.focus(tui._input)
+        tui._task_selection_active = False
+        tui._selected_task = -1
+        tui._tab_task_cycle()
+        assert tui._selected_task == 2
+        assert tui._task_selection_active is True
+        assert tui._modal_open is False
+
+        # 2) On selected card → open detail.
+        tui.app.layout.focus(tui._task_window)
+        tui._tab_task_cycle()
+        assert tui._modal_open is True
+        assert tui._modal_kind == "agent"
+        assert tui._modal_ref is not None
+        assert tui._modal_ref[0] == tui.ledger.snapshots()[2].id
+
+        # 3) Inside detail → exit, keep that card selected.
+        tui._tab_task_cycle()
+        assert tui._modal_open is False
+        assert tui._selected_task == 2
+        assert tui._task_selection_active is True
+
+
+def test_user_wants_latest_focus_respects_browse_above() -> None:
+    with create_pipe_input() as pin:
+        tui = CodeDoggyTUI(_Session(), input=pin, output=DummyOutput())
+        for i in range(3):
+            tui.ledger.create(f"t{i}")
+        tui._follow_latest_task = True
+        assert tui._user_wants_latest_focus() is True
+        tui._follow_latest_task = False
+        tui._selected_task = 0
+        # No render_info → not at bottom unless following.
+        assert tui._user_wants_latest_focus() is False
+
+
+def test_maybe_focus_latest_skips_when_browsing_above() -> None:
+    with create_pipe_input() as pin:
+        tui = CodeDoggyTUI(_Session(), input=pin, output=DummyOutput())
+        for i in range(3):
+            tui.ledger.create(f"t{i}")
+        tui._selected_task = 0
+        tui._follow_latest_task = False
+        tid = tui.ledger.snapshots()[-1].id
+        tui._maybe_focus_latest_after_task_event(tid)
+        assert tui._selected_task == 0  # unchanged
+
+
+def test_maybe_focus_latest_is_noop() -> None:
+    """Turn finish must not auto-select / steal focus to the latest task."""
+    with create_pipe_input() as pin:
+        tui = CodeDoggyTUI(_Session(), input=pin, output=DummyOutput())
+        for i in range(3):
+            tui.ledger.create(f"t{i}")
+        tui._selected_task = 0
+        tui._task_selection_active = True
+        tui._follow_latest_task = True
+        tid = tui.ledger.snapshots()[-1].id
+        tui._maybe_focus_latest_after_task_event(tid)
+        assert tui._selected_task == 0
+
+
+def test_task_card_plain_click_selects_double_and_ctrl_open() -> None:
+    """Plain left: select. Double-click or Ctrl+left: open detail."""
+    import time
+
+    from prompt_toolkit.mouse_events import (
+        MouseButton,
+        MouseEvent,
+        MouseEventType,
+        MouseModifier,
+    )
+
+    with create_pipe_input() as pin:
+        tui = CodeDoggyTUI(_Session(), input=pin, output=DummyOutput())
+        t = tui.ledger.create("open-me")
+        tui.ledger.update_agent(
+            t.id, f"{t.id}:main", label="MAIN", status="completed", output="ok"
+        )
+        tui._render_tasks()
+        handler = tui._task_card_mouse(0)
+
+        class _Pos:
+            x = 1
+            y = 1
+
+        def fire(
+            etype: MouseEventType, *, mods: frozenset | None = None
+        ) -> object:
+            return handler(
+                MouseEvent(
+                    position=_Pos(),
+                    event_type=etype,
+                    button=MouseButton.LEFT,
+                    modifiers=mods,
+                )
+            )
+
+        # Plain click: select, never open modal.
+        fire(MouseEventType.MOUSE_DOWN)
+        fire(MouseEventType.MOUSE_UP)
+        assert tui._modal_open is False
+        assert tui._selected_task == 0
+
+        # Slow second click still selects only (outside double-click window).
+        tui._task_card_last_click = (0, time.monotonic() - 1.0)
+        fire(MouseEventType.MOUSE_DOWN)
+        fire(MouseEventType.MOUSE_UP)
+        assert tui._modal_open is False
+        assert tui._selected_task == 0
+
+        # Double-click opens detail.
+        tui._task_card_last_click = (0, time.monotonic())
+        fire(MouseEventType.MOUSE_DOWN)
+        fire(MouseEventType.MOUSE_UP)
+        assert tui._modal_open is True
+
+        tui._close_modal()
+        assert tui._modal_open is False
+
+        # Ctrl+left opens detail.
+        fire(MouseEventType.MOUSE_DOWN)
+        fire(MouseEventType.MOUSE_UP, mods=frozenset({MouseModifier.CONTROL}))
+        assert tui._modal_open is True
+
+
+def test_task_card_frame_carries_mouse_handler() -> None:
+    """Whole card (frame included) is a click target."""
+    with create_pipe_input() as pin:
+        tui = CodeDoggyTUI(_Session(), input=pin, output=DummyOutput())
+        tui.ledger.create("card")
+        fr = tui._render_tasks()
+        # Top border fragment should have a mouse handler (3-tuple).
+        tops = [f for f in fr if len(f) >= 2 and "╭" in f[1]]
+        assert tops
+        assert len(tops[0]) >= 3 and tops[0][2] is not None
+
+
+def test_detail_scroll_helpers_move_cursor_and_window() -> None:
+    """↑↓ / End / absolute jump must move both cursor anchor and vertical_scroll."""
+    with create_pipe_input() as pin:
+        tui = CodeDoggyTUI(_Session(), input=pin, output=DummyOutput())
+        t = tui.ledger.create("scroll-me")
+        tui.ledger.update_agent(
+            t.id, f"{t.id}:main", label="MAIN", status="completed", output="body"
+        )
+        tui._open_agent(t.id, f"{t.id}:main")
+        tui._detail_line_count = 80
+        tui._detail_cursor_line = 0
+        tui._detail_window.vertical_scroll = 0
+
+        tui._move_detail_cursor(10)
+        assert tui._detail_cursor_line == 10
+
+        tui._scroll_detail(5)
+        assert tui._detail_window.vertical_scroll >= 5
+        assert tui._detail_cursor_line == tui._detail_window.vertical_scroll
+
+        tui._scroll_detail_to_bottom()
+        assert tui._detail_cursor_line == 79
+        assert tui._detail_window.vertical_scroll == 79  # no render_info → max_y
+
+        tui._scroll_detail_to_line(3)
+        assert tui._detail_cursor_line == 3
+        assert tui._detail_window.vertical_scroll == 3
+
+
+def test_interactive_scrollbar_margin_emits_handlers() -> None:
+    """Scrollbar cells must carry mouse handlers (stock PT margin is paint-only)."""
+    from codedoggy.tui.app import InteractiveScrollbarMargin
+
+    class _Win:
+        vertical_scroll = 0
+
+    class _Info:
+        content_height = 40
+        window_height = 10
+        vertical_scroll = 5
+        window = _Win()
+
+    margin = InteractiveScrollbarMargin(on_scroll=lambda s: None)
+    fr = margin.create_margin(_Info(), 1, 10)
+    # At least one fragment should be a 3-tuple with a handler.
+    handled = [f for f in fr if len(f) >= 3 and f[2] is not None]
+    assert handled
+    assert any("▴" in f[1] or "▾" in f[1] or f[1] == " " for f in handled)
+
+
+def test_task_cards_never_show_agent_rows() -> None:
+    """Selecting / following a card must not inject ↳ MAIN lines (height jiggle)."""
+    with create_pipe_input() as pin:
+        tui = CodeDoggyTUI(_Session(), input=pin, output=DummyOutput())
+        t = tui.ledger.create("done-task")
+        tui.ledger.update_agent(
+            t.id, f"{t.id}:main", label="MAIN", status="completed", output="ok"
+        )
+        tui.ledger.finish_task(t.id, "completed")
+        tui._follow_latest_task = True
+        tui._selected_task = 0
+        tui._task_selection_active = True
+        text = "".join(p[1] for p in tui._render_tasks())
+        assert "↳" not in text

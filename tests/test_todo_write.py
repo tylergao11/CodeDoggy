@@ -144,6 +144,132 @@ def test_summarize_empty() -> None:
     assert summarize_todo_state(TodoState()) == "No tasks currently tracked."
 
 
+def test_todo_counts_badge_excludes_cancelled() -> None:
+    from codedoggy.tools.grok_build.todo_logic import TodoItem, count_todos
+
+    state = TodoState()
+    state.push("a", TodoItem("one", status="completed"))
+    state.push("b", TodoItem("two", status="completed"))
+    state.push("c", TodoItem("three", status="pending"))
+    state.push("d", TodoItem("skip", status="cancelled"))
+    counts = count_todos(state)
+    assert counts.completed == 2
+    assert counts.pending == 1
+    assert counts.cancelled == 1
+    # Grok: cancelled not in denominator → 2/3
+    assert counts.badge_text() == "2/3"
+    assert count_todos(TodoState()).badge_text() is None
+
+
+def test_todo_write_notifies_host_callback(tmp_path: Path) -> None:
+    tools = ToolRegistryBuilder.new().finalize()
+    seen: list[int] = []
+    ctx = ToolCallContext(
+        cwd=tmp_path,
+        extra={"todo_changed_fn": lambda: seen.append(1)},
+    )
+    tools.call(
+        "todo_write",
+        {
+            "merge": False,
+            "todos": [{"id": "1", "content": "A", "status": "pending"}],
+        },
+        ctx,
+    )
+    assert seen == [1]
+
+
+def test_todo_state_json_round_trip(tmp_path: Path) -> None:
+    from codedoggy.tools.grok_build.todo_logic import (
+        TodoItem,
+        load_todo_state,
+        save_todo_state,
+        todo_state_json_path,
+    )
+
+    state = TodoState()
+    state.push("1", TodoItem("A", status="completed"))
+    state.push("2", TodoItem("B", status="pending"))
+    state.push("3", TodoItem("C", status="cancelled"))
+    path = save_todo_state(state, cwd=tmp_path, session_id="s1")
+    assert path == todo_state_json_path(tmp_path, "s1")
+    assert path is not None and path.is_file()
+    restored = load_todo_state(cwd=tmp_path, session_id="s1")
+    assert restored is not None
+    items = list(restored.todo_items_with_ids())
+    assert [t for t, _ in items] == ["1", "2", "3"]
+    assert items[0][1].status == "completed"
+    assert items[2][1].status == "cancelled"
+    # bad json soft-fails
+    path.write_text("{not json", encoding="utf-8")
+    assert load_todo_state(cwd=tmp_path, session_id="s1") is None
+
+
+def test_child_session_todo_path_isolated(tmp_path: Path) -> None:
+    """Subagent todos land under parent:child session id, not MAIN."""
+    from codedoggy.tools.grok_build.todo_logic import (
+        load_todo_state,
+        todo_state_json_path,
+    )
+
+    tools = ToolRegistryBuilder.new().finalize()
+    main_ctx = ToolCallContext(
+        cwd=tmp_path,
+        session_id="sess-main",
+        extra={},
+    )
+    tools.call(
+        "todo_write",
+        {
+            "merge": False,
+            "todos": [{"id": "m", "content": "MAIN item", "status": "pending"}],
+        },
+        main_ctx,
+    )
+    child_ctx = ToolCallContext(
+        cwd=tmp_path,
+        session_id="sess-main:child-1",
+        extra={
+            "is_subagent": True,
+            "parent_session_id": "sess-main",
+            "subagent_id": "child-1",
+        },
+    )
+    tools.call(
+        "todo_write",
+        {
+            "merge": False,
+            "todos": [{"id": "c", "content": "CHILD item", "status": "completed"}],
+        },
+        child_ctx,
+    )
+    main = load_todo_state(cwd=tmp_path, session_id="sess-main")
+    child = load_todo_state(cwd=tmp_path, session_id="sess-main:child-1")
+    assert main is not None and main.get("m") is not None
+    assert child is not None and child.get("c") is not None
+    assert main.get("c") is None
+    assert child.get("m") is None
+    assert todo_state_json_path(tmp_path, "sess-main:child-1").is_file()
+
+
+def test_kernel_persist_load_todo(tmp_path: Path) -> None:
+    from codedoggy.session.kernel import RuntimeKernel
+    from codedoggy.tools.grok_build.todo_logic import TodoItem
+
+    k = RuntimeKernel(cwd=tmp_path, session_id="k-todo")
+    from codedoggy.tools.grok_build.todo_logic import TodoState
+
+    st = TodoState()
+    st.push("x", TodoItem("do it", status="in_progress"))
+    k.todo_state = st
+    k.persist_todo_state()
+    k2 = RuntimeKernel(cwd=tmp_path, session_id="k-todo")
+    assert k2.load_todo_state() is True
+    assert k2.todo_state is not None
+    item = k2.todo_state.get("x")
+    assert item is not None and item.status == "in_progress"
+
+
 def test_summarize_uses_full_status_tags() -> None:
     state = _seed(
         [

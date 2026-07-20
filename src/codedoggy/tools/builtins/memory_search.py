@@ -1,6 +1,11 @@
-"""memory_search — Grok MemorySearchImpl wire surface only.
+"""memory_search — Grok MemorySearchImpl wire surface only (optional).
 
 Source: implementations/memory/search_tool.rs
+
+Product memory policy (CodeDoggy): **Hermes** — curated MEMORY.md is frozen
+into the system prompt; write via ``memory``; recall past turns via
+``session_search``. This tool is kept for Grok wire fidelity / host
+``memory_backend`` injection, not for default model guidance.
 
 Without a real MemoryBackend (extra['memory_backend']), return Grok soft text.
 No invented token-scoring or FTS-as-memory-backend.

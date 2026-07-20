@@ -316,6 +316,7 @@ def run_agent_loop(
                     cres.chars_after,
                     cres.folded_messages,
                 )
+                _reset_plan_reminder_after_compact(extra)
         # Hermes seam: API-only inject into current user (no transcript mutate)
         sample_messages = sample_messages_with_memory(messages, prefetch_block)
         sample_messages = model_sample_messages(
@@ -726,6 +727,7 @@ def run_agent_loop(
                     "chars_after": cres.chars_after,
                     "when": "post_tool_batch",
                 }
+                _reset_plan_reminder_after_compact(extra)
 
         # Drain interjections at next safe point when batch continued
         if phase1.outcome is ToolLoopOutcome.CONTINUE:
@@ -753,6 +755,21 @@ def _last_assistant_text(messages: list[Message]) -> str | None:
         if msg.role is Role.ASSISTANT and msg.content:
             return msg.content
     return None
+
+
+def _reset_plan_reminder_after_compact(extra: dict[str, Any] | None) -> None:
+    """Grok PlanModeTracker::reset_after_compaction after a successful fold."""
+    if not extra:
+        return
+    state = extra.get("session_mode_state")
+    if state is None:
+        return
+    reset = getattr(state, "reset_after_compaction", None)
+    if callable(reset):
+        try:
+            reset()
+        except Exception:  # noqa: BLE001
+            logger.debug("plan reminder reset after compact failed", exc_info=True)
 
 
 def _append_cancelled_tool_results(

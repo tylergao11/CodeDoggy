@@ -7,8 +7,7 @@ Faithful port of Grok Build orchestration concepts:
 * **Turn** = multi-step sample → tools → sample with first-class exits
 * **Tool pipeline** = two-phase precheck then execute (path locks)
 * **Subagent** = child session + summary fold-back
-* **Session mode** = Plan hard gate independent of yolo
-* **Plan-first** = go-steer RequirePlanArtifact + record_plan (gate before mutate)
+* **Session mode** = Plan hard gate independent of yolo (Grok enter/exit plan mode)
 * **Interjection** = mid-turn followup drain
 
 Source map (grok-build):
@@ -36,12 +35,13 @@ from codedoggy.orchestration.interjection import (
     user_query,
 )
 from codedoggy.orchestration.prompt_queue import InterjectionBuffer, PromptQueue, PromptQueueItem
-from codedoggy.orchestration.plan_first import (
-    PlanFirstGate,
-    plan_first_denial,
-    require_plan_artifact_from_env,
+from codedoggy.orchestration.session_mode import (
+    SessionModeState,
+    load_plan_mode_state,
+    plan_mode_edit_gate,
+    plan_mode_json_path,
+    save_plan_mode_state,
 )
-from codedoggy.orchestration.session_mode import SessionModeState, plan_mode_edit_gate
 from codedoggy.orchestration.subagent import (
     SubagentCoordinator,
     SubagentRequest,
@@ -92,9 +92,6 @@ __all__ = [
     "user_query",
     "SessionMode",
     "SessionModeState",
-    "PlanFirstGate",
-    "plan_first_denial",
-    "require_plan_artifact_from_env",
     "SubagentCoordinator",
     "SubagentRequest",
     "SubagentSnapshot",
@@ -123,6 +120,9 @@ __all__ = [
     "make_child_runner",
     "merge_worktree_into_parent",
     "plan_mode_edit_gate",
+    "plan_mode_json_path",
+    "load_plan_mode_state",
+    "save_plan_mode_state",
     "prepare_tool_batch",
     "prepare_tool_call",
     "reattach_worktree",

@@ -20,7 +20,6 @@ from codedoggy.model.auth import auth_status, begin_login, is_imperial
 from codedoggy.model.auth.base import AuthStatus
 from codedoggy.model.catalog import suggested_models
 from codedoggy.model.profile_registry import get_profile
-from codedoggy.model.registry import create_client, model_config_from_env
 
 # UI order for reasoning effort (product default high).
 _REASONING_CHOICES: tuple[tuple[str, str, str], ...] = (
@@ -79,7 +78,7 @@ class AuthWizard:
     provider: str | None = None
     items: list[MenuItem] = field(default_factory=list)
     title: str = "AUTH GATE"
-    subtitle: str = "选择身份 · ↑↓ 移动 · Enter 确认 · Esc 返回"
+    subtitle: str = "选择身份 · ↑↓ 移动 · Enter 确认 · Tab 返回"
     body_note: str = ""
     paste_buffer: str = ""
     paste_prompt: str = ""
@@ -94,7 +93,7 @@ class AuthWizard:
     active_reasoning_enabled: bool = True
     # Model chosen before effort step (may equal active_model).
     pending_model: str = ""
-    # Where Esc returns from the reasoning menu.
+    # Where Tab returns from the reasoning menu.
     _reasoning_from: str = "model"  # model | provider
 
     def open(
@@ -145,12 +144,12 @@ class AuthWizard:
             self._build_reasoning()
         elif self.step == WizardStep.WAITING:
             self.items = [
-                MenuItem("cancel", "取消等待", "Esc", enabled=True, style="danger"),
+                MenuItem("cancel", "取消等待", "Tab", enabled=True, style="muted"),
             ]
         elif self.step == WizardStep.PASTE:
             self.items = [
                 MenuItem("submit", "确认提交", "Enter", style="accent"),
-                MenuItem("back", "返回", "Esc", style="muted"),
+                MenuItem("back", "返回", "Tab", style="muted"),
             ]
         elif self.step == WizardStep.RESULT:
             self.items = [
@@ -164,7 +163,7 @@ class AuthWizard:
         cur = ""
         if self.active_provider or self.active_model:
             cur = f"当前 {self.active_provider or '—'}/{self.active_model or '—'}"
-        self.subtitle = cur or "Provider · Model · 登录 · ↑↓ Enter · Esc"
+        self.subtitle = cur or "Provider · Model · 登录 · ↑↓ Enter · Tab"
         items: list[MenuItem] = []
         active_provider = self.active_provider.strip().lower()
 
@@ -210,7 +209,7 @@ class AuthWizard:
                 )
             )
         items.append(MenuItem("refresh", "刷新状态", "重新探测本机凭证", style="muted"))
-        items.append(MenuItem("close", "关闭", "Esc", style="muted"))
+        items.append(MenuItem("close", "关闭", "Tab", style="muted"))
         self.items = items
 
     def _build_provider(self) -> None:
@@ -295,7 +294,7 @@ class AuthWizard:
                 style="ok" if can_apply else "muted",
             )
         )
-        items.append(MenuItem("back", "返回列表", "Esc", style="muted"))
+        items.append(MenuItem("back", "返回列表", "Tab", style="muted"))
         self.items = items
 
     def _build_model(self) -> None:
@@ -328,7 +327,7 @@ class AuthWizard:
                 style="accent",
             )
         )
-        items.append(MenuItem("back", "返回", "Esc", style="muted"))
+        items.append(MenuItem("back", "返回", "Tab", style="muted"))
         self.items = items
 
     def _build_reasoning(self) -> None:
@@ -354,7 +353,7 @@ class AuthWizard:
                     style="ok" if mark else ("accent" if effort_id == "high" else "normal"),
                 )
             )
-        items.append(MenuItem("back", "返回", "Esc", style="muted"))
+        items.append(MenuItem("back", "返回", "Tab", style="muted"))
         self.items = items
 
     def _enter_reasoning(self, *, from_step: str, model: str | None = None) -> WizardAction:
@@ -722,9 +721,3 @@ def hud_snapshot(current_provider: str | None = None) -> dict[str, Any]:
 def run_browser_login(provider: str, *, cancel_event: Any | None = None) -> AuthStatus:
     """Blocking browser login — call from worker thread."""
     return begin_login(provider, cancel_event=cancel_event)
-
-
-def reload_chat_client(provider: str | None = None) -> Any:
-    """Legacy: build client without ConnectionService (tests / scripts)."""
-    cfg = model_config_from_env(provider=provider)
-    return create_client(cfg, require_auth=True)

@@ -135,7 +135,11 @@ def test_memory_search_tool_integration(tmp_path: Path) -> None:
     store.add("memory", "prefer ripgrep over shell grep for code search")
 
     backend = build_memory_backend(store)
-    tools = ToolRegistryBuilder.new().finalize()
+    from codedoggy.tools.builtins import register_optional_grok_memory_tools
+
+    b = ToolRegistryBuilder.new()
+    register_optional_grok_memory_tools(b)
+    tools = b.finalize(product_surface=False)
     ctx = ToolCallContext(
         cwd=tmp_path,
         extra={"memory_store": store, "memory_backend": backend},
