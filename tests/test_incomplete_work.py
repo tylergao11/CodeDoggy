@@ -35,15 +35,45 @@ def test_open_todo_ids() -> None:
     assert open_todo_ids(st) == ["a", "c"]
 
 
-def test_reasons_plan_first_and_todos() -> None:
+def test_plan_first_alone_not_incomplete() -> None:
+    """RequirePlanArtifact unmet must not block turn completion (prepare-only)."""
+    gate = PlanFirstGate(require_plan_artifact=True)
+    assert incomplete_work_reasons({"plan_first_gate": gate}) == []
+
     st = TodoState()
     st.push("t1", TodoItem(content="do", status="pending"))
-    gate = PlanFirstGate(require_plan_artifact=True)
     reasons = incomplete_work_reasons(
         {"todo_state": st, "plan_first_gate": gate}
     )
     assert any("todos" in r for r in reasons)
-    assert any("record_plan" in r for r in reasons)
+    assert not any("record_plan" in r for r in reasons)
+    assert not any("plan-first" in r for r in reasons)
+
+
+def test_prose_stop_with_plan_first_on_completes(tmp_path: Path) -> None:
+    """Product-shaped: plan-first ON, no open work → prose stop completes in 1 round."""
+    from codedoggy.tools import ToolRegistryBuilder
+
+    tools = ToolRegistryBuilder.new().finalize()
+    gate = PlanFirstGate(require_plan_artifact=True)
+    sampler = _Scripted([SampleResult(content="Here is a short answer.")])
+    result = run_agent_loop(
+        user_text="what is 2+2?",
+        sampler=sampler,
+        tools=tools,
+        cwd=tmp_path,
+        max_turns=3,
+        session_id="s-plan-compose",
+        tool_extra={"plan_first_gate": gate},
+    )
+    assert result.completed is True
+    assert result.rounds == 1
+    nudge_msgs = [
+        m
+        for m in result.messages
+        if m.role is Role.USER and "incomplete_work" in (m.content or "")
+    ]
+    assert not nudge_msgs, "plan-first must not incomplete-nudge prose stop"
 
 
 def test_loop_nudges_instead_of_completed(tmp_path: Path) -> None:

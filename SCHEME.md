@@ -80,7 +80,7 @@ user prompt
        sample(messages, tools)
        archive ASSISTANT
        if no tool_calls → incomplete-work gate
-         (todos / subagents / bg shell tasks / unmet plan-first)
+         (todos / subagents / bg shell tasks only; plan-first is prepare-only)
          else → done
        else three-phase tools:
          Phase1 prepare ALL (schema · pre_tool_use · plan-first · plan gate · policy)

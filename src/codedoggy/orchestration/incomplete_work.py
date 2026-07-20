@@ -1,8 +1,10 @@
 """Incomplete-work gate — block premature turn completion.
 
 Sample with no tool_calls is *sample-done*, not *task-done*. Before finishing
-successfully, refuse when open todos / running children / unmet plan-first /
-active goal remain.
+successfully, refuse when open todos / running children / bg shell tasks remain.
+
+Plan-first (RequirePlanArtifact) is enforced only at tool prepare — not here.
+Unmet plan must not block prose COMPLETED (go-steer: mutate gate, not turn end).
 
 Single source for the loop; no per-call hardcoded lists elsewhere.
 """
@@ -10,8 +12,6 @@ Single source for the loop; no per-call hardcoded lists elsewhere.
 from __future__ import annotations
 
 from typing import Any
-
-from codedoggy.orchestration.plan_first import resolve_plan_first_gate
 
 
 def open_todo_ids(todo_state: Any) -> list[str]:
@@ -102,15 +102,10 @@ def incomplete_work_reasons(extra: dict[str, Any] | None) -> list[str]:
             more = f" (+{len(bg) - 5} more)" if len(bg) > 5 else ""
             reasons.append(f"background shell tasks still running: {preview}{more}")
 
-    gate = resolve_plan_first_gate(bag)
-    if gate is not None and gate.require_plan_artifact and not gate.is_plan_recorded():
-        reasons.append(
-            "plan-first: call record_plan with a non-empty plan before finishing"
-        )
-
     # Goal mode is often a session constraint ("only touch auth"), not a
     # completion checklist — do not block prose-stop solely on goal flags.
     # Completion of checklist-style goals is enforced via todos / update_goal.
+    # Plan-first stays at tool prepare only (see tool_pipeline plan_first_denial).
 
     return reasons
 
@@ -120,6 +115,6 @@ def format_incomplete_work_nudge(reasons: list[str]) -> str:
     return (
         "[incomplete_work] You stopped without tool calls, but open work remains:\n"
         f"{bullets}\n"
-        "Do not claim the task is done. Continue with tools (or update todos/"
-        "record_plan/wait for subagents) until the work is actually finished."
+        "Do not claim the task is done. Continue with tools (or update todos / "
+        "wait for subagents) until the work is actually finished."
     )
