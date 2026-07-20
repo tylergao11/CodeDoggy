@@ -26,6 +26,7 @@ def register_builtins(builder: ToolRegistryBuilder) -> None:
     from codedoggy.tools.builtins.memory_search import MemorySearchTool
     from codedoggy.tools.builtins.monitor import MonitorTool
     from codedoggy.tools.builtins.read_file import ReadFileTool
+    from codedoggy.tools.builtins.record_plan import RecordPlanTool
     from codedoggy.tools.builtins.run_terminal_cmd import RunTerminalCmdTool
     from codedoggy.tools.builtins.scheduler_tools import (
         SchedulerCreateTool,
@@ -70,6 +71,7 @@ def register_builtins(builder: ToolRegistryBuilder) -> None:
     # Orchestration
     builder.register(TodoWriteTool())
     builder.register(UpdateGoalTool())
+    builder.register(RecordPlanTool())  # go-steer plan-first escape valve
     builder.register(EnterPlanModeTool())
     builder.register(ExitPlanModeTool())
     builder.register(AskUserQuestionTool())

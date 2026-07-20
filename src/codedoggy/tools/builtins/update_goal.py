@@ -90,6 +90,27 @@ class UpdateGoalTool(Tool):
         if mode_state is None and kernel is not None:
             mode_state = getattr(kernel, "session_mode_state", None)
 
+        # completed=true must consult the same incomplete-work gate as the loop.
+        if inp.completed is True:
+            from codedoggy.orchestration.incomplete_work import (
+                format_incomplete_work_nudge,
+                incomplete_work_reasons,
+            )
+
+            open_reasons = incomplete_work_reasons(bag)
+            if open_reasons:
+                summary = format_incomplete_work_nudge(open_reasons)
+                refuse = UpdateGoalInput(
+                    completed=False,
+                    message=summary,
+                    blocked_reason=inp.blocked_reason,
+                )
+                ack = Accepted(summary=summary)
+                self._apply_side_effects(
+                    refuse, ack, bag=bag, kernel=kernel, mode_state=mode_state
+                )
+                return summary
+
         # Optional host harness: (UpdateGoalInput) -> UpdateGoalAck
         host_ack: Callable[[UpdateGoalInput], UpdateGoalAck] | None = bag.get(
             "goal_ack_fn"

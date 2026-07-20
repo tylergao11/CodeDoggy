@@ -206,6 +206,7 @@ class SessionStore:
         title: str | None = None,
     ) -> None:
         now = time.time()
+        cwd_stored = _normalize_cwd(cwd) if cwd else None
         with self._lock:
             row = self._conn.execute(
                 "SELECT id FROM sessions WHERE id = ?", (session_id,)
@@ -214,7 +215,7 @@ class SessionStore:
                 self._conn.execute(
                     "INSERT INTO sessions (id, cwd, goal, title, created_at, updated_at) "
                     "VALUES (?, ?, ?, ?, ?, ?)",
-                    (session_id, cwd, goal, title or (goal or "")[:80], now, now),
+                    (session_id, cwd_stored, goal, title or (goal or "")[:80], now, now),
                 )
             else:
                 # Do NOT overwrite cwd on existing sessions (cross-project boundary).
@@ -303,8 +304,9 @@ class SessionStore:
         either caller can hydrate the transcript.
         """
         sid = str(session_id or "").strip()
+        # Persist the same identity used for ownership checks (normcase path).
         requested = _normalize_cwd(cwd)
-        stored_value = str(Path(cwd).expanduser().resolve(strict=False))
+        stored_value = requested
         if not sid:
             return SessionCwdValidation(
                 False,
@@ -391,9 +393,18 @@ class SessionStore:
     ) -> int:
         from codedoggy.memory.redact import redact_secrets
 
-        self.ensure_session(session_id)
+        # Never create unbound sessions here — claim/ensure with cwd first.
+        meta = self.get_session_metadata(session_id)
+        if meta is None:
+            raise ValueError(
+                f"session {session_id!r} is not claimed; "
+                "call ensure_session(..., cwd=) or claim_session before append_message"
+            )
         # Redact before write — no dual-store of unredacted secrets.
         safe_content = redact_secrets(content)
+        safe_reasoning = (
+            redact_secrets(reasoning_content) if reasoning_content else None
+        )
         tc_json = None
         if tool_calls:
             try:
@@ -434,7 +445,7 @@ class SessionStore:
                     tool_name,
                     tool_call_id,
                     tc_json,
-                    reasoning_content,
+                    safe_reasoning,
                     provider_json,
                     str(turn_id or "") or None,
                     outcome_value,
@@ -649,13 +660,22 @@ class SessionStore:
             "messages_after": len(after_msgs),
         }
 
-    def list_recent_sessions(self, *, limit: int = 20) -> list[dict[str, Any]]:
+    def list_recent_sessions(
+        self, *, limit: int = 20, cwd: str | Path | None = None
+    ) -> list[dict[str, Any]]:
+        """List recent sessions; when ``cwd`` is set, only that workspace (fail closed)."""
+        params: list[Any] = []
+        sql = (
+            "SELECT id, cwd, goal, title, created_at, updated_at, message_count "
+            "FROM sessions "
+        )
+        if cwd is not None and str(cwd).strip():
+            sql += "WHERE cwd = ? "
+            params.append(_normalize_cwd(cwd))
+        sql += "ORDER BY updated_at DESC LIMIT ?"
+        params.append(int(limit))
         with self._lock:
-            rows = self._conn.execute(
-                "SELECT id, cwd, goal, title, created_at, updated_at, message_count "
-                "FROM sessions ORDER BY updated_at DESC LIMIT ?",
-                (int(limit),),
-            ).fetchall()
+            rows = self._conn.execute(sql, params).fetchall()
         out = []
         for r in rows:
             d = dict(r)
@@ -738,7 +758,7 @@ class SessionStore:
             params.append(exclude_session_id)
         if cwd:
             sql += "AND s.cwd = ? "
-            params.append(str(cwd))
+            params.append(_normalize_cwd(cwd))
         if roles:
             placeholders = ",".join("?" for _ in roles)
             sql += f"AND m.role IN ({placeholders}) "
@@ -822,7 +842,7 @@ class SessionStore:
             params.append(session_id)
         if cwd:
             sql += " AND s.cwd = ?"
-            params.append(str(cwd))
+            params.append(_normalize_cwd(cwd))
         if roles:
             placeholders = ",".join("?" for _ in roles)
             sql += f" AND m.role IN ({placeholders})"

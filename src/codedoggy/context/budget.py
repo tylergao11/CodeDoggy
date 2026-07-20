@@ -206,14 +206,29 @@ def needs_compaction(messages: list[Message], budget: ContextBudget) -> bool:
     """Grok trigger: usage strictly greater than threshold tokens.
 
     Prefer last real ``prompt_tokens`` from the API when present; fall back
-    to local estimate. Either exceeding the trigger forces compaction.
+    to local estimate. If the live local estimate is already under the
+    trigger (e.g. after prune), clear sticky API usage so we do not force
+    fold after pressure was already relieved.
     """
     if not budget.enabled:
         return False
-    if budget.last_prompt_tokens is not None:
-        if budget.last_prompt_tokens > budget.trigger_tokens:
-            return True
     usage = estimate_tokens(messages)
+    if usage <= budget.trigger_tokens:
+        # Local window already safe — drop stale API reading.
+        if budget.last_prompt_tokens is not None:
+            budget.last_prompt_tokens = None
+        return False
+    if budget.last_prompt_tokens is not None:
+        # API prompt_tokens usually include tools + ephemeral overhead.
+        # Usable trigger already excludes those reserves — normalize first so
+        # we do not double-subtract and force early fold.
+        effective_api = (
+            int(budget.last_prompt_tokens)
+            - int(budget.tools_reserve)
+            - int(budget.ephemeral_reserve)
+        )
+        if effective_api > budget.trigger_tokens:
+            return True
     return usage > budget.trigger_tokens
 
 

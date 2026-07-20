@@ -124,8 +124,8 @@ class SchedulerCreateTool(Tool):
         return ToolNamespace.Doggy
 
     def kind(self) -> ToolKind:
-        # Grok: ToolKind::Other
-        return ToolKind.Other
+        # Mutating schedule registration — EXECUTE ladder, not opaque Other.
+        return ToolKind.Execute
 
     def description(self, _ctx: ListToolsContext | None = None) -> ToolDescription:
         return ToolDescription(
@@ -212,7 +212,7 @@ class SchedulerDeleteTool(Tool):
         return ToolNamespace.Doggy
 
     def kind(self) -> ToolKind:
-        return ToolKind.Other
+        return ToolKind.Execute
 
     def description(self, _ctx: ListToolsContext | None = None) -> ToolDescription:
         return ToolDescription(
@@ -249,7 +249,8 @@ class SchedulerListTool(Tool):
         return ToolNamespace.Doggy
 
     def kind(self) -> ToolKind:
-        return ToolKind.Other
+        # Read-only inventory — must stay allowed under READ_ONLY capability.
+        return ToolKind.Read
 
     def description(self, _ctx: ListToolsContext | None = None) -> ToolDescription:
         return ToolDescription(

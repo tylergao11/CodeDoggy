@@ -79,8 +79,10 @@ def build_session(
     # left notes_append etc. half-wired — schemas on manager, never on toolset.
     memory: MemoryStore | None = None
     if enable_memory:
-        memory = MemoryStore(memory_dir=memory_dir) if memory_dir else MemoryStore()
-        memory.load_from_disk()
+        # Honor CODEDOGGY_MEMORY_CHAR_LIMIT / CODEDOGGY_USER_CHAR_LIMIT (same as CLI).
+        from codedoggy.memory.store import load_on_disk_store
+
+        memory = load_on_disk_store(memory_dir=memory_dir)
 
     session_store: SessionStore | None = None
     if enable_session_store:
@@ -222,6 +224,10 @@ def build_session(
     )
 
     # Grok orchestration spine: mode + interjection + subagent coordinator
+    from codedoggy.orchestration.plan_first import (
+        PlanFirstGate,
+        require_plan_artifact_from_env,
+    )
     from codedoggy.orchestration.prompt_queue import InterjectionBuffer, PromptQueue
     from codedoggy.orchestration.session_mode import SessionModeState
     from codedoggy.orchestration.subagent import SubagentCoordinator, make_child_runner
@@ -230,6 +236,15 @@ def build_session(
     # Session-level goal → enter goal mode so hard gates + update_goal apply
     if goal and str(goal).strip():
         mode_state.enter_goal()
+    # go-steer RequirePlanArtifact: substrate is opt-in; product default ON
+    # (force think-before-mutate). Tests/CI: CODEDOGGY_REQUIRE_PLAN_ARTIFACT=0
+    import os as _os_plan
+
+    _plan_default = not bool(_os_plan.environ.get("PYTEST_CURRENT_TEST"))
+    plan_first_gate = PlanFirstGate(
+        require_plan_artifact=require_plan_artifact_from_env(default=_plan_default),
+        agents_dir=str(cwd_path / ".agents"),
+    )
     interjections = InterjectionBuffer()
     prompt_queue = PromptQueue()
     # High pool: main agent defaults to parallel fan-out of many children.
@@ -263,6 +278,7 @@ def build_session(
         graph=graph,
         connection=connection,
         session_mode_state=mode_state,
+        plan_first_gate=plan_first_gate,
         interjection_buffer=interjections,
         prompt_queue=prompt_queue,
         subagent_coordinator=subagent_coord,

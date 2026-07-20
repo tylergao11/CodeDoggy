@@ -55,6 +55,10 @@ def test_p1_busy_handle_prompt_is_queued_not_completed(tmp_path: Path) -> None:
 
 
 def test_p1_ensure_session_does_not_rewrite_cwd(tmp_path: Path) -> None:
+    import os
+
+    from codedoggy.memory.session_store import _normalize_cwd
+
     db = tmp_path / "s.db"
     store = SessionStore(db)
     store.ensure_session("s1", cwd="/project/A", goal="g1")
@@ -63,8 +67,9 @@ def test_p1_ensure_session_does_not_rewrite_cwd(tmp_path: Path) -> None:
     # find s1
     hit = next(x for x in row if x.get("id") == "s1" or x.get("session_id") == "s1")
     cwd = hit.get("cwd")
-    assert cwd in ("/project/A", str(Path("/project/A")))
-    assert "B" not in str(cwd)
+    # Stored as normalized identity (same key ownership / FTS use).
+    assert cwd == _normalize_cwd("/project/A")
+    assert "B" not in str(cwd) and "b" not in os.path.basename(str(cwd))
 
 
 def test_p1_session_search_scopes_cwd(tmp_path: Path) -> None:
@@ -107,7 +112,7 @@ def test_p1_redact_aws_and_database_url() -> None:
     s = "AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
     r = redact_secrets(s)
     assert "wJalrXUtnFEMI" not in r
-    assert "REDACTED" in r
+    assert "redacted" in r.lower()
     u = "DATABASE_URL=postgres://user:s3cretpass@localhost/db"
     r2 = redact_secrets(u)
     assert "s3cretpass" not in r2

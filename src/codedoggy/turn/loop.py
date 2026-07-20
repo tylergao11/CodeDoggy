@@ -373,13 +373,23 @@ def run_agent_loop(
                     before_chars = estimate_chars(messages)
                     bud = getattr(context_compactor, "budget", None)
                     old_pct = None
-                    if bud is not None:
-                        old_pct = bud.threshold_percent
-                        bud.threshold_percent = min(40, int(bud.threshold_percent))
-                    cres = context_compactor.ensure(messages)
-                    messages = cres.messages
-                    if old_pct is not None and bud is not None:
-                        bud.threshold_percent = old_pct
+                    # Overflow must fold even if awaiting_real_usage latch is set.
+                    was_awaiting = bool(
+                        getattr(context_compactor, "awaiting_real_usage", False)
+                    )
+                    try:
+                        if bud is not None:
+                            old_pct = bud.threshold_percent
+                            bud.threshold_percent = min(40, int(bud.threshold_percent))
+                        if was_awaiting:
+                            context_compactor.awaiting_real_usage = False
+                        cres = context_compactor.ensure(messages)
+                        messages = cres.messages
+                    finally:
+                        if old_pct is not None and bud is not None:
+                            bud.threshold_percent = old_pct
+                        if was_awaiting:
+                            context_compactor.awaiting_real_usage = True
                     after_chars = estimate_chars(messages)
                     overflow_resubmits += 1
                     compact_meta["compactions"] = int(
@@ -501,6 +511,25 @@ def run_agent_loop(
                     )
                     # Re-archive filled final (first archive may have been empty).
                     _archive(on_archive_message, messages[-1])
+            # Sample-done ≠ task-done: refuse COMPLETED while open work remains.
+            from codedoggy.orchestration.incomplete_work import (
+                format_incomplete_work_nudge,
+                incomplete_work_reasons,
+            )
+
+            gate_extra = dict(extra)
+            gate_extra.setdefault("session_id", session_id)
+            open_reasons = incomplete_work_reasons(gate_extra)
+            if open_reasons:
+                nudge = format_incomplete_work_nudge(open_reasons)
+                um = Message(role=Role.USER, content=nudge)
+                messages.append(um)
+                # Do not archive the synthetic nudge into FTS (ephemeral steer).
+                compact_meta["incomplete_work_nudges"] = int(
+                    compact_meta.get("incomplete_work_nudges", 0)
+                ) + 1
+                compact_meta["incomplete_work_reasons"] = list(open_reasons)
+                continue
             return _finish(completed=True, text=final_text)
 
         # True prefire overlap: start flush LLM *before* tools run so it

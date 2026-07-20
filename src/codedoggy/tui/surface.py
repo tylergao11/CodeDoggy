@@ -84,6 +84,26 @@ def session_mode_label(session: Any) -> str:
     }.get(str(raw_mode or "normal"), str(raw_mode or "auto"))
 
 
+def plan_first_label(session: Any) -> str:
+    """HUD fragment when plan-first gate is active and not yet satisfied."""
+    kernel = getattr(getattr(session, "extensions", None), "kernel", None)
+    bag = {
+        "kernel": kernel,
+        "plan_first_gate": getattr(kernel, "plan_first_gate", None) if kernel else None,
+    }
+    try:
+        from codedoggy.orchestration.plan_first import resolve_plan_first_gate
+
+        gate = resolve_plan_first_gate(bag)
+    except Exception:  # noqa: BLE001
+        return ""
+    if gate is None or not gate.require_plan_artifact:
+        return ""
+    if gate.is_plan_recorded():
+        return "plan✓"
+    return "need-plan"
+
+
 def reasoning_text(session: Any) -> str:
     """Reasoning effort label from active connection (e.g. ``推理:high``)."""
     snap = active_connection(session)
@@ -93,14 +113,19 @@ def reasoning_text(session: Any) -> str:
 
 
 def model_and_mode_text(session: Any) -> str:
-    """Prompt caption: ``model · 推理:high · auto``."""
+    """Prompt caption: ``model · 推理:high · auto · need-plan``."""
     snap = active_connection(session)
     model = snap.model if snap is not None else "model"
     mode = session_mode_label(session)
     reason = snap.reasoning_label if snap is not None else ""
+    plan = plan_first_label(session)
+    parts = [model]
     if reason:
-        return f"{model} · {reason} · {mode}"
-    return f"{model} · {mode}"
+        parts.append(reason)
+    parts.append(mode)
+    if plan:
+        parts.append(plan)
+    return " · ".join(parts)
 
 
 def budget_text(session: Any) -> str:
@@ -161,6 +186,8 @@ def hud_projection(session: Any) -> dict[str, Any]:
         "reasoning": snap.reasoning_label if snap is not None else "",
         "reasoning_effort": snap.reasoning_effort if snap is not None else "",
         "reasoning_enabled": bool(snap.reasoning_enabled) if snap is not None else False,
+        "mode": session_mode_label(session),
+        "plan_first": plan_first_label(session),
         "any_logged_in": any_in,
         "rows": rows,
         "current_ok": current_ok,

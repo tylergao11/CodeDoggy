@@ -87,7 +87,32 @@ def plan_mode_edit_gate(
     if not state.is_plan():
         return PlanEditGate.ALLOW
 
-    write_kinds = {ToolKind.Edit, ToolKind.Write, ToolKind.Delete, ToolKind.Move}
+    from codedoggy.orchestration.capability import is_mutating_action
+    from codedoggy.tools.kinds import FILE_MUTATING_KINDS
+
+    # Non-file mutators (MCP use_tool, spawn, shell, scheduler) — no plan-file
+    # carve-out; reject entirely while plan mode is active.
+    if is_mutating_action(kind, tool_name) and kind not in FILE_MUTATING_KINDS:
+        # apply_patch / write names still go through path check below
+        wire = tool_name
+        if ":" in (wire or ""):
+            wire = wire.split(":", 1)[-1]
+        try:
+            from codedoggy.tools.grok_surface import CLIENT_ALIASES
+
+            wire = CLIENT_ALIASES.get(wire or "", wire or "")
+        except Exception:  # noqa: BLE001
+            pass
+        if wire not in {
+            "search_replace",
+            "write",
+            "write_file",
+            "delete_file",
+            "apply_patch",
+        }:
+            return PlanEditGate.REJECT_NON_PLAN_FILE
+
+    write_kinds = set(FILE_MUTATING_KINDS)
     write_names = {
         "search_replace",
         "write",
@@ -95,11 +120,22 @@ def plan_mode_edit_gate(
         "delete_file",
         "apply_patch",
     }
-    is_write = (kind in write_kinds) or (tool_name in write_names)
+    wire_name = tool_name or ""
+    if ":" in wire_name:
+        wire_name = wire_name.split(":", 1)[-1]
+    try:
+        from codedoggy.tools.grok_surface import CLIENT_ALIASES
+
+        wire_name = CLIENT_ALIASES.get(wire_name, wire_name)
+    except Exception:  # noqa: BLE001
+        pass
+    is_write = (kind in write_kinds) or (wire_name in write_names)
     if not is_write:
         return PlanEditGate.ALLOW
 
-    if tool_name == "apply_patch":
+    if wire_name == "apply_patch" or (
+        isinstance(tool_name, str) and tool_name.endswith("apply_patch")
+    ):
         return PlanEditGate.REJECT_NON_PLAN_FILE
 
     path = _extract_path(args)
@@ -118,7 +154,7 @@ def plan_mode_edit_gate(
 
     if target == plan:
         return PlanEditGate.ALLOW
-    return PlanEditGate.REJECT_NON_PLAN_FILE if target != plan else PlanEditGate.ALLOW
+    return PlanEditGate.REJECT_NON_PLAN_FILE
 
 
 def _extract_path(args: dict[str, Any]) -> str | None:

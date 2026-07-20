@@ -127,6 +127,48 @@ class TaskLedger:
             if description is not None:
                 agent.description = description.strip()
 
+    def apply_agent_status(
+        self,
+        task_id: str,
+        agent_id: str,
+        *,
+        label: str,
+        status: str,
+        output: str | None = None,
+        description: str | None = None,
+    ) -> bool:
+        """Route live vs terminal agent writes through the correct fence.
+
+        Non-terminal statuses use ``update_live_agent`` (refuse revive after
+        task/agent done). Terminal statuses use ``update_agent`` only when the
+        task is still open or we are reconciling a terminal snap.
+        """
+        st = (status or "").strip().lower()
+        if st in {"pending", "running", "waiting"}:
+            return self.update_live_agent(
+                task_id,
+                agent_id,
+                label=label,
+                status=st,
+                output=output,
+                description=description,
+            )
+        with self._lock:
+            task = self._find_task(task_id)
+            if task is None:
+                return False
+            # Allow terminal reconcile even after task finished; skip only if
+            # task cancelled and agent already cancelled (no-op noise).
+        self.update_agent(
+            task_id,
+            agent_id,
+            label=label,
+            status=st or status,
+            output=output,
+            description=description,
+        )
+        return True
+
     def update_live_agent(
         self,
         task_id: str,

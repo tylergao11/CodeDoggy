@@ -335,8 +335,15 @@ class AgentTurnRunner:
                     cwd=str(cwd),
                     goal=getattr(session, "goal", None),
                 )
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception as e:  # noqa: BLE001
+                # Fail closed — never archive into an unbound (cwd=NULL) session.
+                logger.error(
+                    "ensure_session failed for %s cwd=%s: %s",
+                    session_id,
+                    cwd,
+                    e,
+                )
+                raise
 
         # Mid-turn tool path: provider tools + session_search read stores from
         # ctx.extra. Kernel.tool_extra is the single source; refresh every run

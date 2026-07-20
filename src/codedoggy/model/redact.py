@@ -130,6 +130,11 @@ _CFG_ANCHORED_RE = re.compile(
     rf"(^[ \t]*(?:export[ \t]+)?[A-Za-z0-9_\-]*{_SECRET_CFG_NAMES}[A-Za-z0-9_\-]*)={_CFG_VALUE}",
     re.IGNORECASE | re.MULTILINE,
 )
+# Mid-line ``password=…`` / ``api_key=…`` (memory write path; not line-anchored).
+_CFG_INLINE_RE = re.compile(
+    rf"\b([A-Za-z0-9_\-]*{_SECRET_CFG_NAMES}[A-Za-z0-9_\-]*)={_CFG_VALUE}",
+    re.IGNORECASE,
+)
 
 _YAML_CFG_NAMES = r"(?:api[ _.\-]?key|token|secret|passwd|password|credential)"
 _YAML_ASSIGN_RE = re.compile(
@@ -316,6 +321,7 @@ def redact_sensitive_text(
             if "://" not in text:
                 text = _CFG_DOTTED_RE.sub(_redact_env, text)
                 text = _CFG_ANCHORED_RE.sub(_redact_env, text)
+                text = _CFG_INLINE_RE.sub(_redact_env, text)
 
         if ":" in text and '"' in text:
 

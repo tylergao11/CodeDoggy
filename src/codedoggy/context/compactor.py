@@ -872,13 +872,11 @@ def _refresh_memory_after_flush(
         return messages
     if not blocks or not str(blocks).strip():
         return messages
-    note = (
-        "[MEMORY refreshed mid-turn after pre-compaction flush]\n"
-        "The following curated MEMORY/USER blocks supersede any older copy "
-        "still present earlier in the system prompt:\n\n"
-        f"{str(blocks).strip()}"
-    )
-    return list(messages) + [Message(role=Role.SYSTEM, content=note)]
+    # Refresh freeze only — never append SYSTEM into the live spine (SCHEME:
+    # curated lives in seed SYSTEM; prefetch is sample-time USER). Snapshot
+    # refresh above updates what the next turn's system_prompt rebuild sees.
+    _ = blocks
+    return messages
 
 
 def _deterministic_sketch(middle: list[Message]) -> str:

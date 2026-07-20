@@ -61,7 +61,7 @@ Session          outer lifecycle, cwd, extensions
 
 Core: `read_file` · `search_replace` · `list_dir` · `grep` · `run_terminal_cmd`  
 Tasks: `get_task_output` · `kill_task` · `monitor` · `spawn_subagent` · `parallel_tasks` · `get_subagent_output`  
-Orchestration: `todo_write` · `update_goal` · `enter_plan_mode` · `exit_plan_mode` · `ask_user_question`  
+Orchestration: `todo_write` · `update_goal` · `record_plan` · `enter_plan_mode` · `exit_plan_mode` · `ask_user_question`  
 Web: `web_search` · `web_fetch`  
 Scheduler: `scheduler_create` · `scheduler_delete` · `scheduler_list`  
 Extras: `memory` · `session_search` · `code_nav` · `image_gen` · `image_edit` · video tools  
@@ -79,9 +79,11 @@ user prompt
        ContextCompactor.ensure
        sample(messages, tools)
        archive ASSISTANT
-       if no tool_calls → done
+       if no tool_calls → incomplete-work gate
+         (todos / subagents / bg shell tasks / unmet plan-first)
+         else → done
        else three-phase tools:
-         Phase1 prepare ALL (schema · pre_tool_use · plan gate · policy)
+         Phase1 prepare ALL (schema · pre_tool_use · plan-first · plan gate · policy)
          Phase2 execute approved (path-lock parallel when safe)
          Phase3 writeback in emission order + after_tool / after_mutation
        exit: completed | max_turns | cancelled | permission_reject | aborted | error
@@ -102,6 +104,7 @@ user prompt
 | Tool prepare/execute | `tool_pipeline.execute_tool_calls_two_phase` |
 | Path lock | `path_lock.lock_path_for_args` |
 | Plan mode | `SessionModeState` + `plan_mode_edit_gate` |
+| Plan-first | go-steer `PlanFirstGate` + `record_plan` (mutate gated until recorded) |
 | Interjection / queue | `InterjectionBuffer` / `PromptQueue` |
 | Subagents | `SubagentCoordinator` + child `run_agent_loop` |
 | Capability | `read-only` / `read-write` / `execute` / `all` |
@@ -116,12 +119,11 @@ user prompt
 ```
 before each sample → ContextCompactor.ensure:
   0. suppress gate
-  1. prune oversized tool results
-  2. under pressure: prune_retained
-  3. memory_flush (soft)
-  4. if over window * threshold → fold middle (commit only if token savings)
-  5. system / MEMORY never dropped
-  on API context overflow → compact-and-resubmit
+  1. under pressure: prune oversized + prune_retained
+  2. memory_flush (soft; refreshes curated snapshot — does not append SYSTEM to live)
+  3. if over usable_window * threshold → fold middle (commit only if token savings)
+  4. system / MEMORY never dropped
+  on API context overflow → compact-and-resubmit (threshold restore in finally)
 ```
 
 Env: `CODEDOGGY_CONTEXT_WINDOW`, `CODEDOGGY_COMPLETION_RESERVE`,

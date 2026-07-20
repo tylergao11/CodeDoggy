@@ -135,6 +135,9 @@ class HermesMemorySelector:
                 session_id=session_filter,
                 cwd=cwd_s,
                 roles=roles,
+                # Same contract as SessionMemoryProvider: failed/cancelled
+                # partials stay out of automatic memory selection.
+                completed_only=True,
             )
         except Exception:  # noqa: BLE001
             return []

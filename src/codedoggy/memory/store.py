@@ -205,6 +205,9 @@ class MemoryStore:
         scan = first_threat_message(content)
         if scan:
             return {"success": False, "error": scan}
+        from codedoggy.memory.redact import redact_secrets
+
+        content = redact_secrets(content)
 
         with self._file_lock(self._path_for(target)):
             self._reload_target(target, skip_drift=True)
@@ -254,6 +257,9 @@ class MemoryStore:
         scan = first_threat_message(new_content)
         if scan:
             return {"success": False, "error": scan}
+        from codedoggy.memory.redact import redact_secrets
+
+        new_content = redact_secrets(new_content)
 
         with self._file_lock(self._path_for(target)):
             bak = self._reload_target(target)

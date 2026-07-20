@@ -249,6 +249,7 @@ def codedoggy_product_appendix() -> str:
 - Prefer `code_nav` for go-to-definition / find-references (code graph); `grep` for free text.
 - Use `session_search` for past conversations; curated MEMORY.md is injected at session start when memory is enabled.
 - Workspace policy may deny writes to protected paths (`.git`, `.env`, …).
+- Plan-first (go-steer): when require_plan_artifact is on, call `record_plan` with a non-empty markdown plan before any write / shell / spawn. Research tools stay allowed. Recording the plan unblocks mutation for the session (no user approval step).
 
 ### MAIN parallel-first principle (you decide — nothing auto-fans-out)
 The harness does **not** split work or run agents for you. Parallelism happens only when **you** call tools. Your default decision rule is parallel-first: dispatch independent work concurrently whenever it is safe and useful, while keeping ordering-sensitive integration on MAIN.

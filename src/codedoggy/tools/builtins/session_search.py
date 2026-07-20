@@ -166,18 +166,8 @@ class SessionSearchTool(Tool):
                 ensure_ascii=False,
                 default=str,
             )
-        # browse — same cwd scope when store supports it
-        try:
-            recent = store.list_recent_sessions(limit=limit, cwd=cwd_scope)
-        except TypeError:
-            recent = store.list_recent_sessions(limit=limit)
-            if cwd_scope and isinstance(recent, list):
-                recent = [
-                    s
-                    for s in recent
-                    if str(s.get("cwd") or "") == cwd_scope
-                    or not s.get("cwd")
-                ]
+        # browse — cwd-scoped only (fail closed; never leak unbound sessions)
+        recent = store.list_recent_sessions(limit=limit, cwd=cwd_scope)
         return json.dumps(
             {"shape": "browse", "cwd": cwd_scope, "sessions": recent},
             ensure_ascii=False,

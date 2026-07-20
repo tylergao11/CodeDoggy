@@ -147,6 +147,8 @@ def on_turn_end(
     if not (user_text or "").strip() or not (assistant_text or "").strip():
         return
     try:
+        # sync_turn owns next-turn warm (blended user+assistant). Do not
+        # queue_prefetch_all(user_text) afterward — that overwrites richer warm.
         memory_manager.sync_all(
             user_text or "",
             assistant_text or "",
@@ -157,13 +159,6 @@ def on_turn_end(
         )
     except Exception:  # noqa: BLE001
         logger.warning("sync_all failed", exc_info=True)
-    try:
-        # Warm next turn (Hermes run_agent post-turn order)
-        memory_manager.queue_prefetch_all(
-            user_text or "", session_id=session_id, cwd=cwd
-        )
-    except Exception:  # noqa: BLE001
-        logger.debug("queue_prefetch_all failed", exc_info=True)
 
 
 def on_pre_compress(

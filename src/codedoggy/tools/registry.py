@@ -354,12 +354,9 @@ class FinalizedToolset(ToolDispatch):
             registered_kind=ft.tool.kind(),
         )
         if (ctx.extra or {}).get("writes_paused"):
-            if ft.kind in {
-                ToolKind.Edit,
-                ToolKind.Write,
-                ToolKind.Delete,
-                ToolKind.Move,
-            } or ft.short_id in {"run_terminal_cmd", "search_replace"}:
+            from codedoggy.orchestration.capability import is_mutating_action
+
+            if is_mutating_action(ft.kind, ft.short_id):
                 raise ToolError(
                     "writes paused — fix the blocking issue before more writes",
                     code="writes_paused",

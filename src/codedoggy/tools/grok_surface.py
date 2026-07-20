@@ -163,6 +163,7 @@ _DOGGY_ENHANCEMENT_IDS: list[str] = [
     "Doggy:session_search",
     "Doggy:code_nav",
     "Doggy:parallel_tasks",  # MAIN aggressive parallel fan-out + aggregate
+    "Doggy:record_plan",  # go-steer plan-first RequirePlanArtifact escape valve
 ]
 
 

@@ -121,11 +121,11 @@ def test_turn_begin_end_order(tmp_path: Path) -> None:
         session_id="s1",
         messages=[{"role": "user", "content": "hi"}],
     )
-    # sync_all + queue_prefetch_all are background — drain worker
+    # sync_all is background — drain worker (warm owned by sync_turn, not
+    # a second queue_prefetch_all that would overwrite blended warm)
     assert mm.flush_pending(timeout=3.0) is True
     assert "turn_start:3" in prov.events
     assert "sync" in prov.events
-    assert "queue_prefetch" in prov.events
 
 
 def test_sample_messages_ephemeral_only() -> None:

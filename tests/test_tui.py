@@ -95,6 +95,24 @@ def test_ledger_keeps_agents_under_their_task_and_exposes_parallel_stage() -> No
     assert _task_status_style(snapshot) == "class:task.status.reporting"
 
 
+def test_apply_agent_status_refuses_revive_after_terminal() -> None:
+    ledger = TaskLedger()
+    task = ledger.create("fence")
+    ledger.apply_agent_status(
+        task.id, "child", label="child", status="completed", output="done"
+    )
+    ledger.finish_task(task.id, "completed")
+    assert (
+        ledger.apply_agent_status(
+            task.id, "child", label="child", status="running", output="late"
+        )
+        is False
+    )
+    snap = ledger.snapshots()[0]
+    child = next(a for a in snap.agents if a.id == "child")
+    assert child.status == "completed"
+
+
 def test_overview_summary_contains_assistant_output_not_tool_noise() -> None:
     messages = [
         Message(role=Role.ASSISTANT, content="我先检查入口。"),

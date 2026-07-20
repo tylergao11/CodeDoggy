@@ -67,6 +67,7 @@ STATUS_TEXT = {
     "waiting": "等待",
     "pending": "准备中",
     "running": "推进中",
+    "queued": "排队中",
     "completed": "已完成",
     "failed": "失败",
     "cancelled": "已取消",
@@ -1006,7 +1007,7 @@ class CodeDoggyTUI:
             activity = self._activity.rebuild(task_id, sub_id, list(live))
 
         output = activity or subagent_text(snap)
-        self.ledger.update_agent(
+        self.ledger.apply_agent_status(
             task_id,
             sub_id,
             label=label,
@@ -1478,18 +1479,20 @@ class CodeDoggyTUI:
                 agent for agent in children if agent.status in {"failed", "cancelled"}
             ]
             if open_children:
-                final_status = "failed"
-                feedback = ("MAIN 未完成并行收口", "warning", 2.2)
+                # MAIN turn ended but children still run — not failure / not done.
+                # _sync_runtime finishes the task when children become terminal.
+                self.ledger.set_task_status(task_id, "running")
+                self.ledger.set_task_phase(task_id, "parallel")
+                feedback = ("MAIN 已汇总，等待子 Agent", "info", 2.2)
             elif failed_children:
-                final_status = "failed"
+                self.ledger.finish_task(task_id, "failed")
                 feedback = ("子 Agent 未全部成功", "warning", 2.2)
             elif status == "completed":
-                final_status = "completed"
+                self.ledger.finish_task(task_id, "completed")
                 feedback = ("MAIN 已汇总，任务完成", "success", None)
             else:
-                final_status = status
+                self.ledger.finish_task(task_id, status)
                 feedback = ("任务未能完成", "warning", 2.2)
-            self.ledger.finish_task(task_id, final_status)
 
             def apply_success() -> None:
                 if feedback[2] is None:
@@ -1511,7 +1514,20 @@ class CodeDoggyTUI:
                 output=message,
             )
             self.ledger.set_report(task_id, "MAIN", message)
-            self.ledger.finish_task(task_id, "failed")
+            task = next(
+                (item for item in self.ledger.snapshots() if item.id == task_id),
+                None,
+            )
+            open_kids = [
+                a
+                for a in ([] if task is None else task.agents[1:])
+                if a.status in {"pending", "running"}
+            ]
+            if open_kids:
+                self.ledger.set_task_status(task_id, "running")
+                self.ledger.set_task_phase(task_id, "parallel")
+            else:
+                self.ledger.finish_task(task_id, "failed")
 
             def apply_fail() -> None:
                 self._set_feedback("任务执行失败", "warning", duration=2.2)
@@ -1566,11 +1582,12 @@ class CodeDoggyTUI:
             label_counts[key] = label_counts.get(key, 0) + 1
             label = base if label_counts[key] == 1 else f"{base} {label_counts[key]}"
             output = subagent_text(snap)
-            self.ledger.update_agent(
+            status = str(snap.status or "waiting")
+            self.ledger.apply_agent_status(
                 task_id,
                 snap.subagent_id,
                 label=label,
-                status=str(snap.status or "waiting"),
+                status=status,
                 output=output,
                 description=description,
             )
@@ -1584,12 +1601,12 @@ class CodeDoggyTUI:
                     self._detail_messages[detail_key] = msgs
                     # Effect: rebuild only after the transcript changed.
                     line = self._activity.rebuild(task_id, snap.subagent_id, msgs)
-                    if line and str(snap.status or "") in {"pending", "running"}:
-                        self.ledger.update_agent(
+                    if line and status in {"pending", "running"}:
+                        self.ledger.apply_agent_status(
                             task_id,
                             snap.subagent_id,
                             label=label,
-                            status=str(snap.status or "waiting"),
+                            status=status,
                             output=line,
                             description=description,
                         )
@@ -1598,10 +1615,29 @@ class CodeDoggyTUI:
             if task.phase in {"done", "failed", "cancelled"}:
                 continue
             children = task.agents[1:]
-            if any(agent.status in {"pending", "running"} for agent in children):
+            open_kids = [
+                a for a in children if a.status in {"pending", "running"}
+            ]
+            if open_kids:
                 self.ledger.set_task_phase(task.id, "parallel")
-            elif children:
+                continue
+            if children:
                 self.ledger.set_task_phase(task.id, "reporting")
+                # MAIN already returned (status left running while waiting);
+                # children now terminal — close the task.
+                main = task.agents[0] if task.agents else None
+                main_done = main is not None and main.status not in {
+                    "pending",
+                    "running",
+                    "waiting",
+                }
+                if task.status == "running" and main_done:
+                    failed = any(
+                        a.status in {"failed", "cancelled"} for a in children
+                    )
+                    self.ledger.finish_task(
+                        task.id, "failed" if failed else "completed"
+                    )
             else:
                 self.ledger.set_task_phase(task.id, "dispatching")
 
@@ -1623,7 +1659,23 @@ class CodeDoggyTUI:
 
     def _is_running(self) -> bool:
         worker_running = self._worker is not None and self._worker.is_alive()
-        return worker_running or getattr(self.session, "phase", None) is SessionPhase.TURN_RUNNING
+        if worker_running or getattr(self.session, "phase", None) is SessionPhase.TURN_RUNNING:
+            return True
+        # Background subagents outlive MAIN's worker — still "running" for UX.
+        task_id = self._active_task_id
+        if task_id:
+            task = next(
+                (item for item in self.ledger.snapshots() if item.id == task_id),
+                None,
+            )
+            if task is not None:
+                for agent in task.agents:
+                    if agent.status in {"pending", "running"}:
+                        return True
+        for snap in self._subagents():
+            if getattr(snap, "status", None) in {"pending", "running"}:
+                return True
+        return False
 
     def _cancel_current(self) -> None:
         if not self._is_running():
@@ -1640,8 +1692,26 @@ class CodeDoggyTUI:
                 except Exception:  # noqa: BLE001
                     pass
         if self._active_task_id:
-            self.ledger.set_task_status(self._active_task_id, "cancelled")
-            self.ledger.set_task_phase(self._active_task_id, "cancelled")
+            tid = self._active_task_id
+            self.ledger.set_task_status(tid, "cancelled")
+            self.ledger.set_task_phase(tid, "cancelled")
+            task = next(
+                (item for item in self.ledger.snapshots() if item.id == tid),
+                None,
+            )
+            for agent in list(getattr(task, "agents", None) or []):
+                aid = getattr(agent, "id", None)
+                if not aid:
+                    continue
+                st = str(getattr(agent, "status", "") or "").lower()
+                if st in {"completed", "failed", "cancelled"}:
+                    continue
+                self.ledger.apply_agent_status(
+                    tid,
+                    str(aid),
+                    label=str(getattr(agent, "label", "") or "AGENT"),
+                    status="cancelled",
+                )
         self._set_feedback("已请求停止当前任务", "warning")
         self.app.invalidate()
 
@@ -2181,9 +2251,8 @@ class CodeDoggyTUI:
             # but avoid re-walking every agent line under the float each frame.
             self._task_refs = [task.id for task in tasks]
             self._agent_refs = []  # no underlay chip handlers while modal owns input
+            # Modal owns focus — do not advance selection via follow-latest.
             if tasks:
-                if self._follow_latest_task:
-                    self._selected_task = len(tasks) - 1
                 self._selected_task %= len(tasks)
             empty = [("", "\n")]
             self._task_line_count = self._count_fragment_lines(empty)
@@ -3406,6 +3475,8 @@ def _turn_status(status: TurnStatus | Any) -> str:
         return "cancelled"
     if value == TurnStatus.MAX_TURNS_REACHED.value:
         return "max_turns"
+    if value == TurnStatus.QUEUED.value:
+        return "queued"
     return "failed"
 
 

@@ -46,7 +46,7 @@ def test_redact_secrets_pure() -> None:
     assert "hunter2xx" not in out
     assert "ghp_" not in out
     assert "BEGIN RSA" not in out
-    assert "[REDACTED" in out
+    assert "redacted" in out.lower() or "REDACTED" in out
     assert redact_secrets(None) == ""
     assert redact_secrets("") == ""
 
@@ -62,17 +62,36 @@ def test_append_message_redacts_before_write(tmp_path: Path) -> None:
         "assistant",
         "ok",
         tool_calls=[{"id": "1", "name": "x", "arguments": {"token": "sk-abcdefghijklmnopqrstuvwxyz1234"}}],
+        reasoning_content="hold sk-proj-abcdefghijklmnopqrstuvwxyz999999 in chain",
     )
     msgs = store.get_messages("s1")
-    blob = " ".join((m.get("content") or "") + " " + str(m.get("tool_calls") or "") for m in msgs)
+    blob = " ".join(
+        (m.get("content") or "")
+        + " "
+        + str(m.get("tool_calls") or "")
+        + " "
+        + str(m.get("reasoning_content") or "")
+        for m in msgs
+    )
     assert "sk-proj-" not in blob
     assert "sk-abcdefghijklmnopqrstuvwxyz1234" not in blob
-    assert "REDACTED" in blob or "[REDACTED" in blob
+    assert "redacted" in blob.lower()
     # FTS must not surface the raw key either
     hits = store.search("OPENAI deploy", limit=5, roles=["user", "assistant"])
     for h in hits:
         assert "sk-proj-" not in (h.content or "")
         assert "sk-proj-" not in (h.snippet or "")
+    store.close()
+
+
+def test_append_message_requires_claimed_session(tmp_path: Path) -> None:
+    """Root cause of cwd=NULL unbound sessions: never create via append."""
+    store = SessionStore(tmp_path / "claim.db")
+    try:
+        store.append_message("ghost", "user", "hi")
+        assert False, "expected ValueError for unclaimed session"
+    except ValueError as e:
+        assert "not claimed" in str(e)
     store.close()
 
 
@@ -114,6 +133,7 @@ def test_hermes_select_scopes_fts_with_cwd_and_roles(tmp_path: Path) -> None:
     assert "[tool]" not in joined
 
     # include_current_session=False excludes request.session_id
+    ss.ensure_session("sid-now", cwd="/proj/alpha", goal="auth", title="now")
     ss.append_message("sid-now", "user", "JWT login current session only unique")
     excl = HermesMemorySelector(
         session_store=ss, include_current_session=False

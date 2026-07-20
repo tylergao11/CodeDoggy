@@ -13,8 +13,12 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Callable
 
-from codedoggy.orchestration.capability import is_read_only_kind
+from codedoggy.orchestration.capability import is_mutating_action, is_read_only_kind
 from codedoggy.orchestration.path_lock import PathLockTable, lock_path_for_args
+from codedoggy.orchestration.plan_first import (
+    plan_first_denial,
+    resolve_plan_first_gate,
+)
 from codedoggy.orchestration.session_mode import (
     PLAN_REJECT_MESSAGE,
     PlanEditGate,
@@ -116,6 +120,22 @@ def prepare_tool_call(
                 hook_name=str(meta.get("hook_name") or "pre_tool_use"),
             )
 
+    # go-steer plan-first pre-check — BEFORE mode/policy (even yolo respects it).
+    # Soft deny (HOOK_DENY): return error observation and keep the batch/turn
+    # alive so the model can call record_plan in the same round. Hard PLAN_REJECT
+    # would cancel siblings and exit the turn as permission_reject — wrong for
+    # the escape-valve workflow.
+    plan_first = resolve_plan_first_gate(extra)
+    denied = plan_first_denial(plan_first, name)
+    if denied is not None:
+        return PrecheckResult(
+            verdict=PrecheckVerdict.HOOK_DENY,
+            observation=f"Error (plan_first): {denied}",
+            tool_name=name,
+            reason=denied,
+            hook_name="plan_first",
+        )
+
     # Plan mode hard gate (Grok plan_mode_edit_gate — independent of yolo)
     if mode_state is not None:
         gate = plan_mode_edit_gate(
@@ -130,10 +150,18 @@ def prepare_tool_call(
                 reason=msg,
             )
 
-    # Workspace policy (hard — PermissionReject)
+    # Workspace policy (hard — PermissionReject). Prefer wire short_id so
+    # HARD_* name lists match registry.call (no client/wire drift).
+    short_id = getattr(ft, "short_id", None) or name
     ctx = ToolCallContext(cwd=cwd, session_id=session_id, extra=dict(extra or {}))
     try:
-        enforce_policy(tool_name=name, kind=kind, args=args, ctx=ctx)
+        enforce_policy(
+            tool_name=str(short_id),
+            kind=kind,
+            args=args,
+            ctx=ctx,
+            registered_kind=kind,
+        )
     except ToolError as e:
         return PrecheckResult(
             verdict=PrecheckVerdict.PERMISSION_REJECT,
@@ -142,8 +170,8 @@ def prepare_tool_call(
             reason=e.message,
         )
 
-    # writes_paused — treat as permission reject for further writes
-    if (extra or {}).get("writes_paused") and not is_read_only_kind(kind):
+    # writes_paused — single mutating classifier (capability.is_mutating_action)
+    if (extra or {}).get("writes_paused") and is_mutating_action(kind, name):
         return PrecheckResult(
             verdict=PrecheckVerdict.PERMISSION_REJECT,
             observation=(

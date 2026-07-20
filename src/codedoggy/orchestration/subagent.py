@@ -608,6 +608,15 @@ class SubagentCoordinator:
                 if result.system_prompt:
                     entry.system_prompt = result.system_prompt
                 entry.resume_count = max(entry.resume_count, result.resume_count)
+                snap = _copy_snap(entry.snapshot)
+                listeners = list(self._listeners)
+            # Terminal notify — same channel as live messages so TUI does not
+            # wait on the 0.35s idle poll after MAIN exits.
+            for cb in listeners:
+                try:
+                    cb(snap, None)
+                except Exception:  # noqa: BLE001
+                    logger.debug("subagent terminal listener failed", exc_info=True)
             return result
 
         fut = self._pool.submit(_job)
@@ -847,6 +856,9 @@ def make_child_runner(
             ),
         )
 
+        # go-steer Q3: children inherit parent's planRecorded via shared gate
+        parent_plan_first = _parent_resource(parent_session, "plan_first_gate")
+
         tool_extra: dict[str, Any] = {
             "kernel": child_resources,
             "is_subagent": True,
@@ -862,6 +874,8 @@ def make_child_runner(
             "isolation": isolation_mode.value,
             "resumed": is_resume,
         }
+        if parent_plan_first is not None:
+            tool_extra["plan_first_gate"] = parent_plan_first
         # Media extras follow the parent's ActiveConnection (same login as MAIN).
         parent_connection = _parent_resource(parent_session, "connection")
         if parent_connection is not None:

@@ -8,6 +8,7 @@ Faithful port of Grok Build orchestration concepts:
 * **Tool pipeline** = two-phase precheck then execute (path locks)
 * **Subagent** = child session + summary fold-back
 * **Session mode** = Plan hard gate independent of yolo
+* **Plan-first** = go-steer RequirePlanArtifact + record_plan (gate before mutate)
 * **Interjection** = mid-turn followup drain
 
 Source map (grok-build):
@@ -35,6 +36,11 @@ from codedoggy.orchestration.interjection import (
     user_query,
 )
 from codedoggy.orchestration.prompt_queue import InterjectionBuffer, PromptQueue, PromptQueueItem
+from codedoggy.orchestration.plan_first import (
+    PlanFirstGate,
+    plan_first_denial,
+    require_plan_artifact_from_env,
+)
 from codedoggy.orchestration.session_mode import SessionModeState, plan_mode_edit_gate
 from codedoggy.orchestration.subagent import (
     SubagentCoordinator,
@@ -86,6 +92,9 @@ __all__ = [
     "user_query",
     "SessionMode",
     "SessionModeState",
+    "PlanFirstGate",
+    "plan_first_denial",
+    "require_plan_artifact_from_env",
     "SubagentCoordinator",
     "SubagentRequest",
     "SubagentSnapshot",

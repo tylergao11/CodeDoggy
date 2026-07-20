@@ -74,8 +74,9 @@ Usage:
 - The target_file parameter can be a relative path in the workspace or an absolute path
 - By default, it reads up to {MAX_LINES_READ} lines starting from the beginning of the file
 - Results are returned with line numbers starting at 1. The format is: LINE_NUMBER→LINE_CONTENT
-- This tool can read PDF files (.pdf), PowerPoint files (.pptx), Jupyter notebooks (.ipynb files), and image files (e.g. PNG, JPG, etc).
-- When reading an image file the contents are presented visually as this tool uses multimodal LLMs.
+- Text files, Jupyter notebooks (.ipynb), and PowerPoint (.pptx) return extractable text.
+- Image files return metadata (dimensions/format), not pixels — no multimodal vision here.
+- PDF files: use format='text' for text extract. format='image' is not supported without a host page renderer (hard error).
 """
 
 
@@ -129,8 +130,9 @@ class ReadFileTool(Tool):
                 "format": {
                     "type": "string",
                     "description": (
-                        "Output format for PDF files. 'image' (default) renders pages as "
-                        "images. 'text' extracts text content. Ignored for non-PDF files."
+                        "Output format for PDF files. 'text' (default) extracts text. "
+                        "'image' is not supported without a host page renderer. "
+                        "Ignored for non-PDF files."
                     ),
                 },
             },
@@ -171,22 +173,14 @@ class ReadFileTool(Tool):
                 raise ToolError(str(e), code="image_error") from e
 
         if is_pdf(path, raw):
-            # Grok default format for PDF is image; without multimodal host we
-            # fall back to text extract and note honesty in error paths.
+            # Default/auto → text extract. format=image has no host renderer here —
+            # hard error (no silent text 兜底 that pretends pages were rendered).
             extract_text = fmt_s == "text" or fmt_s in {None, "auto"}
             if fmt_s == "image":
-                # No page renderer in pure Python tools — honest soft path via text note
-                try:
-                    text = read_pdf_text(
-                        raw,
-                        pages=args.get("pages") if isinstance(args.get("pages"), str) else None,
-                    )
-                except ValueError as e:
-                    raise ToolError(str(e), code="pdf_error") from e
-                return (
-                    "[PDF format=image not available without host page renderer; "
-                    "showing text extract instead]\n\n"
-                    + _window_text(text, args)
+                raise ToolError(
+                    "PDF format='image' requires a host page renderer; "
+                    "use format='text' for text extract instead.",
+                    code="not_supported",
                 )
             if extract_text:
                 try:

@@ -49,6 +49,8 @@ class RuntimeKernel:
     task_manager: Any = None  # BackgroundTaskManager
     scheduler: Any = None  # Scheduler
     agent: Any = None  # optional Agent config package
+    # go-steer plan-first (RequirePlanArtifact / planRecorded)
+    plan_first_gate: Any = None  # PlanFirstGate
     # Goal / todo state (model tools)
     todo_state: Any = None
     goal_log: list = field(default_factory=list)
@@ -89,6 +91,7 @@ class RuntimeKernel:
             "graph",
             "mcp_runtime",
             "session_mode_state",
+            "plan_first_gate",
             "interjection_buffer",
             "subagent_coordinator",
             "subagent_run_fn",
@@ -148,6 +151,8 @@ class RuntimeKernel:
                 populate(extra)
         if self.session_mode_state is not None:
             extra["session_mode_state"] = self.session_mode_state
+        if self.plan_first_gate is not None:
+            extra["plan_first_gate"] = self.plan_first_gate
         if self.interjection_buffer is not None:
             extra["interjection_buffer"] = self.interjection_buffer
         if self.subagent_coordinator is not None:
@@ -196,6 +201,26 @@ class RuntimeKernel:
         if state is not None:
             state.exit_plan(approved=approved)
         self.refresh_tool_extra()
+
+    def replan(self) -> str | None:
+        """go-steer /replan — revoke latest plan artifact + clear planRecorded.
+
+        Returns archived path (or None if nothing to revoke). Model must call
+        record_plan again before mutating tools work.
+        """
+        from codedoggy.orchestration.plan_first import revoke_latest_plan
+
+        gate = self.plan_first_gate
+        if gate is None:
+            return None
+        agents = gate.resolve_agents_dir(self.cwd)
+        if agents is None:
+            gate.clear_plan_recorded()
+            self.refresh_tool_extra()
+            return None
+        revoked = revoke_latest_plan(gate, agents)
+        self.refresh_tool_extra()
+        return str(revoked) if revoked is not None else None
 
     def enter_goal_mode(self) -> None:
         """Enter goal mode — hard tool gate when blocked (orchestration)."""
