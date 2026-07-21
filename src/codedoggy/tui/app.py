@@ -196,7 +196,7 @@ _DETAIL_INPUT_MAX_LINES = 6
 _DOUBLE_CLICK_S = 0.45  # task/plan card double-click window
 # High-res mice fire many SCROLL events per physical notch — require several
 # same-direction ticks before moving one card, then a short cooldown.
-_WHEEL_TASK_NOTCHES = 3
+_WHEEL_TASK_NOTCHES = 2
 _WHEEL_TASK_COOLDOWN_S = 0.14
 # Windows Terminal steals Ctrl+V; we edge-detect the chord and paste images ourselves.
 _WIN32_CTRL_V_DEBOUNCE_S = 0.35
