@@ -106,11 +106,16 @@ def model_config_from_env(
     """Resolve config from args + environment, using provider profiles + auth."""
     _ensure_profiles()
 
-    prov = (
-        provider
-        or os.environ.get("CODEDOGGY_PROVIDER")
-        or "ollama"
-    ).strip().lower()
+    env_provider = (os.environ.get("CODEDOGGY_PROVIDER") or "").strip().lower()
+    explicit_provider = bool((provider or "").strip() or env_provider)
+    if (provider or "").strip():
+        prov = str(provider).strip().lower()
+    elif env_provider:
+        prov = env_provider
+    else:
+        from codedoggy.model.preferred_provider import resolve_startup_provider
+
+        prov = resolve_startup_provider()
     profile = get_profile(prov)
 
     if profile is not None:
@@ -123,20 +128,44 @@ def model_config_from_env(
         default_base = "http://127.0.0.1:11434/v1"
         default_model = "gpt-4o-mini"
 
+    # Auto-picked imperial must not inherit a leftover local Ollama BASE_URL.
+    env_base = os.environ.get("CODEDOGGY_BASE_URL")
+    if (
+        not explicit_provider
+        and prov != "ollama"
+        and env_base
+        and _looks_like_local_ollama_url(env_base)
+    ):
+        env_base = None
+
     resolved_base = (
         base_url
-        or os.environ.get("CODEDOGGY_BASE_URL")
+        or env_base
         or (profile.resolve_base_url(None) if profile else None)
-        or os.environ.get("OLLAMA_HOST")
+        or (os.environ.get("OLLAMA_HOST") if prov == "ollama" else None)
         or default_base
         or ""
     )
     if prov == "ollama":
         resolved_base = _normalize_ollama_base(resolved_base)
+    elif _looks_like_local_ollama_url(resolved_base):
+        # Explicit grok/claude/codex + stale 11434 — fail closed to profile URL.
+        resolved_base = str(
+            (profile.resolve_base_url(None) if profile else None) or default_base or ""
+        )
+
+    env_model = os.environ.get("CODEDOGGY_MODEL")
+    if (
+        not explicit_provider
+        and prov != "ollama"
+        and env_model
+        and _looks_like_ollama_model_tag(env_model)
+    ):
+        env_model = None
 
     resolved_model = (
         model
-        or os.environ.get("CODEDOGGY_MODEL")
+        or env_model
         or default_model
     ).strip()
     from codedoggy.model.context_limits import ensure_model_context_window
@@ -207,6 +236,25 @@ def _normalize_ollama_base(base: str) -> str:
     if "://" not in b and "11434" in b:
         return f"http://{b}/v1" if not b.endswith("/v1") else f"http://{b}"
     return b
+
+
+def _looks_like_local_ollama_url(base: str | None) -> bool:
+    raw = (base or "").strip().lower()
+    if not raw:
+        return False
+    if ":11434" in raw:
+        return True
+    return "127.0.0.1" in raw and "ollama" in raw
+
+
+def _looks_like_ollama_model_tag(model: str | None) -> bool:
+    """Heuristic for leftover local tags (e.g. ``qwen3:8b``) on imperial providers."""
+    name = (model or "").strip().lower()
+    if not name or ":" not in name:
+        return False
+    # Imperial cloud ids rarely use ``name:size`` tags.
+    size = name.rsplit(":", 1)[-1]
+    return size.endswith("b") and any(ch.isdigit() for ch in size)
 
 
 def _env_float(name: str, default: float | None) -> float | None:

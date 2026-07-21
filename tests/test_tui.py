@@ -563,6 +563,29 @@ def test_running_status_and_feedback_fit_narrow_terminals(monkeypatch: object) -
             assert get_cwidth(feedback) <= width
 
 
+def test_reload_client_deferred_until_idle(monkeypatch: object) -> None:
+    """OAuth finish while a turn runs must queue apply, not drop it."""
+    with create_pipe_input() as pipe_input:
+        tui = CodeDoggyTUI(_Session(), input=pipe_input, output=DummyOutput())
+        applied: list[str | None] = []
+
+        monkeypatch.setattr(tui, "_is_running", lambda: True)  # type: ignore[attr-defined]
+        tui._queue_or_apply_reload(provider="grok", message="登录成功")
+        assert tui._pending_reload is not None
+        assert tui._pending_reload["provider"] == "grok"
+        assert applied == []
+
+        monkeypatch.setattr(  # type: ignore[attr-defined]
+            tui,
+            "_apply_reload_client",
+            lambda **kwargs: applied.append(kwargs.get("provider")),
+        )
+        monkeypatch.setattr(tui, "_is_running", lambda: False)  # type: ignore[attr-defined]
+        tui._flush_pending_reload()
+        assert tui._pending_reload is None
+        assert applied == ["grok"]
+
+
 def test_budget_text_keeps_last_used_while_awaiting_usage() -> None:
     """Reasoning / compact clears last_prompt_tokens — UI must not flash '—'."""
     session_surface._budget_sticky.clear()

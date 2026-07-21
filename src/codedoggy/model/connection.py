@@ -206,6 +206,12 @@ class ConnectionService:
         runner: Any | None = None,
     ) -> ConnectionService:
         state = connection_from_config(main, aux=aux, source="bootstrap", generation=0)
+        try:
+            from codedoggy.model.preferred_provider import save_preferred_provider
+
+            save_preferred_provider(state.provider)
+        except Exception:  # noqa: BLE001
+            pass
         return cls(state, client=client, runner=runner)
 
     def bind_runner(self, runner: Any) -> None:
@@ -380,6 +386,12 @@ class ConnectionService:
                 last_error=None,
                 updated_at=time.time(),
             )
+            try:
+                from codedoggy.model.preferred_provider import save_preferred_provider
+
+                save_preferred_provider(prov)
+            except Exception:  # noqa: BLE001
+                pass
             return deepcopy(self._state)
 
     def _push_runtime(self, client: Any, cfg: ModelConfig) -> None:

@@ -504,6 +504,8 @@ class CodeDoggyTUI:
         self._auth_wizard = AuthWizard()
         self._auth_login_worker: threading.Thread | None = None
         self._auth_login_cancel: threading.Event | None = None
+        # Login finished while a turn was running — apply after idle.
+        self._pending_reload: dict[str, Any] | None = None
         self._pending_prompt: str | None = None
         # One-shot startup brand (concept art). Dismissed forever on first task;
         # not "empty ledger" — finished tasks never bring the splash back.
@@ -1979,6 +1981,7 @@ class CodeDoggyTUI:
                 self._sync_runtime()
                 if self._active_task_id == task_id:
                     self._task_started_at = None
+                self._flush_pending_reload()
                 # Never auto-focus task list after a turn ends — leave input alone.
                 self._invalidate_safe()
 
@@ -2193,6 +2196,8 @@ class CodeDoggyTUI:
                 0,
                 min(int(self._detail_cursor_line), max(0, int(self._detail_line_count) - 1)),
             )
+        # Children may be the last thing keeping _is_running true.
+        self._flush_pending_reload()
 
     def _subagents(self) -> list[Any]:
         kernel = getattr(self.session.extensions, "kernel", None)
@@ -5472,47 +5477,13 @@ class CodeDoggyTUI:
             self.app.invalidate()
             return
         if kind == "reload_client":
-            if self._is_running():
-                self._set_feedback(
-                    "任务运行中，结束后再切换模型",
-                    "warning",
-                )
-                self.app.invalidate()
-                return
-            try:
-                snap = self._reload_model_client(
-                    getattr(action, "provider", None),
-                    model=getattr(action, "model", None),
-                    reasoning_effort=getattr(action, "reasoning_effort", None),
-                    reasoning_enabled=getattr(action, "reasoning_enabled", None),
-                )
-                if snap is not None:
-                    # Commit connection truth only after apply succeeds.
-                    self._auth_wizard.active_provider = snap.provider
-                    self._auth_wizard.active_model = snap.model
-                    self._auth_wizard.active_reasoning_effort = snap.reasoning_effort
-                    self._auth_wizard.active_reasoning_enabled = snap.reasoning_enabled
-                    self._auth_wizard.pending_model = ""
-                    # After effort confirm, land on provider menu (not stuck on reasoning).
-                    if self._auth_wizard.step is WizardStep.REASONING:
-                        self._auth_wizard.step = WizardStep.PROVIDER
-                        self._auth_wizard.provider = snap.provider
-                        self._auth_wizard.cursor = 0
-                    if self._auth_wizard.step in {
-                        WizardStep.PROVIDER,
-                        WizardStep.MODEL,
-                        WizardStep.REASONING,
-                        WizardStep.RESULT,
-                        WizardStep.HOME,
-                    }:
-                        self._auth_wizard._rebuild()
-                self._set_feedback(
-                    message or f"已连接 {snap.label if snap else ''}".strip(),
-                    "success",
-                )
-            except Exception as exc:  # noqa: BLE001
-                self._set_feedback(f"切换失败: {exc}", "warning")
-            self.app.invalidate()
+            self._queue_or_apply_reload(
+                provider=getattr(action, "provider", None),
+                model=getattr(action, "model", None),
+                reasoning_effort=getattr(action, "reasoning_effort", None),
+                reasoning_enabled=getattr(action, "reasoning_enabled", None),
+                message=message,
+            )
             return
         if kind == "start_login":
             provider = str(getattr(action, "provider", None) or "grok")
@@ -5559,6 +5530,99 @@ class CodeDoggyTUI:
             target=worker, name="auth-login", daemon=True
         )
         self._auth_login_worker.start()
+
+    def _queue_or_apply_reload(
+        self,
+        *,
+        provider: str | None,
+        model: str | None = None,
+        reasoning_effort: str | None = None,
+        reasoning_enabled: bool | None = None,
+        message: str = "",
+    ) -> None:
+        """Apply connection now, or after the current turn if one is running.
+
+        OAuth can finish while MAIN is still on bootstrap ollama; dropping the
+        reload left tokens saved but sampler on 11434. Queue + flush fixes that.
+        """
+        if self._is_running():
+            self._pending_reload = {
+                "provider": provider,
+                "model": model,
+                "reasoning_effort": reasoning_effort,
+                "reasoning_enabled": reasoning_enabled,
+                "message": message,
+            }
+            label = (provider or "provider").strip() or "provider"
+            self._set_feedback(
+                f"登录已保存，当前任务结束后自动切换到 {label}",
+                "info",
+            )
+            self.app.invalidate()
+            return
+        self._pending_reload = None
+        self._apply_reload_client(
+            provider=provider,
+            model=model,
+            reasoning_effort=reasoning_effort,
+            reasoning_enabled=reasoning_enabled,
+            message=message,
+        )
+
+    def _flush_pending_reload(self) -> None:
+        pending = self._pending_reload
+        if not pending or self._is_running():
+            return
+        self._pending_reload = None
+        self._apply_reload_client(
+            provider=pending.get("provider"),
+            model=pending.get("model"),
+            reasoning_effort=pending.get("reasoning_effort"),
+            reasoning_enabled=pending.get("reasoning_enabled"),
+            message=str(pending.get("message") or ""),
+        )
+
+    def _apply_reload_client(
+        self,
+        *,
+        provider: str | None,
+        model: str | None = None,
+        reasoning_effort: str | None = None,
+        reasoning_enabled: bool | None = None,
+        message: str = "",
+    ) -> None:
+        try:
+            snap = self._reload_model_client(
+                provider,
+                model=model,
+                reasoning_effort=reasoning_effort,
+                reasoning_enabled=reasoning_enabled,
+            )
+            if snap is not None:
+                self._auth_wizard.active_provider = snap.provider
+                self._auth_wizard.active_model = snap.model
+                self._auth_wizard.active_reasoning_effort = snap.reasoning_effort
+                self._auth_wizard.active_reasoning_enabled = snap.reasoning_enabled
+                self._auth_wizard.pending_model = ""
+                if self._auth_wizard.step is WizardStep.REASONING:
+                    self._auth_wizard.step = WizardStep.PROVIDER
+                    self._auth_wizard.provider = snap.provider
+                    self._auth_wizard.cursor = 0
+                if self._auth_wizard.step in {
+                    WizardStep.PROVIDER,
+                    WizardStep.MODEL,
+                    WizardStep.REASONING,
+                    WizardStep.RESULT,
+                    WizardStep.HOME,
+                }:
+                    self._auth_wizard._rebuild()
+            self._set_feedback(
+                message or f"已连接 {snap.label if snap else ''}".strip(),
+                "success",
+            )
+        except Exception as exc:  # noqa: BLE001
+            self._set_feedback(f"切换失败: {exc}", "warning")
+        self.app.invalidate()
 
     def _reload_model_client(
         self,

@@ -69,6 +69,11 @@ def test_model_config_from_env_ollama_defaults(monkeypatch: pytest.MonkeyPatch) 
     monkeypatch.delenv("CODEDOGGY_PROVIDER", raising=False)
     monkeypatch.delenv("CODEDOGGY_MODEL", raising=False)
     monkeypatch.delenv("CODEDOGGY_BASE_URL", raising=False)
+    # Isolate from the developer's real ~/.grok login + preferred provider.
+    monkeypatch.setattr(
+        "codedoggy.model.preferred_provider.resolve_startup_provider",
+        lambda: "ollama",
+    )
     cfg = model_config_from_env()
     assert cfg.provider == "ollama"
     assert "11434" in cfg.base_url or "ollama" in cfg.base_url.lower()
