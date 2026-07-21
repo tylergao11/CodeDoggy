@@ -21,7 +21,6 @@ from codedoggy.tui.open_path import (
     paths_from_detail_record,
     tool_paths_from_arguments,
 )
-from codedoggy.tui.theme import DETAIL_STYLE_RULES
 
 # Grok injects plan/MCP/scheduler hints as <system-reminder>...</system-reminder>
 # on the model-facing user turn. Never paint those in the TUI transcript.
@@ -412,7 +411,7 @@ def render_detail_body(
     """Render every selected record without summarizing or truncating bodies.
 
     ``path_mouse(path)`` optional: returns a prompt_toolkit mouse handler so
-    image_gen paths open in the OS viewer on click (Grok-style link affordance).
+    tool/file paths open in the OS viewer on click.
 
     ``collapsed_keys`` / ``fold_mouse`` optional: fold tool arg/result blocks.
     """
@@ -437,7 +436,7 @@ def render_detail_body(
         )
         if path_mouse is not None:
             for file_path in paths_from_detail_record(record):
-                label = f"  Ctrl+点击 {link_label_for_path(file_path)}"
+                label = f"  点击打开 {link_label_for_path(file_path)}"
                 label = _truncate_display(label, width)
                 handler = path_mouse(file_path)
                 if handler is not None:
@@ -1573,7 +1572,6 @@ def _status_text(status: str) -> str:
 __all__ = [
     "DETAIL_FILTERS",
     "DETAIL_FILTER_LABELS",
-    "DETAIL_STYLE_RULES",
     "MAX_THOUGHTS_WIDTH",
     "THINKING_LABEL",
     "THINKING_PREVIEW_LINES",

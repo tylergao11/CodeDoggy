@@ -3,12 +3,24 @@
 Terminal paste only carries text. When the OS clipboard holds a bitmap,
 we dump it under ``.codedoggy/attachments/`` and return that path so the
 user (and image_edit tools) can use a normal filesystem reference.
+
+Windows notes
+-------------
+* Win+Shift+S / WeChat / browsers often expose ``PNG`` or ``image/png`` in
+  addition to (or instead of) ``CF_DIB``. Reading only ``CF_DIB`` misses many
+  real-world screenshots.
+* Windows Terminal steals Ctrl+V for "paste text" — image-only clipboards
+  produce an empty paste and the app never sees ``c-v``. The TUI polls the
+  Ctrl+V chord on Windows and pastes images itself when present.
+* True OS drag-and-drop is not delivered to console TUIs; WT may paste the
+  dropped file path as text — :func:`coerce_image_path_text` handles that.
 """
 
 from __future__ import annotations
 
 import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -17,6 +29,7 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 _ATTACH_DIRNAME = Path(".codedoggy") / "attachments"
+_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tif", ".tiff"}
 
 
 def save_clipboard_image(cwd: Path | str, *, prefix: str = "paste") -> Path | None:
@@ -35,7 +48,7 @@ def save_clipboard_image(cwd: Path | str, *, prefix: str = "paste") -> Path | No
     dest_png = _next_path(out_dir, prefix=prefix, ext="png")
     saved: Path | None = None
     if sys.platform == "win32":
-        saved = _save_windows(dest_png)
+        saved = _save_windows(dest_png, out_dir=out_dir, prefix=prefix)
     elif sys.platform == "darwin":
         saved = _save_macos(dest_png)
     else:
@@ -55,6 +68,40 @@ def get_system_clipboard_text() -> str | None:
     if sys.platform == "darwin":
         return _macos_clipboard_text()
     return _linux_clipboard_text()
+
+
+def coerce_image_path_text(
+    text: str | None, *, cwd: Path | str | None = None
+) -> Path | None:
+    """If ``text`` is a local image path / file URI, return an existing file.
+
+    Covers Windows Terminal drag-drop (pastes the path as text) and
+    Explorer "Copy as path".
+    """
+    if not text or not str(text).strip():
+        return None
+    raw = str(text).strip().strip('"').strip("'")
+    # file:///C:/foo.png or file://localhost/C:/foo.png
+    if raw.lower().startswith("file:"):
+        raw = re.sub(r"^file:(?://localhost)?/+", "", raw, flags=re.I)
+        if re.match(r"^[A-Za-z]:", raw):
+            pass
+        else:
+            raw = "/" + raw.lstrip("/")
+    # One path per paste (first non-empty line).
+    line = raw.splitlines()[0].strip().strip('"').strip("'")
+    if not line:
+        return None
+    candidate = Path(line)
+    if not candidate.is_absolute() and cwd is not None:
+        candidate = Path(cwd) / line
+    try:
+        candidate = candidate.expanduser()
+        if candidate.is_file() and candidate.suffix.lower() in _IMAGE_EXTS:
+            return candidate.resolve()
+    except OSError:
+        return None
+    return None
 
 
 def insert_path_token(path: Path | str, *, cwd: Path | str | None = None) -> str:
@@ -100,11 +147,58 @@ def _cleanup_tiny(path: Path) -> None:
         pass
 
 
-def _save_windows(dest: Path) -> Path | None:
-    """PNG via WinForms (STA); CF_DIB→BMP fallback without PowerShell."""
-    # 1) Fast path: CF_DIB via ctypes (no process spawn).
+def _copy_into_attachments(
+    src: Path, out_dir: Path, *, prefix: str
+) -> Path | None:
+    ext = src.suffix.lower().lstrip(".") or "png"
+    if src.suffix.lower() not in _IMAGE_EXTS:
+        ext = "png"
+    dest = _next_path(out_dir, prefix=prefix, ext=ext)
+    try:
+        shutil.copy2(src, dest)
+    except OSError as e:
+        logger.debug("copy attachment failed: %s", e)
+        return None
+    if dest.is_file() and dest.stat().st_size >= 32:
+        return dest.resolve()
+    return None
+
+
+def _save_windows(
+    dest: Path, *, out_dir: Path, prefix: str
+) -> Path | None:
+    """Prefer raw PNG/JPEG clipboard bytes, then HDROP, DIB, WinForms."""
+    # 1) Modern apps: registered PNG / image/* bytes (Win+Shift+S, browsers…).
+    for name, ext in (
+        ("PNG", "png"),
+        ("image/png", "png"),
+        ("image/jpeg", "jpg"),
+        ("image/jpg", "jpg"),
+        ("image/webp", "webp"),
+        ("image/bmp", "bmp"),
+        ("image/gif", "gif"),
+    ):
+        blob = _windows_clipboard_format_bytes(name)
+        if blob and len(blob) > 32:
+            target = dest if ext == "png" else _next_path(out_dir, prefix=prefix, ext=ext)
+            try:
+                target.write_bytes(blob)
+            except OSError:
+                continue
+            if target.is_file() and target.stat().st_size > 32:
+                return target.resolve()
+
+    # 2) Explorer "Copy" / some shots: file drop list.
+    for dropped in _windows_hdrop_paths():
+        if dropped.suffix.lower() in _IMAGE_EXTS and dropped.is_file():
+            copied = _copy_into_attachments(dropped, out_dir, prefix=prefix)
+            if copied is not None:
+                return copied
+
+    # 3) Classic DIB → BMP (no process spawn).
     dib = _save_windows_dib(dest.with_suffix(".bmp"))
-    # Prefer PNG when PowerShell STA works (better for tools / smaller).
+
+    # 4) WinForms GetImage → PNG (covers CF_BITMAP synthesis).
     png = _save_windows_powershell_png(dest)
     if png is not None:
         if dib is not None and dib != png:
@@ -114,6 +208,107 @@ def _save_windows(dest: Path) -> Path | None:
                 pass
         return png
     return dib
+
+
+def _windows_clipboard_format_bytes(format_name: str) -> bytes | None:
+    """Read a named clipboard format (e.g. ``PNG``, ``image/png``) as raw bytes."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+    except ImportError:
+        return None
+
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+    user32.RegisterClipboardFormatW.argtypes = [wintypes.LPCWSTR]
+    user32.RegisterClipboardFormatW.restype = wintypes.UINT
+    user32.OpenClipboard.argtypes = [wintypes.HWND]
+    user32.OpenClipboard.restype = wintypes.BOOL
+    user32.CloseClipboard.argtypes = []
+    user32.CloseClipboard.restype = wintypes.BOOL
+    user32.IsClipboardFormatAvailable.argtypes = [wintypes.UINT]
+    user32.IsClipboardFormatAvailable.restype = wintypes.BOOL
+    user32.GetClipboardData.argtypes = [wintypes.UINT]
+    user32.GetClipboardData.restype = wintypes.HANDLE
+    kernel32.GlobalLock.argtypes = [wintypes.HGLOBAL]
+    kernel32.GlobalLock.restype = ctypes.c_void_p
+    kernel32.GlobalUnlock.argtypes = [wintypes.HGLOBAL]
+    kernel32.GlobalUnlock.restype = wintypes.BOOL
+    kernel32.GlobalSize.argtypes = [wintypes.HGLOBAL]
+    kernel32.GlobalSize.restype = ctypes.c_size_t
+
+    fmt = user32.RegisterClipboardFormatW(format_name)
+    if not fmt:
+        return None
+    if not user32.OpenClipboard(None):
+        return None
+    try:
+        if not user32.IsClipboardFormatAvailable(fmt):
+            return None
+        handle = user32.GetClipboardData(fmt)
+        if not handle:
+            return None
+        ptr = kernel32.GlobalLock(handle)
+        if not ptr:
+            return None
+        try:
+            size = int(kernel32.GlobalSize(handle))
+            if size < 32:
+                return None
+            return ctypes.string_at(ptr, size)
+        finally:
+            kernel32.GlobalUnlock(handle)
+    finally:
+        user32.CloseClipboard()
+
+
+def _windows_hdrop_paths() -> list[Path]:
+    """Paths from CF_HDROP (Explorer copy / some drag sources mirrored to clip)."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+    except ImportError:
+        return []
+
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+    CF_HDROP = 15
+
+    user32.OpenClipboard.argtypes = [wintypes.HWND]
+    user32.OpenClipboard.restype = wintypes.BOOL
+    user32.CloseClipboard.argtypes = []
+    user32.CloseClipboard.restype = wintypes.BOOL
+    user32.IsClipboardFormatAvailable.argtypes = [wintypes.UINT]
+    user32.IsClipboardFormatAvailable.restype = wintypes.BOOL
+    user32.GetClipboardData.argtypes = [wintypes.UINT]
+    user32.GetClipboardData.restype = wintypes.HANDLE
+    shell32.DragQueryFileW.argtypes = [
+        wintypes.HANDLE,
+        wintypes.UINT,
+        wintypes.LPWSTR,
+        wintypes.UINT,
+    ]
+    shell32.DragQueryFileW.restype = wintypes.UINT
+
+    if not user32.OpenClipboard(None):
+        return []
+    try:
+        if not user32.IsClipboardFormatAvailable(CF_HDROP):
+            return []
+        handle = user32.GetClipboardData(CF_HDROP)
+        if not handle:
+            return []
+        count = int(shell32.DragQueryFileW(handle, 0xFFFFFFFF, None, 0))
+        out: list[Path] = []
+        buf = ctypes.create_unicode_buffer(1024)
+        for i in range(count):
+            n = int(shell32.DragQueryFileW(handle, i, buf, 1024))
+            if n > 0:
+                out.append(Path(buf.value))
+        return out
+    finally:
+        user32.CloseClipboard()
 
 
 def _save_windows_powershell_png(dest: Path) -> Path | None:

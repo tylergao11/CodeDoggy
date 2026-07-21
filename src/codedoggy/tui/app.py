@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 import shutil
+import sys
 import threading
 import time
 from collections.abc import Callable
@@ -43,9 +44,9 @@ from prompt_toolkit.widgets import Frame, TextArea
 
 from codedoggy.session.types import SessionPhase, TurnStatus
 from codedoggy.tui.clipboard_image import (
+    coerce_image_path_text,
     get_system_clipboard_text,
     insert_image_chip,
-    insert_path_token,
     save_clipboard_image,
 )
 from codedoggy.tui.agent_detail import (
@@ -82,6 +83,37 @@ STATUS_TEXT = {
 
 _STREAM_PREVIEW_LIMIT = 2_000
 _STREAM_REFRESH_INTERVAL_S = 0.04
+
+
+def _mouse_control_held(event: MouseEvent | None = None) -> bool:
+    """True when Ctrl is held for a mouse event.
+
+    prompt_toolkit's Win32 mouse path always passes an empty modifier set
+    (``UNKNOWN_MODIFIER``), so ``MouseModifier.CONTROL in event.modifiers``
+    is permanently false on classic Windows console input. Read the real
+    keyboard state as a fallback.
+    """
+    if event is not None:
+        mods = getattr(event, "modifiers", None) or ()
+        try:
+            from prompt_toolkit.mouse_events import MouseModifier
+
+            if MouseModifier.CONTROL in mods:
+                return True
+        except Exception:  # noqa: BLE001
+            pass
+        for mod in mods:
+            if getattr(mod, "value", mod) == "CONTROL":
+                return True
+    if sys.platform == "win32":
+        try:
+            import ctypes
+
+            # VK_CONTROL = 0x11; high bit set ⇒ currently down.
+            return bool(ctypes.windll.user32.GetAsyncKeyState(0x11) & 0x8000)
+        except Exception:  # noqa: BLE001
+            return False
+    return False
 
 
 def _append_stream_preview(
@@ -162,6 +194,12 @@ _DOG_EAR = "∪"
 _INPUT_MAX_LINES = 8
 _DETAIL_INPUT_MAX_LINES = 6
 _DOUBLE_CLICK_S = 0.45  # task/plan card double-click window
+# High-res mice fire many SCROLL events per physical notch — require several
+# same-direction ticks before moving one card, then a short cooldown.
+_WHEEL_TASK_NOTCHES = 3
+_WHEEL_TASK_COOLDOWN_S = 0.14
+# Windows Terminal steals Ctrl+V; we edge-detect the chord and paste images ourselves.
+_WIN32_CTRL_V_DEBOUNCE_S = 0.35
 
 
 class InteractiveScrollbarMargin(Margin):
@@ -500,6 +538,9 @@ class CodeDoggyTUI:
         self._selected_line = 0
         self._task_line_count = 1  # clamp cursor y — PT crashes if y >= line_count
         self._pinned_task_for_line: int | None = None  # re-pin only on task change
+        # Wheel → card focus damping (see _wheel_task_focus).
+        self._wheel_task_accum = 0
+        self._wheel_task_last_move_at = 0.0
         # Active-task interject flash for homepage card: task_id -> (until, preview)
         self._interject_flash: dict[str, tuple[float, str]] = {}
         self._modal_open = False
@@ -569,7 +610,6 @@ class CodeDoggyTUI:
         )
         # before_render throttle + splash cache (ESC/modal close snappiness)
         self._last_sync_runtime_at = 0.0
-        self._paint_clock = 0.0  # one monotonic sample per paint (no extra invalidate)
         self._doggy_empty_cache: tuple[tuple[Any, ...], StyleAndTextTuples] | None = None
         # Full task-list fragment cache: skip card rebuild when content unchanged.
         self._task_paint_cache: tuple[Any, ...] | None = None
@@ -584,6 +624,8 @@ class CodeDoggyTUI:
         self._view_lock = threading.RLock()
         self._prompt_history = self._make_prompt_history()
         self._last_pasted_path: str | None = None
+        self._win32_ctrl_v_down = False
+        self._win32_ctrl_v_last_at = 0.0
 
         self._task_control = FormattedTextControl(
             text=self._render_tasks,
@@ -591,13 +633,12 @@ class CodeDoggyTUI:
             show_cursor=False,
             get_cursor_position=self._task_cursor_position,
         )
-        self._task_window = ScrollableWindow(
+        self._task_window = Window(
             content=self._task_control,
             wrap_lines=False,  # line y == content row; wrap broke scroll/cursor map
+            # Wheel/Page move card focus; no scrollbar (would fight focus navigation).
+            # Cursor pin + ScrollOffsets keep the selected card in view.
             scroll_offsets=ScrollOffsets(top=1, bottom=3),
-            right_margins=[
-                InteractiveScrollbarMargin(on_scroll=self._on_task_scrollbar)
-            ],
             style="class:root",
             dont_extend_height=False,
         )
@@ -1391,7 +1432,7 @@ class CodeDoggyTUI:
         @keys.add("c-v", filter=prompt_paste, eager=True)
         @keys.add("s-insert", filter=prompt_paste, eager=True)
         def _paste_image_or_text(event: Any) -> None:
-            """Clipboard image → save file → insert path; else OS/text paste."""
+            """Clipboard: image → chip, else text / image-file path."""
             self._paste_into_buffer(event)
 
         # Mouse selection does not set shift_mode — stock Backspace won't cut.
@@ -1569,11 +1610,12 @@ class CodeDoggyTUI:
 
         @keys.add("pageup", filter=tasks_focused)
         def _tasks_page_up(_: Any) -> None:
-            self._scroll_tasks(-max(4, _terminal_height() // 2))
+            # Jump several cards (not document lines).
+            self._move_task(-max(2, _terminal_height() // 12))
 
         @keys.add("pagedown", filter=tasks_focused)
         def _tasks_page_down(_: Any) -> None:
-            self._scroll_tasks(max(4, _terminal_height() // 2))
+            self._move_task(max(2, _terminal_height() // 12))
 
         @keys.add("c-l", filter=~modal)
         def _open_auth(_: Any) -> None:
@@ -1696,33 +1738,49 @@ class CodeDoggyTUI:
             pass
 
     def _paste_into_buffer(self, event: Any) -> None:
-        """If OS clipboard holds an image, dump it and insert a「查看图片」chip.
+        """Paste whatever the clipboard holds: image chip, else text / file path.
 
-        Otherwise paste OS / prompt_toolkit text. Intercepting Ctrl+V means we
-        must read the *system* clipboard ourselves — PT's pad is often empty.
+        Preference matches user expectation — last copied image → chip; last
+        copied text → text. Windows Terminal may swallow Ctrl+V for images;
+        ``_poll_win32_ctrl_v_image_paste`` covers that path.
         """
         buffer = event.current_buffer
         if buffer.selection_state is not None:
             buffer.cut_selection()
         cwd = getattr(self.session, "cwd", None) or Path.cwd()
+
+        # Debounce against the Win32 Ctrl+V poll (same physical keypress).
+        now = time.monotonic()
+        if now - float(self._win32_ctrl_v_last_at) < _WIN32_CTRL_V_DEBOUNCE_S:
+            return
+
+        saved: Path | None = None
         try:
             saved = save_clipboard_image(cwd)
         except Exception:  # noqa: BLE001
             saved = None
+
+        if saved is None:
+            text_probe: str | None = None
+            try:
+                data = event.app.clipboard.get_data()
+                raw = getattr(data, "text", None) if data is not None else None
+                if isinstance(raw, str) and raw:
+                    text_probe = raw
+            except Exception:  # noqa: BLE001
+                text_probe = None
+            if not text_probe:
+                try:
+                    text_probe = get_system_clipboard_text()
+                except Exception:  # noqa: BLE001
+                    text_probe = None
+            path_hit = coerce_image_path_text(text_probe, cwd=cwd)
+            if path_hit is not None:
+                saved = path_hit
+
         if saved is not None:
-            token = insert_image_chip(saved, cwd=cwd)
-            pos = buffer.cursor_position
-            before = buffer.text[:pos]
-            lead = " " if before and not before[-1].isspace() else ""
-            insert = f"{lead}{token} "
-            text = buffer.text
-            buffer.text = text[:pos] + insert + text[pos:]
-            buffer.cursor_position = pos + len(insert)
-            self._last_pasted_path = str(saved)
-            self._set_feedback(
-                f"已粘贴{VIEW_IMAGE_LABEL} · Ctrl+点击路径可打开",
-                "info",
-            )
+            self._win32_ctrl_v_last_at = now
+            self._insert_image_chip(buffer, saved, cwd=cwd)
             event.app.invalidate()
             return
 
@@ -1745,8 +1803,25 @@ class CodeDoggyTUI:
             buffer.text = body[:pos] + text + body[pos:]
             buffer.cursor_position = pos + len(text)
         else:
-            self._set_feedback("剪贴板没有可用图片或文字", "warning")
+            self._set_feedback("剪贴板是空的", "warning")
         event.app.invalidate()
+
+    def _insert_image_chip(
+        self, buffer: Any, saved: Path | str, *, cwd: Path | str
+    ) -> None:
+        token = insert_image_chip(saved, cwd=cwd)
+        pos = buffer.cursor_position
+        before = buffer.text[:pos]
+        lead = " " if before and not before[-1].isspace() else ""
+        insert = f"{lead}{token} "
+        text = buffer.text
+        buffer.text = text[:pos] + insert + text[pos:]
+        buffer.cursor_position = pos + len(insert)
+        self._last_pasted_path = str(saved)
+        self._set_feedback(
+            f"已粘贴{VIEW_IMAGE_LABEL} · Ctrl+点击打开",
+            "info",
+        )
 
     def _accept_prompt(self, buffer: Any) -> bool:
         prompt = buffer.text.strip()
@@ -2071,9 +2146,6 @@ class CodeDoggyTUI:
 
     def _before_render(self) -> None:
         """prompt_toolkit before_render hook — keep off the hot path when idle."""
-        # Single clock sample for this paint. Animations (spinners, ==>) read it;
-        # they must never schedule their own invalidate / full redraw storms.
-        self._paint_clock = time.monotonic()
         # Fixed 30fps (GrokBuild animation.fps default). No dynamic downclock.
         try:
             self.app.refresh_interval = 1.0 / 30.0
@@ -2081,11 +2153,70 @@ class CodeDoggyTUI:
             pass
         # Goal mode is exclusive of plan approval chrome.
         self._clear_plan_ui_if_goal()
-        # Interactive scrollbar + Window wheel only touch vertical_scroll;
-        # re-anchor cursor lines so get_cursor_position cannot snap back.
+        # Interactive detail scrollbar only touches vertical_scroll;
+        # re-anchor the detail cursor so get_cursor_position cannot snap back.
         self._sync_detail_scroll_from_window()
-        self._sync_task_scroll_from_window()
+        # WT steals Ctrl+V: when the chord is held and clipboard is an image,
+        # paste the chip ourselves (text paste still comes from the terminal).
+        self._poll_win32_ctrl_v_image_paste()
         self._sync_runtime()
+
+    def _prompt_buffer_for_paste(self) -> Any | None:
+        """Active prompt buffer (main or detail interject), or None."""
+        try:
+            layout = self.app.layout
+            if layout.has_focus(self._input):
+                return self._input.buffer
+            if (
+                self._modal_open
+                and self._modal_kind == "agent"
+                and layout.has_focus(self._detail_input)
+            ):
+                return self._detail_input.buffer
+        except Exception:  # noqa: BLE001
+            return None
+        return None
+
+    def _poll_win32_ctrl_v_image_paste(self) -> None:
+        """Catch Ctrl+V when the host terminal swallows the key for text paste.
+
+        Only acts when the clipboard holds an image — so plain text Ctrl+V is
+        still handled by Windows Terminal / our ``c-v`` binding, never doubled.
+        """
+        if sys.platform != "win32":
+            return
+        buffer = self._prompt_buffer_for_paste()
+        if buffer is None:
+            self._win32_ctrl_v_down = False
+            return
+        try:
+            import ctypes
+
+            # VK_CONTROL=0x11, VK_V=0x56; high bit ⇒ currently down.
+            ctrl = bool(ctypes.windll.user32.GetAsyncKeyState(0x11) & 0x8000)
+            v_key = bool(ctypes.windll.user32.GetAsyncKeyState(0x56) & 0x8000)
+        except Exception:  # noqa: BLE001
+            return
+        chord = ctrl and v_key
+        was = bool(self._win32_ctrl_v_down)
+        self._win32_ctrl_v_down = chord
+        if not chord or was:
+            return
+        now = time.monotonic()
+        if now - float(self._win32_ctrl_v_last_at) < _WIN32_CTRL_V_DEBOUNCE_S:
+            return
+        cwd = getattr(self.session, "cwd", None) or Path.cwd()
+        try:
+            saved = save_clipboard_image(cwd)
+        except Exception:  # noqa: BLE001
+            saved = None
+        if saved is None:
+            return
+        self._win32_ctrl_v_last_at = now
+        if buffer.selection_state is not None:
+            buffer.cut_selection()
+        self._insert_image_chip(buffer, saved, cwd=cwd)
+        self._invalidate_safe()
 
     def _clear_plan_ui_if_goal(self) -> None:
         """If session entered Goal, drop plan approval chrome."""
@@ -2529,45 +2660,20 @@ class CodeDoggyTUI:
         width = max(16, _terminal_width())
         border = self._prompt_border_class()
         rail_width = width - 4
-        # Title plate in the top rail when wide enough.
+        # Solid focus rail (same as selected task cards) — no marching scan.
         plate = " 交代任务 "
         plate_w = get_cwidth(plate)
-        if border != "class:prompt.border.focus" or rail_width < 8:
-            if rail_width >= plate_w + 4:
-                left = max(1, (rail_width - plate_w) // 2)
-                right = max(1, rail_width - plate_w - left)
-                fr = [
-                    (border, "  ╭" + "─" * left),
-                    ("class:prompt.caption", plate),
-                    (border, "─" * right + "╮"),
-                ]
-            else:
-                fr = [(border, "  ╭" + "─" * rail_width + "╮")]
-            return self._with_input_focus_mouse(fr)
-
-        scan = int(time.monotonic() * 14) % rail_width
-        styles = ["class:prompt.border.dim"] * rail_width
-        styles[0] = border
-        for offset in range(3):
-            styles[(scan + offset) % rail_width] = border
-        fragments: StyleAndTextTuples = [(border, "  ╭")]
         if rail_width >= plate_w + 4:
             left = max(1, (rail_width - plate_w) // 2)
             right = max(1, rail_width - plate_w - left)
-            for style, cells in groupby(styles[:left]):
-                fragments.append((style, "─" * sum(1 for _ in cells)))
-            fragments.append(("class:prompt.caption", plate))
-            for style, cells in groupby(styles[left + plate_w : left + plate_w + right]):
-                fragments.append((style, "─" * sum(1 for _ in cells)))
-            # pad if scan groups short
-            used = left + plate_w + right
-            if used < rail_width:
-                fragments.append((border, "─" * (rail_width - used)))
+            fr = [
+                (border, "  ╭" + "─" * left),
+                ("class:prompt.caption", plate),
+                (border, "─" * right + "╮"),
+            ]
         else:
-            for style, cells in groupby(styles):
-                fragments.append((style, "─" * sum(1 for _ in cells)))
-        fragments.append((border, "╮"))
-        return self._with_input_focus_mouse(fragments)
+            fr = [(border, "  ╭" + "─" * rail_width + "╮")]
+        return self._with_input_focus_mouse(fr)
 
     def _render_prompt_right(self) -> StyleAndTextTuples:
         # One │ per visual input row so the frame grows with wrap height.
@@ -2648,15 +2754,11 @@ class CodeDoggyTUI:
         caption = f" {caption_text} "
         fill = max(1, width - 4 - get_cwidth(caption))
         border = self._prompt_border_class()
-        rail = (
-            "class:prompt.border.dim"
-            if border == "class:prompt.border.focus"
-            else border
-        )
+        # Full solid focus border — match selected task-card chrome (no dim mid-rail).
         return self._with_input_focus_mouse(
             [
                 (border, "  ╰"),
-                (rail, "─" * fill),
+                (border, "─" * fill),
                 ("class:prompt.caption", caption),
                 (border, "╯"),
             ]
@@ -3127,12 +3229,9 @@ class CodeDoggyTUI:
 
     def _todo_badge_mouse(self) -> Callable[[MouseEvent], object]:
         def _on_up(event: MouseEvent) -> None:
-            from prompt_toolkit.mouse_events import MouseModifier
-
-            mods = getattr(event, "modifiers", None) or ()
             now = time.monotonic()
             # Ctrl+left or double-click → open MAIN 计划 tab.
-            if MouseModifier.CONTROL in mods:
+            if _mouse_control_held(event):
                 self._todo_badge_last_click = None
                 self._open_active_main_plan_tab()
                 return
@@ -3245,7 +3344,9 @@ class CodeDoggyTUI:
         tasks = self.ledger.snapshots()
         fragments: StyleAndTextTuples = []
         line = 0
-        width = max(1, _terminal_width() - 2)
+        # Full terminal width: short lines leave unmapped cells; PT remaps those
+        # clicks to (0,0) = first card (see _task_blank_line).
+        width = max(1, _terminal_width())
 
         # Modal float covers this pane — skip expensive splash/task paint while open
         # so ESC close is not stuck behind a full truecolor doggy recompute.
@@ -3328,59 +3429,11 @@ class CodeDoggyTUI:
             )
             # Anchor only when a real selection exists (user pick / focus helper).
             is_cursor_task = has_sel and task_index == self._selected_task
-            # Focused card frame = same recipe as the main input prompt focus.
-            framed = selected and has_frame
             inner_width = max(1, width - 2) if has_frame else width
-            # prompt.border.focus when selected; quiet spine otherwise.
-            side_style = (
-                "class:prompt.border.focus"
-                if framed
-                else "class:task.spine"
-            )
             card_start = line
             if is_cursor_task:
                 selected_line_start = card_start
             card_mouse = self._task_card_mouse(task_index)
-            if has_frame:
-                # Whole card is the hit target (frame + body + padding).
-                fragments.extend(
-                    self._task_card_h_rail(
-                        top=True,
-                        inner_width=inner_width,
-                        framed=framed,
-                        mouse=card_mouse,
-                    )
-                )
-                line += 1
-
-            def append_task_line(parts: StyleAndTextTuples) -> None:
-                """Paint one card row — entire row (incl. pad/rails) is clickable.
-
-                Nested handlers (e.g. agent row) keep their own mouse; everything
-                else uses the card handler (select / Ctrl+left open).
-                """
-                nonlocal line
-                if has_frame:
-                    fragments.append((side_style, "│", card_mouse))
-                used = 0
-                for part in parts:
-                    style = part[0]
-                    text = part[1]
-                    used += get_cwidth(text)
-                    if len(part) >= 3 and part[2] is not None:
-                        fragments.append(part)
-                    else:
-                        fragments.append((style, text, card_mouse))
-                if used < inner_width:
-                    fragments.append(
-                        ("", " " * (inner_width - used), card_mouse)
-                    )
-                if has_frame:
-                    fragments.append((side_style, "│", card_mouse))
-                fragments.append(("", "\n", card_mouse))
-                line += 1
-
-            # Compact chat-list density: title + status + wrapped summary.
             active = task.phase in {
                 "dispatching",
                 "parallel",
@@ -3388,117 +3441,145 @@ class CodeDoggyTUI:
                 "planning",
                 "plan_review",
             } or task.status == "running"
-            is_latest = task_index == len(tasks) - 1
-            spine_style = "class:task.spine.active" if active else "class:task.spine"
-            prefix = "  "
+            # Pseudo-card surface: whole-row bg fill (not ASCII-table chrome).
+            if selected:
+                face = "class:task.card.selected"
+                border = "class:task.card.border.selected"
+                title_cls = "class:task.title.selected"
+                report_cls = "class:report.selected"
+                stream_cls = "class:report.stream.selected"
+            elif active:
+                face = "class:task.card.active"
+                border = "class:task.card.border.active"
+                title_cls = "class:task.title.active"
+                report_cls = "class:report.active"
+                stream_cls = "class:report.stream"
+            else:
+                face = "class:task.card"
+                border = "class:task.card.border"
+                title_cls = "class:task.title"
+                report_cls = "class:report"
+                stream_cls = "class:report"
+
+            def append_task_line(parts: StyleAndTextTuples) -> None:
+                """Paint one card row — entire row (incl. pad/rails) is clickable."""
+                nonlocal line
+                if has_frame:
+                    fragments.append((border, "│", card_mouse))
+                used = 0
+                for part in parts:
+                    # Layer face under semantic color so the whole card has one bg.
+                    raw = part[0] or ""
+                    style = f"{face} {raw}".strip() if raw else face
+                    text = part[1]
+                    used += get_cwidth(text)
+                    if len(part) >= 3 and part[2] is not None:
+                        fragments.append((style, text, part[2]))
+                    else:
+                        fragments.append((style, text, card_mouse))
+                if used < inner_width:
+                    fragments.append(
+                        (face, " " * (inner_width - used), card_mouse)
+                    )
+                if has_frame:
+                    fragments.append((border, "│", card_mouse))
+                fragments.append(("", "\n", card_mouse))
+                line += 1
+
+            if has_frame:
+                fragments.extend(
+                    self._task_card_h_rail(
+                        top=True,
+                        inner_width=inner_width,
+                        mouse=card_mouse,
+                        border_class=border,
+                    )
+                )
+                line += 1
+
             flash = self._interject_preview(task.id)
-            status = (
-                _compact_task_stage_text(task, interject=flash)
-                if width < 34
-                else _task_stage_text(task, interject=flash)
-            )
-            # Total task duration on the homepage card (live while running).
-            elapsed_label = _task_elapsed_label(task)
-            if elapsed_label:
-                status = f"{status} · {elapsed_label}"
-            if selected:
-                marker = "›"
-            elif flash:
-                marker = "↩"
-            elif is_latest and active:
-                marker = "●"
-            elif active:
-                marker = "•"
-            else:
-                marker = "·"
-            if selected:
-                marker_style = "class:task.marker.selected"
-            elif flash:
-                marker_style = "class:task.marker.interject"
-            elif active:
-                marker_style = "class:task.marker.active"
-            else:
-                marker_style = "class:task.marker.idle"
-            gutter = f"{marker} "
-            gutter_w = get_cwidth(gutter)
-            text_cols = max(1, inner_width - get_cwidth(prefix) - gutter_w)
-            # Show full title by wrapping — do not hard-crop with "…" when it fits.
-            title_lines = _wrap_display_lines(task.title, text_cols, max_lines=20)
-            if not title_lines:
-                title_lines = [""]
-            status_w = get_cwidth(status)
-            first = title_lines[0]
+            # One quiet status word — no stacked hints / agent counts on the cover.
+            status = _compact_task_stage_text(task, interject=flash)
+            if active:
+                elapsed_label = _task_elapsed_label(task)
+                if elapsed_label and width >= 28:
+                    status = f"{status} · {elapsed_label}"
             status_style = (
                 "class:task.interject"
                 if flash
                 else _task_status_style(task)
             )
-            if (
-                len(title_lines) == 1
-                and status_w + 1 < text_cols
-                and get_cwidth(first) + 1 + status_w <= text_cols
-            ):
+            # Cover: title (1 line) + status. Marker stays minimal.
+            marker = "›" if selected else ("●" if active else " ")
+            marker_style = (
+                "class:task.marker.selected"
+                if selected
+                else (
+                    "class:task.marker.active"
+                    if active
+                    else "class:task.marker.idle"
+                )
+            )
+            gutter = f" {marker} "
+            gutter_w = get_cwidth(gutter)
+            text_cols = max(1, inner_width - gutter_w)
+            title_lines = _wrap_display_lines(task.title, text_cols, max_lines=1)
+            first = title_lines[0] if title_lines else ""
+            status_w = get_cwidth(status)
+            if status_w + 1 < text_cols and get_cwidth(first) + 1 + status_w <= text_cols:
                 gap = max(1, text_cols - get_cwidth(first) - status_w)
                 append_task_line(
                     [
-                        (spine_style, prefix),
                         (marker_style, gutter),
-                        ("class:task.title", first),
+                        (title_cls, first),
                         (status_style, " " * gap + status),
                     ]
                 )
             else:
                 append_task_line(
                     [
-                        (spine_style, prefix),
                         (marker_style, gutter),
-                        ("class:task.title", first),
+                        (title_cls, first),
                     ]
                 )
-                for cont in title_lines[1:]:
-                    append_task_line(
-                        [
-                            (spine_style, prefix),
-                            ("", " " * gutter_w),
-                            ("class:task.title", cont),
-                        ]
-                    )
-                # Status on its own row when title is multi-line or too wide.
                 append_task_line(
                     [
-                        (spine_style, prefix),
-                        ("", " " * gutter_w),
+                        (face, " " * gutter_w),
                         (status_style, status),
                     ]
                 )
 
-            # Full summary via wrap — human prose only, never tool live names.
+            # Breathing row inside the card.
+            append_task_line([(face, "")])
+
+            # Stream / one-line cover copy — max 2 lines (detail owns the rest).
             summary = _task_list_summary(task, interject=flash)
             if summary:
-                sum_cols = max(1, inner_width - get_cwidth(prefix) - gutter_w)
-                for sum_line in _wrap_display_lines(summary, sum_cols, max_lines=12):
+                sum_cols = max(1, inner_width - gutter_w)
+                body_cls = stream_cls if (active or flash) else report_cls
+                for sum_line in _wrap_display_lines(summary, sum_cols, max_lines=2):
                     append_task_line(
                         [
-                            (spine_style, prefix),
-                            ("", " " * gutter_w),
-                            ("class:report", sum_line),
+                            (face, " " * gutter_w),
+                            (body_cls, sum_line),
                         ]
                     )
-
-            # No ↳ MAIN / agent rows on the list — extra lines jiggle when
-            # arrowing through cards. Open detail via Tab / Ctrl+click.
 
             if has_frame:
                 fragments.extend(
                     self._task_card_h_rail(
                         top=False,
                         inner_width=inner_width,
-                        framed=framed,
                         mouse=card_mouse,
+                        border_class=border,
                     )
                 )
                 line += 1
-            # No blank spacer between cards — frames already separate them.
+            # Card list gap — MUST be full-width spaces (not bare \\n).
+            # prompt_toolkit Window remaps clicks on unmapped cells to (0,0),
+            # which is the first task card's mouse handler.
+            fragments.extend(self._task_blank_line(width, self._task_gap_mouse()))
+            line += 1
 
         # Pad remaining viewport with void hit-targets — click clears selection.
         void = self._task_void_mouse()
@@ -3508,7 +3589,7 @@ class CodeDoggyTUI:
             win_h = 0
         pad_lines = max(12, (win_h - line + 4) if win_h else 12)
         for _ in range(pad_lines):
-            fragments.append(("", "\n", void))
+            fragments.extend(self._task_blank_line(width, void))
             line += 1
 
         # Re-pin cursor only when a real selection exists — never jump list to end.
@@ -3568,14 +3649,6 @@ class CodeDoggyTUI:
                     tuple(agents),
                 )
             )
-        # Focused card top scan must tick; otherwise paint cache freezes it.
-        scan_frame = 0
-        if (
-            self._task_selection_active
-            and self._selected_task >= 0
-            and self._task_list_has_focus()
-        ):
-            scan_frame = int(self._paint_clock * 14) % 16
         return (
             width,
             int(self._selected_task),
@@ -3584,57 +3657,38 @@ class CodeDoggyTUI:
             self._pinned_task_for_line,
             int(self._selected_line),
             self._task_list_has_focus(),
-            scan_frame,
             tuple(rows),
         )
+
+    @staticmethod
+    def _task_blank_line(
+        width: int, mouse: Callable[[MouseEvent], object]
+    ) -> StyleAndTextTuples:
+        """One full-width blank row with a real mouse hit-target on every cell.
+
+        Root cause (blank click → first card): prompt_toolkit ``Window`` mouse
+        routing builds ``rowcol_to_yx`` only for *painted characters*. A bare
+        ``\\n`` line has no cells. Clicks on those screen positions miss the map
+        and fall through to ``Point(x=0, y=0)`` — the first task card. Painting
+        ``width`` spaces attaches the void/gap handler to the whole row.
+        """
+        w = max(1, int(width))
+        return [("", " " * w + "\n", mouse)]
 
     def _task_card_h_rail(
         self,
         *,
         top: bool,
         inner_width: int,
-        framed: bool,
         mouse: Callable[[MouseEvent], object],
+        border_class: str = "class:task.card.border",
     ) -> StyleAndTextTuples:
-        """Card top/bottom edge — mirror ``_render_prompt_top`` / bottom exactly.
-
-        Focused:
-        - top: dim rail + 3-cell pink scan (prompt focus animation)
-        - bottom: pink corners + dim fill (no scan)
-        - corners and sides use ``prompt.border.focus``
-        Unfocused: quiet ``task.spine`` box.
-        """
+        """Card top/bottom edge — soft hairline; selected uses brand border."""
         corner_l = "╭" if top else "╰"
         corner_r = "╮" if top else "╯"
         w = max(1, int(inner_width))
-        if not framed:
-            return [
-                (
-                    "class:task.spine",
-                    f"{corner_l}{'─' * w}{corner_r}\n",
-                    mouse,
-                ),
-            ]
-        # Same style classes as the main input chrome.
-        border = "class:prompt.border.focus"
-        dim = "class:prompt.border.dim"
-        if top:
-            # Identical scan to _render_prompt_top (focused branch).
-            scan = int(time.monotonic() * 14) % w
-            styles = [dim] * w
-            styles[0] = border
-            for offset in range(3):
-                styles[(scan + offset) % w] = border
-            out: StyleAndTextTuples = [(border, corner_l, mouse)]
-            for style, cells in groupby(styles):
-                out.append((style, "─" * sum(1 for _ in cells), mouse))
-            out.append((border, corner_r + "\n", mouse))
-            return out
-        # Bottom: same as _render_prompt_bottom — pink corners, dim mid rail.
         return [
-            (border, corner_l, mouse),
-            (dim, "─" * w, mouse),
-            (border, corner_r + "\n", mouse),
+            (border_class, f"{corner_l}{'─' * w}{corner_r}\n", mouse),
         ]
 
     def _task_list_has_focus(self) -> bool:
@@ -4889,35 +4943,10 @@ class CodeDoggyTUI:
             pass
         self.app.invalidate()
 
-    def _on_task_scrollbar(self, scroll: int) -> None:
-        """Keep task cursor anchor on the scrollbar-driven viewport top."""
-        self._follow_latest_task = False
-        max_y = max(0, int(self._task_line_count) - 1)
-        self._selected_line = max(0, min(max_y, int(scroll)))
-
     def _on_detail_scrollbar(self, scroll: int) -> None:
         """Keep detail cursor anchor on the scrollbar-driven viewport top."""
         max_y = max(0, int(self._detail_line_count) - 1)
         self._detail_cursor_line = max(0, min(max_y, int(scroll)))
-
-    def _scroll_tasks(self, delta_lines: int) -> None:
-        """Manual scroll: move content + stop auto-follow of the latest task."""
-        self._follow_latest_task = False
-        win = self._task_window
-        info = getattr(win, "render_info", None)
-        if info is not None:
-            max_scroll = max(0, int(info.content_height) - int(info.window_height))
-            win.vertical_scroll = max(
-                0, min(max_scroll, int(win.vertical_scroll) + int(delta_lines))
-            )
-        else:
-            win.vertical_scroll = max(0, int(win.vertical_scroll) + int(delta_lines))
-        # Keep cursor y near the new viewport so the next paint does not snap back.
-        max_y = max(0, int(self._task_line_count) - 1)
-        self._selected_line = max(
-            0, min(max_y, int(win.vertical_scroll))
-        )
-        self.app.invalidate()
 
     def _only_mouse_up(
         self,
@@ -4928,8 +4957,7 @@ class CodeDoggyTUI:
         """Fragment mouse handlers must not swallow wheel incorrectly.
 
         Returning None for non-UP events marks the event handled. Wheel over
-        task chips scrolls the task list; wheel over modal/detail must let the
-        Window scroll (or scroll the detail pane), never the underlay tasks.
+        task cards moves focus; wheel over modal/detail scrolls that pane.
         No pre-click / hover chrome.
         """
 
@@ -4955,7 +4983,9 @@ class CodeDoggyTUI:
                         self._scroll_todo_pane(-1 if step < 0 else 1)
                         return None
                     if target == "tasks" and not self._modal_open:
-                        self._scroll_tasks(step)
+                        # Homepage wheel = card focus, not document line scroll.
+                        delta = -1 if step < 0 else 1
+                        self._wheel_task_focus(delta)
                         return None
                     if target == "detail" and (
                         self._modal_open or self._ask_active
@@ -5016,23 +5046,6 @@ class CodeDoggyTUI:
                 self._detail_cursor_line = max(0, min(max_y, scroll))
             finally:
                 self._detail_scroll_syncing = False
-
-    def _sync_task_scroll_from_window(self) -> None:
-        """Same cursor/viewport coupling for the main task list scrollbar."""
-        if self._modal_open or self._ask_active:
-            return
-        try:
-            win = self._task_window
-            scroll = int(getattr(win, "vertical_scroll", 0) or 0)
-        except Exception:  # noqa: BLE001
-            return
-        max_y = max(0, int(self._task_line_count) - 1)
-        cursor = int(self._selected_line)
-        info = getattr(win, "render_info", None)
-        height = int(info.window_height) if info is not None else 1
-        height = max(1, height)
-        if cursor < scroll or cursor >= scroll + height:
-            self._selected_line = max(0, min(max_y, scroll))
 
     def _selected_task_view(self) -> TaskView | None:
         tasks = self.ledger.snapshots()
@@ -5155,12 +5168,6 @@ class CodeDoggyTUI:
         except Exception:  # noqa: BLE001
             return False
 
-    def _maybe_focus_latest_after_task_event(self, task_id: str) -> None:
-        """No-op: submit/turn events must not steal focus from the input.
-
-        Kept as a stub so older call sites / tests stay import-safe.
-        """
-        return
 
     def _move_task(self, delta: int) -> None:
         tasks = self.ledger.snapshots()
@@ -5178,6 +5185,33 @@ class CodeDoggyTUI:
         self._follow_latest_task = self._selected_task == len(tasks) - 1
         self._pinned_task_for_line = None
         self.app.invalidate()
+
+    def _wheel_task_focus(self, delta: int) -> None:
+        """Mouse wheel → card focus, damped for high-resolution mice.
+
+        One physical notch often yields many SCROLL events. Accumulate
+        same-direction ticks and enforce a short cooldown after each move so
+        the list does not leap several cards per flick.
+        """
+        if not delta:
+            return
+        now = time.monotonic()
+        if now - float(self._wheel_task_last_move_at) < _WHEEL_TASK_COOLDOWN_S:
+            return
+        step = 1 if delta > 0 else -1
+        if self._wheel_task_accum and (self._wheel_task_accum > 0) != (step > 0):
+            self._wheel_task_accum = 0
+        self._wheel_task_accum += step
+        if abs(self._wheel_task_accum) < _WHEEL_TASK_NOTCHES:
+            return
+        move = 1 if self._wheel_task_accum > 0 else -1
+        self._wheel_task_accum = 0
+        self._wheel_task_last_move_at = now
+        self._move_task(move)
+        try:
+            self.app.layout.focus(self._task_window)
+        except Exception:  # noqa: BLE001
+            pass
 
     def _move_task_agent(self, delta: int) -> None:
         task = self._selected_task_view()
@@ -5369,7 +5403,7 @@ class CodeDoggyTUI:
 
         No hover chrome, no auto-scroll-to-bottom on single click.
         """
-        from prompt_toolkit.mouse_events import MouseButton, MouseModifier
+        from prompt_toolkit.mouse_events import MouseButton
 
         def handler(event: MouseEvent) -> object:
             btn = getattr(event, "button", None)
@@ -5382,10 +5416,10 @@ class CodeDoggyTUI:
                 MouseEventType.SCROLL_DOWN,
             }:
                 if not self._modal_open:
-                    step = (
-                        -3 if event.event_type is MouseEventType.SCROLL_UP else 3
+                    delta = (
+                        -1 if event.event_type is MouseEventType.SCROLL_UP else 1
                     )
-                    self._scroll_tasks(step)
+                    self._wheel_task_focus(delta)
                     return None
                 return NotImplemented
             if event.event_type is not MouseEventType.MOUSE_UP:
@@ -5409,7 +5443,6 @@ class CodeDoggyTUI:
                 self.app.layout.focus(self._task_window)
             except Exception:  # noqa: BLE001
                 pass
-            mods = getattr(event, "modifiers", None) or ()
             now = time.monotonic()
             last = self._task_card_last_click
             is_double = (
@@ -5417,7 +5450,7 @@ class CodeDoggyTUI:
                 and last[0] == task_index
                 and (now - last[1]) <= _DOUBLE_CLICK_S
             )
-            if MouseModifier.CONTROL in mods or is_double:
+            if _mouse_control_held(event) or is_double:
                 self._task_card_last_click = None
                 self._open_selected_task()
             else:
@@ -5435,6 +5468,7 @@ class CodeDoggyTUI:
         self._pinned_task_for_line = None
         self._task_mouse_down_index = None
         self._task_card_last_click = None
+        self._wheel_task_accum = 0
         if focus_input:
             try:
                 self.app.layout.focus(self._input)
@@ -5444,7 +5478,7 @@ class CodeDoggyTUI:
         self.app.invalidate()
 
     def _task_gap_mouse(self) -> Callable[[MouseEvent], object]:
-        """1-line gap between cards: click clears selection."""
+        """1-line gap between cards: wheel moves focus; click clears selection."""
 
         def handler(event: MouseEvent) -> object:
             if event.event_type in {
@@ -5452,10 +5486,10 @@ class CodeDoggyTUI:
                 MouseEventType.SCROLL_DOWN,
             }:
                 if not self._modal_open:
-                    step = (
-                        -3 if event.event_type is MouseEventType.SCROLL_UP else 3
+                    delta = (
+                        -1 if event.event_type is MouseEventType.SCROLL_UP else 1
                     )
-                    self._scroll_tasks(step)
+                    self._wheel_task_focus(delta)
                     return None
                 return NotImplemented
             if event.event_type is MouseEventType.MOUSE_DOWN:
@@ -5469,7 +5503,7 @@ class CodeDoggyTUI:
         return handler
 
     def _task_void_mouse(self) -> Callable[[MouseEvent], object]:
-        """Empty area below cards: click clears selection (no hover)."""
+        """Empty area below cards: wheel moves focus; click clears selection."""
 
         def handler(event: MouseEvent) -> object:
             if event.event_type is MouseEventType.MOUSE_DOWN:
@@ -5480,10 +5514,10 @@ class CodeDoggyTUI:
                 MouseEventType.SCROLL_DOWN,
             }:
                 if not self._modal_open:
-                    step = (
-                        -3 if event.event_type is MouseEventType.SCROLL_UP else 3
+                    delta = (
+                        -1 if event.event_type is MouseEventType.SCROLL_UP else 1
                     )
-                    self._scroll_tasks(step)
+                    self._wheel_task_focus(delta)
                     return None
                 return NotImplemented
             if event.event_type is MouseEventType.MOUSE_UP:
@@ -5493,9 +5527,6 @@ class CodeDoggyTUI:
 
         return handler
 
-    def _task_blank_mouse(self) -> Callable[[MouseEvent], object]:
-        """Alias for void (tests / callers)."""
-        return self._task_void_mouse()
 
     @staticmethod
     def _make_prompt_history() -> FileHistory | InMemoryHistory:
@@ -5731,7 +5762,7 @@ class CodeDoggyTUI:
         original = control.mouse_handler
 
         def mouse_handler(mouse_event: MouseEvent) -> object:
-            from prompt_toolkit.mouse_events import MouseButton, MouseModifier
+            from prompt_toolkit.mouse_events import MouseButton
 
             result = original(mouse_event)
             if mouse_event.event_type is not MouseEventType.MOUSE_UP:
@@ -5739,8 +5770,7 @@ class CodeDoggyTUI:
             btn = getattr(mouse_event, "button", None)
             if btn not in (None, MouseButton.LEFT):
                 return result
-            mods = getattr(mouse_event, "modifiers", None) or ()
-            if MouseModifier.CONTROL not in mods:
+            if not _mouse_control_held(mouse_event):
                 return result
             buf = area.buffer
             path = path_under_cursor(buf.text, buf.cursor_position)
@@ -5773,10 +5803,15 @@ class CodeDoggyTUI:
         control.mouse_handler = mouse_handler  # type: ignore[method-assign]
 
     def _image_path_mouse(self, path: str) -> Callable[[MouseEvent], object]:
-        """Ctrl+click-to-open for image / script paths in the agent detail pane."""
+        """Click-to-open for image / script paths in the agent detail pane.
+
+        Dedicated link fragments open on plain left-click. Ctrl is optional
+        (and on Win32 must be detected via keyboard state — see
+        ``_mouse_control_held``).
+        """
 
         def handler(event: MouseEvent) -> object:
-            from prompt_toolkit.mouse_events import MouseModifier
+            from prompt_toolkit.mouse_events import MouseButton
 
             if event.event_type in {
                 MouseEventType.SCROLL_UP,
@@ -5789,8 +5824,8 @@ class CodeDoggyTUI:
                 return NotImplemented
             if event.event_type is not MouseEventType.MOUSE_UP:
                 return NotImplemented
-            mods = getattr(event, "modifiers", None) or ()
-            if MouseModifier.CONTROL not in mods:
+            btn = getattr(event, "button", None)
+            if btn not in (None, MouseButton.LEFT, MouseButton.UNKNOWN):
                 return NotImplemented
             cwd = getattr(self.session, "cwd", None)
             ok, message = open_local_path(path, cwd=cwd)
@@ -6025,11 +6060,16 @@ def _task_list_summary(
             return main_prose
         return ""
 
-    # Live plan chrome only while the task is still open.
+    # Live plan chrome only while the task is still open — short cover copy
+    # (detail owns Enter/Esc instructions; don't repeat them on the card).
     if task.plan_state == "awaiting_approval":
-        return "计划待你确认 · Enter 打开"
+        if main_prose:
+            return main_prose
+        if report:
+            return " ".join(report.split())
+        return "计划待确认"
     if task.plan_state == "consent":
-        return "代理想进入 Plan · Enter 同意 / Esc 拒绝"
+        return "等待同意进入 Plan"
     if task.plan_state == "planning" and task.phase in {
         "planning",
         "plan_review",
@@ -6517,88 +6557,3 @@ def _wrap_display_lines(text: str, width: int, *, max_lines: int = 40) -> list[s
             if len(lines) >= max_lines:
                 break
     return lines or [""]
-
-
-_MORE_HINT_WIDTH = 3
-# 2Hz cycle (not 10Hz): ride Application.refresh_interval paints without
-# thrashing the task-list fragment cache every tick.
-_MORE_HINT_FRAMES = (
-    "  >",
-    " =>",
-    "==>",
-    "=> ",
-    ">  ",
-    "==>",
-    " =>",
-    "==>",
-)
-
-
-def _more_hint(*, now: float | None = None) -> str:
-    """Animated more-marker (fixed width 3) for truncated task briefs.
-
-    Paint-time only — never schedules invalidate. Prefer ``now=_paint_clock``
-    so one frame uses one marker glyph.
-    """
-    clock = time.monotonic() if now is None else now
-    return _MORE_HINT_FRAMES[int(clock * 2) % len(_MORE_HINT_FRAMES)]
-
-
-def _strip_legacy_ellipsis(text: str) -> str:
-    """Remove trailing … / ... left by older report storage — UI owns more-hint."""
-    raw = text
-    while True:
-        if raw.endswith("..."):
-            raw = raw[:-3].rstrip()
-            continue
-        if raw.endswith("…"):
-            raw = raw[:-1].rstrip()
-            continue
-        break
-    return raw
-
-
-def _fill_display_width(text: str, width: int) -> tuple[str, str]:
-    """Take a prefix of ``text`` that fits in ``width`` cells; return (prefix, rest)."""
-    width = max(0, int(width))
-    if width <= 0:
-        return "", text
-    out: list[str] = []
-    used = 0
-    for i, ch in enumerate(text):
-        cw = get_cwidth(ch)
-        if used + cw > width:
-            return "".join(out), text[i:]
-        out.append(ch)
-        used += cw
-    return "".join(out), ""
-
-
-def _brief_two_lines(text: str, full_width: int) -> tuple[list[str], bool]:
-    """Task brief: up to two full-width lines.
-
-    Returns ``(lines, truncated)``. When ``truncated`` is True the second line
-    is body-only (room reserved for the animated ``==>`` more-marker); the
-    caller paints the marker with ``class:report.more``.
-    """
-    # Honor the caller's column budget (do not force min 8 — narrow cards overflow).
-    full_width = max(1, int(full_width))
-    raw = _strip_legacy_ellipsis(
-        " ".join((text or "").replace("\r", "\n").split())
-    )
-    if not raw:
-        return [""], False
-    if get_cwidth(raw) <= full_width:
-        return [raw], False
-    line1, rest = _fill_display_width(raw, full_width)
-    line1 = line1.rstrip()
-    rest = rest.lstrip()
-    if not rest:
-        return [line1], False
-    if get_cwidth(rest) <= full_width:
-        return [line1, rest], False
-    # Reserve marker only when at least one body cell remains.
-    reserve = _MORE_HINT_WIDTH if full_width > _MORE_HINT_WIDTH else 0
-    body_w = max(1, full_width - reserve)
-    body, _leftover = _fill_display_width(rest, body_w)
-    return [line1, body.rstrip()], True

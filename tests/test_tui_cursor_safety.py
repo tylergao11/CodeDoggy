@@ -188,10 +188,20 @@ def test_scroll_mouse_routing_modal_vs_tasks() -> None:
         def make_event(etype: MouseEventType) -> MouseEvent:
             return MouseEvent(position=_Pos(), event_type=etype, button=None, modifiers=None)
 
-        # Task handler scrolls tasks when modal closed.
+        # Task handler moves card focus when modal closed (not line-scroll).
+        # Wheel is damped — fire enough same-direction ticks to commit one move.
+        from codedoggy.tui.app import _WHEEL_TASK_NOTCHES
+
         handler = tui._only_mouse_up(lambda _e: None, scroll_target="tasks")
         tui._modal_open = False
-        assert handler(make_event(MouseEventType.SCROLL_DOWN)) is None
+        tui._task_selection_active = True
+        tui._selected_task = 0
+        tui._follow_latest_task = True
+        tui._wheel_task_accum = 0
+        tui._wheel_task_last_move_at = 0.0
+        for _ in range(_WHEEL_TASK_NOTCHES):
+            assert handler(make_event(MouseEventType.SCROLL_DOWN)) is None
+        assert tui._selected_task == 1
         assert tui._follow_latest_task is False
 
         # Same handler must not scroll tasks while modal is open.
@@ -209,6 +219,72 @@ def test_scroll_mouse_routing_modal_vs_tasks() -> None:
 
         none_h = tui._only_mouse_up(lambda _e: None, scroll_target="none")
         assert none_h(make_event(MouseEventType.SCROLL_UP)) is NotImplemented
+
+
+def test_task_card_wheel_moves_focus() -> None:
+    from codedoggy.tui.app import _WHEEL_TASK_NOTCHES
+
+    with create_pipe_input() as pin:
+        tui = CodeDoggyTUI(_Session(), input=pin, output=DummyOutput())
+        for i in range(4):
+            tui.ledger.create(f"t{i}")
+        tui._task_selection_active = True
+        tui._selected_task = 1
+        tui._follow_latest_task = False
+        tui._wheel_task_accum = 0
+        tui._wheel_task_last_move_at = 0.0
+
+        class _Pos:
+            x = 0
+            y = 0
+
+        handler = tui._task_card_mouse(1)
+        up = MouseEvent(
+            position=_Pos(),
+            event_type=MouseEventType.SCROLL_UP,
+            button=None,
+            modifiers=None,
+        )
+        down = MouseEvent(
+            position=_Pos(),
+            event_type=MouseEventType.SCROLL_DOWN,
+            button=None,
+            modifiers=None,
+        )
+        # Single tick must not leap; need accumulated notches.
+        assert handler(up) is None
+        assert tui._selected_task == 1
+        for _ in range(_WHEEL_TASK_NOTCHES - 1):
+            assert handler(up) is None
+        assert tui._selected_task == 0
+        tui._wheel_task_last_move_at = 0.0
+        for _ in range(_WHEEL_TASK_NOTCHES):
+            assert handler(down) is None
+        assert tui._selected_task == 1
+
+
+def test_wheel_task_focus_resets_on_direction_flip() -> None:
+    from codedoggy.tui.app import _WHEEL_TASK_NOTCHES
+
+    with create_pipe_input() as pin:
+        tui = CodeDoggyTUI(_Session(), input=pin, output=DummyOutput())
+        for i in range(3):
+            tui.ledger.create(f"t{i}")
+        tui._task_selection_active = True
+        tui._selected_task = 1
+        tui._wheel_task_accum = 0
+        tui._wheel_task_last_move_at = 0.0
+        # Two down, then up should wipe the accumulator (no move yet).
+        tui._wheel_task_focus(1)
+        tui._wheel_task_focus(1)
+        assert tui._selected_task == 1
+        assert abs(tui._wheel_task_accum) == 2
+        tui._wheel_task_focus(-1)
+        assert tui._wheel_task_accum == -1
+        assert tui._selected_task == 1
+        for _ in range(_WHEEL_TASK_NOTCHES - 1):
+            tui._wheel_task_focus(-1)
+        assert tui._selected_task == 0
 
 
 def test_auth_set_cursor_rejects_disabled() -> None:
@@ -254,38 +330,19 @@ def test_ensure_fragments_never_empty() -> None:
     assert tui._count_fragment_lines(tui._ensure_fragments([])) >= 1
 
 
-def test_brief_two_lines_does_not_ellipsis_when_fits() -> None:
-    from codedoggy.tui.app import _MORE_HINT_WIDTH, _brief_two_lines, _more_hint
+def test_wrap_display_lines_caps_and_fits() -> None:
+    from codedoggy.tui.app import _wrap_display_lines
     from prompt_toolkit.utils import get_cwidth
 
-    # Fits on one line of width 20.
-    lines, truncated = _brief_two_lines("hello world", 20)
-    assert lines == ["hello world"]
-    assert truncated is False
-    # Fits exactly across two full-width lines — no more-marker.
+    assert _wrap_display_lines("hello world", 20, max_lines=2) == ["hello world"]
     text = "abcdefghij" * 2
-    lines, truncated = _brief_two_lines(text, 10)
-    assert truncated is False
+    lines = _wrap_display_lines(text, 10, max_lines=2)
     assert len(lines) == 2
-    assert not any("…" in line or "=>" in line for line in lines)
     assert "".join(lines) == text
-    # Overflow past two lines → truncated flag; body leaves room for ==> .
     long = "abcdefghij" * 3
-    overflow, truncated = _brief_two_lines(long, 10)
-    assert truncated is True
-    assert len(overflow) == 2
-    assert not overflow[1].endswith("…")
-    assert get_cwidth(overflow[0]) <= 10
-    assert get_cwidth(overflow[1]) + _MORE_HINT_WIDTH <= 10
-    # Narrow budget must not inflate past caller width.
-    narrow, n_trunc = _brief_two_lines(long, 5)
-    assert all(get_cwidth(line) <= 5 for line in narrow)
-    if n_trunc:
-        assert get_cwidth(narrow[-1]) + _MORE_HINT_WIDTH <= 5 or get_cwidth(narrow[-1]) <= 5
-    # Marker itself is always width-3 and changes over time.
-    assert get_cwidth(_more_hint(now=0.0)) == 3
-    assert get_cwidth(_more_hint(now=0.2)) == 3
-    assert {_more_hint(now=t / 10) for t in range(20)}  # non-empty set
+    capped = _wrap_display_lines(long, 10, max_lines=2)
+    assert len(capped) == 2
+    assert all(get_cwidth(line) <= 10 for line in capped)
 
 
 def test_task_paint_cache_skips_rebuild_when_idle() -> None:
@@ -294,7 +351,6 @@ def test_task_paint_cache_skips_rebuild_when_idle() -> None:
         tui = CodeDoggyTUI(_Session(), input=pin, output=DummyOutput())
         tui._startup_brand = False
         tui.ledger.create("short done")
-        tui._paint_clock = 10.0
         fr1 = tui._render_tasks()
         fr2 = tui._render_tasks()
         assert fr1 is fr2
@@ -302,17 +358,6 @@ def test_task_paint_cache_skips_rebuild_when_idle() -> None:
         tui.ledger.create("another")
         fr3 = tui._render_tasks()
         assert fr3 is not fr1
-
-
-def test_more_hint_is_paint_time_only_and_2hz() -> None:
-    from codedoggy.tui.app import _MORE_HINT_FRAMES, _more_hint
-
-    a = _more_hint(now=1.0)
-    b = _more_hint(now=1.4)  # same 2Hz bucket
-    c = _more_hint(now=1.6)  # next bucket
-    assert a == b
-    assert a in _MORE_HINT_FRAMES
-    assert c in _MORE_HINT_FRAMES
 
 
 def test_focus_latest_task_from_prompt_ignores_prior_selection() -> None:
@@ -369,6 +414,56 @@ def test_blank_click_clears_selection_not_first_task() -> None:
         plain = "".join(p[1] for p in fr)
         assert tui._selected_task == -1
         assert "›" not in plain
+
+
+def test_blank_lines_are_full_width_hit_targets(monkeypatch: object) -> None:
+    """Bare ``\\n`` rows remap to (0,0)=first card in prompt_toolkit Window.
+
+    Every gap/void row must paint full-width spaces with a clear-selection handler.
+    """
+    monkeypatch.setattr(
+        "codedoggy.tui.app._terminal_width",
+        lambda: 40,
+    )
+    with create_pipe_input() as pin:
+        tui = CodeDoggyTUI(_Session(), input=pin, output=DummyOutput())
+        for i in range(2):
+            tui.ledger.create(f"t{i}")
+        tui._selected_task = 1
+        tui._task_selection_active = True
+        fr = tui._render_tasks()
+
+        blank_rows = [
+            f
+            for f in fr
+            if len(f) >= 3
+            and f[2] is not None
+            and f[1].endswith("\n")
+            and f[1][:-1] != ""
+            and f[1][:-1].strip() == ""
+        ]
+        assert blank_rows, "expected gap/void rows with space hit-targets"
+        for _style, text, _handler in blank_rows:
+            body = text[:-1]
+            assert len(body) >= 40, f"short blank row remaps to card0: {text!r}"
+
+        # Clicking a void/gap handler must clear, not select card 0.
+        from prompt_toolkit.mouse_events import MouseButton, MouseEvent, MouseEventType
+
+        class _Pos:
+            x = 20
+            y = 0
+
+        blank_rows[-1][2](
+            MouseEvent(
+                position=_Pos(),
+                event_type=MouseEventType.MOUSE_UP,
+                button=MouseButton.LEFT,
+                modifiers=None,
+            )
+        )
+        assert tui._selected_task == -1
+        assert tui._task_selection_active is False
 
 
 def test_interject_shows_on_homepage_card() -> None:
@@ -441,32 +536,6 @@ def test_user_wants_latest_focus_respects_browse_above() -> None:
         assert tui._user_wants_latest_focus() is False
 
 
-def test_maybe_focus_latest_skips_when_browsing_above() -> None:
-    with create_pipe_input() as pin:
-        tui = CodeDoggyTUI(_Session(), input=pin, output=DummyOutput())
-        for i in range(3):
-            tui.ledger.create(f"t{i}")
-        tui._selected_task = 0
-        tui._follow_latest_task = False
-        tid = tui.ledger.snapshots()[-1].id
-        tui._maybe_focus_latest_after_task_event(tid)
-        assert tui._selected_task == 0  # unchanged
-
-
-def test_maybe_focus_latest_is_noop() -> None:
-    """Turn finish must not auto-select / steal focus to the latest task."""
-    with create_pipe_input() as pin:
-        tui = CodeDoggyTUI(_Session(), input=pin, output=DummyOutput())
-        for i in range(3):
-            tui.ledger.create(f"t{i}")
-        tui._selected_task = 0
-        tui._task_selection_active = True
-        tui._follow_latest_task = True
-        tid = tui.ledger.snapshots()[-1].id
-        tui._maybe_focus_latest_after_task_event(tid)
-        assert tui._selected_task == 0
-
-
 def test_task_card_plain_click_selects_double_and_ctrl_open() -> None:
     """Plain left: select. Double-click or Ctrl+left: open detail."""
     import time
@@ -529,6 +598,60 @@ def test_task_card_plain_click_selects_double_and_ctrl_open() -> None:
         fire(MouseEventType.MOUSE_DOWN)
         fire(MouseEventType.MOUSE_UP, mods=frozenset({MouseModifier.CONTROL}))
         assert tui._modal_open is True
+
+
+def test_detail_path_link_opens_without_control_modifier(
+    tmp_path: object, monkeypatch: object
+) -> None:
+    """Dedicated detail links must open on plain click (Win32 reports no Ctrl)."""
+    from pathlib import Path
+
+    from prompt_toolkit.mouse_events import MouseButton, MouseModifier
+
+    from codedoggy.tui.app import _mouse_control_held
+    import codedoggy.tui.open_path as op
+
+    root = Path(str(tmp_path))
+    img = root / "shot.png"
+    img.write_bytes(b"\x89PNG\r\n\x1a\n")
+    opened: list[str] = []
+    monkeypatch.setattr(op.sys, "platform", "win32")
+    monkeypatch.setattr(op.os, "startfile", lambda p: opened.append(p), raising=False)
+
+    # Helper: enum CONTROL counts; empty frozenset does not (without real key).
+    assert _mouse_control_held(
+        MouseEvent(
+            position=type("P", (), {"x": 0, "y": 0})(),
+            event_type=MouseEventType.MOUSE_UP,
+            button=MouseButton.LEFT,
+            modifiers=frozenset({MouseModifier.CONTROL}),
+        )
+    )
+    # Empty mods: only true if physical Ctrl is down — do not assert False on
+    # a live Ctrl-held developer machine; just exercise the call.
+    _mouse_control_held(
+        MouseEvent(
+            position=type("P", (), {"x": 0, "y": 0})(),
+            event_type=MouseEventType.MOUSE_UP,
+            button=MouseButton.LEFT,
+            modifiers=frozenset(),
+        )
+    )
+
+    with create_pipe_input() as pin:
+        tui = CodeDoggyTUI(_Session(), input=pin, output=DummyOutput())
+        tui.session.cwd = root  # type: ignore[attr-defined]
+        handler = tui._image_path_mouse(str(img))
+        result = handler(
+            MouseEvent(
+                position=type("P", (), {"x": 0, "y": 0})(),
+                event_type=MouseEventType.MOUSE_UP,
+                button=MouseButton.LEFT,
+                modifiers=frozenset(),  # Win32 reality
+            )
+        )
+        assert result is None
+        assert opened and str(opened[0]).endswith("shot.png")
 
 
 def test_task_card_frame_carries_mouse_handler() -> None:

@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from codedoggy.tui.clipboard_image import (
+    coerce_image_path_text,
     get_system_clipboard_text,
     insert_path_token,
     save_clipboard_image,
@@ -26,7 +27,7 @@ def test_save_clipboard_image_none_when_no_image(tmp_path: Path) -> None:
 def test_save_clipboard_image_writes_under_attachments(tmp_path: Path) -> None:
     payload = b"\x89PNG\r\n\x1a\n" + b"\x00" * 64
 
-    def _fake_save(dest: Path) -> Path | None:
+    def _fake_save(dest: Path, **_kwargs: object) -> Path | None:
         dest.write_bytes(payload)
         return dest
 
@@ -61,7 +62,7 @@ def test_get_system_clipboard_text_uses_os_hook(monkeypatch) -> None:
 def test_unique_paste_names(tmp_path: Path) -> None:
     payload = b"\x89PNG\r\n\x1a\n" + b"\x00" * 64
 
-    def _fake_save(dest: Path) -> Path | None:
+    def _fake_save(dest: Path, **_kwargs: object) -> Path | None:
         dest.write_bytes(payload)
         return dest
 
@@ -72,3 +73,36 @@ def test_unique_paste_names(tmp_path: Path) -> None:
         b = save_clipboard_image(tmp_path)
     assert a is not None and b is not None
     assert a != b
+
+
+def test_coerce_image_path_text(tmp_path: Path) -> None:
+    img = tmp_path / "a.png"
+    img.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 40)
+    assert coerce_image_path_text(str(img)) == img.resolve()
+    assert coerce_image_path_text(f'"{img}"') == img.resolve()
+    assert coerce_image_path_text("not-a-file.png", cwd=tmp_path) is None
+    assert coerce_image_path_text("readme.txt\n", cwd=tmp_path) is None
+
+
+def test_save_windows_prefers_png_format_bytes(tmp_path: Path) -> None:
+    payload = b"\x89PNG\r\n\x1a\n" + b"\x00" * 64
+    out_dir = tmp_path / ".codedoggy" / "attachments"
+    out_dir.mkdir(parents=True)
+    dest = out_dir / "paste-1.png"
+
+    with patch(
+        "codedoggy.tui.clipboard_image._windows_clipboard_format_bytes",
+        side_effect=lambda name: payload if name in {"PNG", "image/png"} else None,
+    ), patch(
+        "codedoggy.tui.clipboard_image._windows_hdrop_paths", return_value=[]
+    ), patch(
+        "codedoggy.tui.clipboard_image._save_windows_dib", return_value=None
+    ), patch(
+        "codedoggy.tui.clipboard_image._save_windows_powershell_png",
+        return_value=None,
+    ):
+        from codedoggy.tui.clipboard_image import _save_windows
+
+        path = _save_windows(dest, out_dir=out_dir, prefix="paste")
+    assert path is not None
+    assert path.read_bytes().startswith(b"\x89PNG")

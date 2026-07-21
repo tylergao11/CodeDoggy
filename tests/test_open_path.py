@@ -106,7 +106,7 @@ def test_detail_body_emits_clickable_image_line(tmp_path: Path) -> None:
         snap, 80, active_filter="tool", path_mouse=path_mouse
     )
     text = "".join(f[1] for f in frags)
-    assert "查看图片" in text or "打开文件" in text or "Ctrl+点击" in text
+    assert "查看图片" in text or "打开文件" in text or "点击打开" in text or "Ctrl+点击" in text
     # At least one fragment carries a mouse handler (3-tuple)
     assert any(len(f) >= 3 and f[2] is not None for f in frags if isinstance(f, tuple))
 
@@ -139,5 +139,5 @@ def test_tool_write_record_exposes_open_path() -> None:
         snap, 80, active_filter="tool", path_mouse=lambda p: (lambda _e: None)
     )
     text = "".join(f[1] for f in frags)
-    assert "Ctrl+点击" in text
+    assert "点击打开" in text
     assert "hello.py" in text

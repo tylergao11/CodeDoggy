@@ -519,8 +519,8 @@ def test_task_panel_keeps_reference_layout_across_terminal_widths(
             # Compact list: title + stage + one human summary (no dog-ear separators).
             assert "∪" not in rendered
             assert "CLI" in rendered or "任务面板" in rendered
-            expected_stage = "3 并行" if width < 36 else "3 个 Agent 并行中"
-            assert expected_stage in rendered
+            # Cover badge stays compact at every width (detail owns the long form).
+            assert "3 并行" in rendered
             # No ↳ agent rows on homepage cards.
             assert "↳" not in rendered
             compact = rendered.replace("\n", "").replace(" ", "")
@@ -678,7 +678,7 @@ def test_full_screen_agent_window_is_opaque_and_interactive() -> None:
         assert _wait_until(lambda: bool(tui.ledger.snapshots()))
         assert _wait_until(lambda: tui.ledger.snapshots()[0].phase == "done")
         task_text = "".join(fragment[1] for fragment in tui._render_tasks())
-        assert "已完成 · 1 个 Agent" in task_text
+        assert "完成·1" in task_text
         # Compact card: frame + title; summary is MAIN report prose.
         assert "╭" in task_text and "╮" in task_text
         assert "实现 CLI" in task_text
@@ -931,6 +931,25 @@ def test_live_plan_prefers_main_prose_over_draft_placeholder() -> None:
     # Still planning phase → stage can say 起草中, but summary shows live prose.
     assert "起草" in _task_stage_text(snap)
     assert "我先读入口" in _task_list_summary(snap)
+
+
+def test_plan_cover_copy_stays_quiet() -> None:
+    """Homepage cards must not repeat Enter/Esc instructions (detail owns them)."""
+    ledger = TaskLedger()
+    task = ledger.create("needs approval")
+    ledger.set_plan_state(task.id, "awaiting_approval")
+    snap = ledger.snapshots()[0]
+    summary = _task_list_summary(snap)
+    assert "Enter" not in summary
+    assert "Esc" not in summary
+    assert "计划待确认" in summary
+
+    ledger.set_plan_state(task.id, "consent")
+    snap = ledger.snapshots()[0]
+    summary = _task_list_summary(snap)
+    assert "Enter" not in summary
+    assert "Esc" not in summary
+    assert "等待同意" in summary
 
 
 def test_toggle_todo_pane_does_not_steal_task_selection() -> None:

@@ -86,3 +86,61 @@ def test_paste_image_inserts_chip(tmp_path: Path) -> None:
             tui._paste_into_buffer(event)
         assert VIEW_IMAGE_LABEL in buf.text
         assert "paste-1.png" in buf.text
+
+
+def test_paste_image_path_text_becomes_chip(tmp_path: Path) -> None:
+    """WT drag-drop / copy-as-path pastes a path string — coerce to chip."""
+    img = tmp_path / "shot.png"
+    img.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 40)
+
+    with create_pipe_input() as pin:
+        session = _Session()
+        session.cwd = str(tmp_path)
+        tui = CodeDoggyTUI(session, input=pin, output=DummyOutput())
+        buf = tui._input.buffer
+        event = SimpleNamespace(current_buffer=buf, app=tui.app)
+        with patch(
+            "codedoggy.tui.app.save_clipboard_image", return_value=None
+        ), patch(
+            "codedoggy.tui.app.get_system_clipboard_text",
+            return_value=str(img),
+        ):
+            tui._paste_into_buffer(event)
+        assert VIEW_IMAGE_LABEL in buf.text
+        assert "shot.png" in buf.text
+
+
+def test_win32_ctrl_v_poll_pastes_image_only(tmp_path: Path) -> None:
+    """Poll must paste images on Ctrl+V, and ignore text-only clipboards."""
+    img = tmp_path / "shot.png"
+    img.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 40)
+
+    with create_pipe_input() as pin:
+        session = _Session()
+        session.cwd = str(tmp_path)
+        tui = CodeDoggyTUI(session, input=pin, output=DummyOutput())
+        tui.app.layout.focus(tui._input)
+        tui._win32_ctrl_v_down = False
+        tui._win32_ctrl_v_last_at = 0.0
+
+        # Text-only: poll no-ops (terminal owns text paste).
+        with patch("sys.platform", "win32"), patch(
+            "codedoggy.tui.app.save_clipboard_image", return_value=None
+        ), patch(
+            "ctypes.windll.user32.GetAsyncKeyState",
+            side_effect=lambda vk: 0x8000 if vk in {0x11, 0x56} else 0,
+        ):
+            tui._poll_win32_ctrl_v_image_paste()
+        assert tui._input.buffer.text == ""
+
+        # Image: rising edge of Ctrl+V inserts chip.
+        tui._win32_ctrl_v_down = False
+        tui._win32_ctrl_v_last_at = 0.0
+        with patch("sys.platform", "win32"), patch(
+            "codedoggy.tui.app.save_clipboard_image", return_value=img
+        ), patch(
+            "ctypes.windll.user32.GetAsyncKeyState",
+            side_effect=lambda vk: 0x8000 if vk in {0x11, 0x56} else 0,
+        ):
+            tui._poll_win32_ctrl_v_image_paste()
+        assert VIEW_IMAGE_LABEL in tui._input.buffer.text

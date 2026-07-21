@@ -91,9 +91,6 @@ class LiveActivityBoard:
         self._lock = RLock()
         self._agents: dict[tuple[str, str], AgentActivity] = {}
 
-    def clear(self) -> None:
-        with self._lock:
-            self._agents.clear()
 
     def clear_task(self, task_id: str) -> None:
         with self._lock:

@@ -34,7 +34,7 @@ def test_fresh_detail_separator_is_visible() -> None:
     assert "bold" not in fresh["detail.md.h1"]
     assert "bold" not in fresh["detail.code.kw"]
     assert "#d4a0b8" in fresh["brand"]
-    assert "#7eb8c9" in fresh["task.spine.active"]
+    assert "#7eb8c9" in fresh["task.marker.active"]
 
 
 def test_section_break_uses_air_not_box_rails() -> None:
@@ -54,7 +54,7 @@ def test_groknight_keeps_legacy_bold() -> None:
     dark = style_dict("groknight")
     assert "bold" in dark["ask.header"]
     assert "bold" in dark["detail.md.h1"]
-    assert "#7dcfff" in dark["task.spine.active"]
+    assert "#7dcfff" in dark["task.marker.active"]
 
 
 def test_themes_share_class_keys() -> None:
@@ -62,6 +62,16 @@ def test_themes_share_class_keys() -> None:
     assert set(THEMES["groknight"]) == keys
     assert "detail.text" in keys
     assert "prompt.border.focus" in keys
+    assert "task.card.selected" in keys
+    assert "task.card.border.selected" in keys
+    assert "report.stream" in keys
+
+
+def test_fresh_card_surface_uses_reading_canvas() -> None:
+    fresh = style_dict("fresh")
+    assert "#14131a" in fresh["task.card"]
+    assert "#1c1b22" in fresh["task.card.selected"]
+    assert "#d4a0b8" in fresh["task.card.border.selected"]
 
 
 def test_build_style_constructs() -> None:

@@ -8,10 +8,10 @@ Inventory (class → role)
 Chrome
   root, header, brand, brand.edge.pink, header.rule.dim, meta, separator
 Tasks
-  task.spine[.active], task.marker[.active|.selected|.idle|.interject]
+  task.marker[.active|.selected|.idle]
   task.title, task.status[.running|.reporting|.completed|.failed], task.interject
 Prompt / input
-  input, input.placeholder, prompt, prompt.border[.focus|.dim], prompt.caption
+  input, input.placeholder, prompt, prompt.border[.focus], prompt.caption
   turn.status, turn.elapsed, turn.stop
   feedback[.info|.success|.warning]
 Todo
@@ -33,7 +33,7 @@ HUD
 Scrollbar
   scrollbar.{background,start,button,end,arrow}
 Detail transcript (agent_detail)
-  detail.{header,meta,active,separator,border.*,text,actor*}
+  detail.{header,meta,active,separator,text,actor*}
   detail.{tool,block,code*,diff*,success,error,warning,link*}
   detail.md.{ol,ul,h1,h2,h3,quote,inline,bold,italic,strike}
   detail.thinking.{header,rail,body,meta}
@@ -66,8 +66,6 @@ _DETAIL_GROKNIGHT: dict[str, str] = {
     "detail.meta": "bg:#141414 #6c6c6c",
     "detail.active": "bg:#141414 #e1e1e1",
     "detail.separator": "bg:#141414 #242424",
-    "detail.border.left": "bg:#141414 #363636",
-    "detail.border.right": "bg:#141414 #363636",
     "detail.text": "bg:#141414 #e1e1e1",
     "detail.actor": "bg:#141414 #c8c8c8",
     "detail.actor.user": "bg:#141414 #c8c8c8",
@@ -122,8 +120,6 @@ _DETAIL_FRESH: dict[str, str] = {
     "detail.meta": "bg:#14131a #8f8a86",
     "detail.active": "bg:#14131a #f0ebe6",
     "detail.separator": "bg:#14131a #5c5754",
-    "detail.border.left": "bg:#14131a #5c5754",
-    "detail.border.right": "bg:#14131a #5c5754",
     # Body: comfortable warm off-white for long prose (not pastel mush).
     "detail.text": "bg:#14131a #e8e2dc",
     "detail.actor": "bg:#14131a #a8a29e",
@@ -182,12 +178,18 @@ def _chrome_groknight() -> dict[str, str]:
         "header.rule.dim": "#242424",
         "meta": "#6c6c6c",
         "separator": "#242424",
-        "task.spine": "#363636",
-        "task.spine.active": "#7dcfff",
+        "task.card": "bg:#141414 #e1e1e1",
+        "task.card.active": "bg:#1a1a1a #e1e1e1",
+        "task.card.selected": "bg:#1c1c1c #e1e1e1",
+        "task.card.border": "bg:#141414 #363636",
+        "task.card.border.active": "bg:#1a1a1a #7dcfff",
+        "task.card.border.selected": "bg:#1c1c1c #c4789a",
         "task.marker.active": "#7dcfff",
         "task.marker.selected": "#c4789a",
         "task.marker.idle": "#414141",
         "task.title": "#e1e1e1",
+        "task.title.active": "#e1e1e1",
+        "task.title.selected": "#e1e1e1",
         "task.status": "#6c6c6c",
         "task.status.running": "#c4789a",
         "task.status.reporting": "#7dcfff",
@@ -195,18 +197,20 @@ def _chrome_groknight() -> dict[str, str]:
         "task.status.failed": "#f7768e",
         "agent.border": "#505058",
         "report": "#c8c8c8",
+        "report.active": "#c8c8c8",
+        "report.selected": "#c8c8c8",
+        "report.stream": "#e1e1e1",
+        "report.stream.selected": "#e1e1e1",
         "input": "bg:#111111 #e1e1e1",
         "input.placeholder": "bg:#111111 #585858",
         "prompt": "bg:#111111 #FFDB8D",
         "prompt.border": "bg:#141414 #323237",
         "prompt.border.focus": "bg:#141414 #d4a0b8",
-        "prompt.border.dim": "bg:#141414 #242424",
         "prompt.caption": "bg:#141414 #6c6c6c",
         "turn.status": "bg:#141414 #c4789a",
         "turn.elapsed": "bg:#141414 #787878",
         "turn.stop": "bg:#141414 #f7768e",
         "task.interject": "bg:#141414 #FFDB8D",
-        "task.marker.interject": "#FFDB8D",
         "feedback.info": "bg:#141414 #7dcfff",
         "feedback.success": "bg:#141414 #9ece6a",
         "feedback.warning": "bg:#141414 #f7768e",
@@ -263,93 +267,113 @@ def _chrome_groknight() -> dict[str, str]:
 
 
 def _chrome_fresh() -> dict[str, str]:
-    """清新可爱 — aligns with splash dogs (blush + mint, soft body text)."""
+    """Reading-first chrome — same tokens as detail (canvas/text/muted/line/brand)."""
+    # Shared reading tokens (must match _DETAIL_FRESH canvas/body).
+    bg = "#14131a"
+    bg_lift = "#1c1b22"
+    bg_active = "#18171e"
+    text = "#e8e2dc"
+    muted = "#8f8a86"
+    line = "#5c5754"
+    brand = "#d4a0b8"
+    accent = "#7eb8c9"
+    warn = "#e09098"
+    ok = "#9cba7a"
+    gold = "#d4b896"
     return {
-        "root": "bg:#14141a #ddd6d0",
-        "header": "bg:#14141a #c8c2bc",
-        "brand": "#d4a0b8",
-        "brand.edge.pink": "#c090a8",
-        "header.rule.dim": "#2a282c",
-        "meta": "#7a7674",
-        "separator": "#2a282c",
-        "task.spine": "#3a363c",
-        "task.spine.active": "#7eb8c9",
-        "task.marker.active": "#7eb8c9",
-        "task.marker.selected": "#d4a0b8",
-        "task.marker.idle": "#3a363c",
-        "task.title": "#ddd6d0",
-        "task.status": "#7a7674",
-        "task.status.running": "#d4a0b8",
-        "task.status.reporting": "#7eb8c9",
-        "task.status.completed": "#7a7674",
-        "task.status.failed": "#e09098",
-        "agent.border": "#4a464c",
-        "report": "#c8c2bc",
-        "input": "bg:#121218 #ddd6d0",
-        "input.placeholder": "bg:#121218 #5c5856",
-        "prompt": "bg:#121218 #e8c9a0",
-        "prompt.border": "bg:#14141a #323037",
-        "prompt.border.focus": "bg:#14141a #d4a0b8",
-        "prompt.border.dim": "bg:#14141a #2a282c",
-        "prompt.caption": "bg:#14141a #7a7674",
-        "turn.status": "bg:#14141a #d4a0b8",
-        "turn.elapsed": "bg:#14141a #7a7674",
-        "turn.stop": "bg:#14141a #e09098",
-        "task.interject": "bg:#14141a #e8c9a0",
-        "task.marker.interject": "#e8c9a0",
-        "feedback.info": "bg:#14141a #7eb8c9",
-        "feedback.success": "bg:#14141a #9cba7a",
-        "feedback.warning": "bg:#14141a #e09098",
-        "todo.badge": "bg:#14141a #7a7674",
-        "todo.badge.open": "bg:#14141a #e8c9a0",
-        "todo.pane": "bg:#14141a #c8c2bc",
-        "todo.pane.title": "bg:#14141a #e8c9a0",
-        "todo.pane.border": "bg:#14141a #3a363c",
-        "todo.item.pending": "bg:#14141a #7a7674",
-        "todo.item.progress": "bg:#14141a #e8c9a0",
-        "todo.item.done": "bg:#14141a #9cba7a",
-        "todo.item.cancelled": "bg:#14141a #5c5856",
-        "shortcut.key": "bg:#14141a #c8c2bc",
-        "shortcut.label": "bg:#14141a #7a7674",
-        "shortcut.separator": "bg:#14141a #2a282c",
-        "shortcut.pending": "bg:#14141a #c4a882",
-        "agent-window": "bg:#14141a #ddd6d0",
-        "agent-window.header": "bg:#14141a #d4a0b8",
-        "agent-window.close": "bg:#1a1a20 #e09098",
-        "agent-window.hint": "bg:#14141a #7a7674",
-        "ask.dialog": "bg:#1a1a20 #ddd6d0",
-        "ask.border": "bg:#1a1a20 #e8c9a0",
-        # no bold — cute UI shouldn't shout
-        "ask.header": "bg:#1a1a20 #e8c9a0",
-        "ask.question": "bg:#1a1a20 #ddd6d0",
-        "ask.meta": "bg:#1a1a20 #7a7674",
-        "ask.option": "bg:#1a1a20 #c8c2bc",
-        "ask.option.selected": "bg:#242428 #e8c9a0",
-        "ask.option.desc": "bg:#1a1a20 #7a7674",
-        "ask.hint": "bg:#1a1a20 #7a7674",
-        "modal.border.left": "bg:#14141a #3a363c",
-        "modal.border.right": "bg:#14141a #3a363c",
-        "modal.border.dim": "bg:#14141a #2a282c",
-        "detail.input": "bg:#121218 #ddd6d0",
-        "detail.input.prompt": "bg:#121218 #e8c9a0",
-        "auth.item": "bg:#14141a #7a7674",
-        "auth.item.selected": "bg:#14141a #7eb8c9",
-        "auth.item.active": "bg:#14141a #e8c9a0",
-        "auth.item.logged": "bg:#14141a #ddd6d0",
-        "auth.item.muted": "bg:#14141a #5c5856",
-        "auth.hint": "bg:#14141a #7a7674",
-        "auth.note": "bg:#14141a #8a8684",
-        "hud.title": "fg:#d4a0b8 bg:#0c0c10",
-        "hud.ok": "fg:#9cba7a bg:#0c0c10",
-        "hud.warn": "fg:#e09098 bg:#0c0c10",
-        "hud.cyan": "fg:#7eb8c9 bg:#0c0c10",
-        "hud.dim": "fg:#5c5856 bg:#0c0c10",
+        "root": f"bg:{bg} {text}",
+        "header": f"bg:{bg} {muted}",
+        "brand": brand,
+        "brand.edge.pink": brand,
+        "header.rule.dim": line,
+        "meta": muted,
+        "separator": line,
+        # Pseudo-card surfaces (whole-row bg fill).
+        "task.card": f"bg:{bg} {text}",
+        "task.card.active": f"bg:{bg_active} {text}",
+        "task.card.selected": f"bg:{bg_lift} {text}",
+        "task.card.border": f"bg:{bg} {line}",
+        "task.card.border.active": f"bg:{bg_active} {accent}",
+        "task.card.border.selected": f"bg:{bg_lift} {brand}",
+        "task.marker.active": accent,
+        "task.marker.selected": brand,
+        "task.marker.idle": line,
+        "task.title": f"bg:{bg} {text}",
+        "task.title.active": f"bg:{bg_active} {text}",
+        "task.title.selected": f"bg:{bg_lift} {text}",
+        "task.status": muted,
+        "task.status.running": brand,
+        "task.status.reporting": accent,
+        "task.status.completed": muted,
+        "task.status.failed": warn,
+        "agent.border": line,
+        "report": f"bg:{bg} {muted}",
+        "report.active": f"bg:{bg_active} {muted}",
+        "report.selected": f"bg:{bg_lift} {muted}",
+        "report.stream": f"bg:{bg_active} {text}",
+        "report.stream.selected": f"bg:{bg_lift} {text}",
+        "input": f"bg:{bg_lift} {text}",
+        "input.placeholder": f"bg:{bg_lift} {muted}",
+        "prompt": f"bg:{bg_lift} {gold}",
+        "prompt.border": f"bg:{bg} {line}",
+        "prompt.border.focus": f"bg:{bg} {brand}",
+        "prompt.caption": f"bg:{bg} {muted}",
+        "turn.status": f"bg:{bg} {brand}",
+        "turn.elapsed": f"bg:{bg} {muted}",
+        "turn.stop": f"bg:{bg} {warn}",
+        "task.interject": f"bg:{bg} {gold}",
+        "feedback.info": f"bg:{bg} {accent}",
+        "feedback.success": f"bg:{bg} {ok}",
+        "feedback.warning": f"bg:{bg} {warn}",
+        "todo.badge": f"bg:{bg} {muted}",
+        "todo.badge.open": f"bg:{bg} {brand}",
+        "todo.pane": f"bg:{bg} {text}",
+        "todo.pane.title": f"bg:{bg} {muted}",
+        "todo.pane.border": f"bg:{bg} {line}",
+        "todo.item.pending": f"bg:{bg} {muted}",
+        "todo.item.progress": f"bg:{bg} {brand}",
+        "todo.item.done": f"bg:{bg} {ok}",
+        "todo.item.cancelled": f"bg:{bg} {line}",
+        "shortcut.key": f"bg:{bg} {text}",
+        "shortcut.label": f"bg:{bg} {muted}",
+        "shortcut.separator": f"bg:{bg} {line}",
+        "shortcut.pending": f"bg:{bg} {gold}",
+        "agent-window": f"bg:{bg} {text}",
+        "agent-window.header": f"bg:{bg} {text}",
+        "agent-window.close": f"bg:{bg_lift} {warn}",
+        "agent-window.hint": f"bg:{bg} {muted}",
+        "ask.dialog": f"bg:{bg_lift} {text}",
+        "ask.border": f"bg:{bg_lift} {gold}",
+        "ask.header": f"bg:{bg_lift} {gold}",
+        "ask.question": f"bg:{bg_lift} {text}",
+        "ask.meta": f"bg:{bg_lift} {muted}",
+        "ask.option": f"bg:{bg_lift} {text}",
+        "ask.option.selected": f"bg:{bg} {gold}",
+        "ask.option.desc": f"bg:{bg_lift} {muted}",
+        "ask.hint": f"bg:{bg_lift} {muted}",
+        "modal.border.left": f"bg:{bg} {line}",
+        "modal.border.right": f"bg:{bg} {line}",
+        "modal.border.dim": f"bg:{bg} {line}",
+        "detail.input": f"bg:{bg_lift} {text}",
+        "detail.input.prompt": f"bg:{bg_lift} {gold}",
+        "auth.item": f"bg:{bg} {muted}",
+        "auth.item.selected": f"bg:{bg} {accent}",
+        "auth.item.active": f"bg:{bg} {gold}",
+        "auth.item.logged": f"bg:{bg} {text}",
+        "auth.item.muted": f"bg:{bg} {line}",
+        "auth.hint": f"bg:{bg} {muted}",
+        "auth.note": f"bg:{bg} {muted}",
+        "hud.title": f"fg:{brand} bg:#0c0c10",
+        "hud.ok": f"fg:{ok} bg:#0c0c10",
+        "hud.warn": f"fg:{warn} bg:#0c0c10",
+        "hud.cyan": f"fg:{accent} bg:#0c0c10",
+        "hud.dim": f"fg:{muted} bg:#0c0c10",
         "hud.bg": "bg:#0c0c10",
-        "scrollbar.background": "bg:#0c0c10 #2a282c",
-        "scrollbar.start": "bg:#0c0c10 #3a363c",
-        "scrollbar.button": "bg:#4a464c #7a7674",
-        "scrollbar.end": "bg:#4a464c #7a7674",
-        "scrollbar.arrow": "bg:#0c0c10 #4a464c",
+        "scrollbar.background": f"bg:#0c0c10 {line}",
+        "scrollbar.start": f"bg:#0c0c10 {line}",
+        "scrollbar.button": f"bg:{line} {muted}",
+        "scrollbar.end": f"bg:{line} {muted}",
+        "scrollbar.arrow": f"bg:#0c0c10 {line}",
     }
 
 
@@ -385,7 +409,3 @@ def build_style(name: str | None = None) -> Style:
     return Style.from_dict(style_dict(name))
 
 
-# Back-compat exports used by agent_detail / older imports.
-DETAIL_STYLE_RULES = dict(_DETAIL_FRESH)
-CODEDOGGY_DARK = build_style("groknight")  # legacy name → old look
-CODEDOGGY_FRESH = build_style("fresh")
