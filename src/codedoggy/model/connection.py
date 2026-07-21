@@ -56,18 +56,25 @@ class ActiveConnection:
     @property
     def ready_to_sample(self) -> bool:
         """Whether the product should allow starting a turn."""
-        if self.provider in {"ollama", "custom"} and not is_imperial(self.provider):
-            # Local / custom: ollama always; custom needs a prior successful resolve.
-            if self.provider == "ollama":
+        pid = (self.provider or "").strip().lower()
+        if not pid or pid == "unconfigured" or not str(self.model or "").strip():
+            return False
+        if pid in {"ollama", "custom"} and not is_imperial(pid):
+            # Local / custom: ollama only after user applied it; custom needs login.
+            if pid == "ollama":
                 return True
             return bool(self.logged_in)
-        if not is_imperial(self.provider):
+        if not is_imperial(pid):
             return bool(self.logged_in)
         return bool(self.logged_in)
 
     @property
     def label(self) -> str:
-        return f"{self.provider}/{self.model}"
+        pid = (self.provider or "").strip() or "—"
+        mid = (self.model or "").strip() or "—"
+        if pid == "unconfigured":
+            return "未选择模型"
+        return f"{pid}/{mid}"
 
     @property
     def reasoning_label(self) -> str:
@@ -138,21 +145,35 @@ def connection_from_config(
     last_error: str | None = None,
 ) -> ActiveConnection:
     """Build a snapshot from configs + live auth probe (no client swap)."""
-    provider = (main.provider or "ollama").strip().lower()
+    provider = (main.provider or "unconfigured").strip().lower() or "unconfigured"
     profile = get_profile(provider)
     api_mode = str(getattr(profile, "api_mode", "") or "chat_completions")
-    st = auth_status(provider)
+    if provider == "unconfigured":
+        logged_in = False
+        auth_kind = ""
+        auth_source = ""
+        auth_detail = "选择 Provider 后才能发送"
+        model = ""
+    else:
+        st = auth_status(provider)
+        logged_in = bool(st.logged_in) or provider == "ollama"
+        auth_kind = str(auth_kind_for_provider(provider) or st.kind or "")
+        auth_source = str(st.source or "")
+        auth_detail = str(st.detail or "")
+        model = str(main.model or "").strip() or (
+            profile.default_model if profile else ""
+        )
     aux_cfg = aux or main
     reasoning_on, reasoning_effort = reasoning_from_extra(getattr(main, "extra", None))
     return ActiveConnection(
         provider=provider,
-        model=str(main.model or "").strip() or (profile.default_model if profile else "model"),
+        model=model,
         base_url=str(main.base_url or "").strip(),
         api_mode=api_mode,
-        auth_kind=str(auth_kind_for_provider(provider) or st.kind or ""),
-        auth_source=str(st.source or ""),
-        logged_in=bool(st.logged_in) or provider == "ollama",
-        auth_detail=str(st.detail or ""),
+        auth_kind=auth_kind,
+        auth_source=auth_source,
+        logged_in=logged_in,
+        auth_detail=auth_detail,
         temperature=main.temperature,
         max_tokens=main.max_tokens,
         context_window=main.context_window,
@@ -205,13 +226,8 @@ class ConnectionService:
         client: Any | None = None,
         runner: Any | None = None,
     ) -> ConnectionService:
+        # Never persist bootstrap defaults (that poisoned active_provider=ollama).
         state = connection_from_config(main, aux=aux, source="bootstrap", generation=0)
-        try:
-            from codedoggy.model.preferred_provider import save_preferred_provider
-
-            save_preferred_provider(state.provider)
-        except Exception:  # noqa: BLE001
-            pass
         return cls(state, client=client, runner=runner)
 
     def bind_runner(self, runner: Any) -> None:

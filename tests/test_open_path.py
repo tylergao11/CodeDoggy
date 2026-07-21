@@ -106,6 +106,38 @@ def test_detail_body_emits_clickable_image_line(tmp_path: Path) -> None:
         snap, 80, active_filter="tool", path_mouse=path_mouse
     )
     text = "".join(f[1] for f in frags)
-    assert "点击打开" in text
+    assert "查看图片" in text or "打开文件" in text or "Ctrl+点击" in text
     # At least one fragment carries a mouse handler (3-tuple)
     assert any(len(f) >= 3 and f[2] is not None for f in frags if isinstance(f, tuple))
+
+
+def test_tool_write_record_exposes_open_path() -> None:
+    messages = [
+        Message(
+            role=Role.ASSISTANT,
+            tool_calls=[
+                ToolCall(
+                    id="w1",
+                    name="write",
+                    arguments={"path": "src/hello.py", "contents": "print(1)\n"},
+                )
+            ],
+        ),
+        Message(role=Role.TOOL, name="write", tool_call_id="w1", content="ok"),
+    ]
+    snap = snapshot_from_messages(
+        messages,
+        task_id="t1",
+        agent_id="t1:main",
+        agent_label="MAIN",
+        task_title="edit",
+        status="completed",
+    )
+    tool = next(r for r in snap.records if r.actor == "TOOL")
+    assert "src/hello.py" in tool.open_paths
+    frags = render_detail_body(
+        snap, 80, active_filter="tool", path_mouse=lambda p: (lambda _e: None)
+    )
+    text = "".join(f[1] for f in frags)
+    assert "Ctrl+点击" in text
+    assert "hello.py" in text

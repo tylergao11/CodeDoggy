@@ -57,12 +57,28 @@ def get_system_clipboard_text() -> str | None:
     return _linux_clipboard_text()
 
 
-def insert_path_token(path: Path | str) -> str:
-    """Text inserted into the prompt buffer (quoted when spaces)."""
-    p = str(Path(path).resolve())
-    if any(ch.isspace() for ch in p):
-        return f'"{p}"'
-    return p
+def insert_path_token(path: Path | str, *, cwd: Path | str | None = None) -> str:
+    """Text inserted into the prompt buffer (quoted when spaces).
+
+    Prefer a short relative path under ``cwd`` when possible so the chip stays readable.
+    """
+    p = Path(path).resolve()
+    root = Path(cwd).resolve() if cwd is not None else Path.cwd().resolve()
+    try:
+        text = str(p.relative_to(root))
+    except (OSError, ValueError):
+        text = str(p)
+    text = text.replace("\\", "/")
+    if any(ch.isspace() for ch in text):
+        return f'"{text}"'
+    return text
+
+
+def insert_image_chip(path: Path | str, *, cwd: Path | str | None = None) -> str:
+    """Paste form: visible「查看图片」+ path for the model / Ctrl+click."""
+    from codedoggy.tui.open_path import VIEW_IMAGE_LABEL
+
+    return f"{VIEW_IMAGE_LABEL}({insert_path_token(path, cwd=cwd)})"
 
 
 def _next_path(out_dir: Path, *, prefix: str, ext: str) -> Path:

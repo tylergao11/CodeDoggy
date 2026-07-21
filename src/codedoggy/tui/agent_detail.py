@@ -16,7 +16,12 @@ from typing import Any, Iterable, Literal
 from prompt_toolkit.formatted_text import StyleAndTextTuples
 from prompt_toolkit.utils import get_cwidth
 
-from codedoggy.tui.open_path import paths_from_detail_record
+from codedoggy.tui.open_path import (
+    link_label_for_path,
+    paths_from_detail_record,
+    tool_paths_from_arguments,
+)
+from codedoggy.tui.theme import DETAIL_STYLE_RULES
 
 # Grok injects plan/MCP/scheduler hints as <system-reminder>...</system-reminder>
 # on the model-facing user turn. Never paint those in the TUI transcript.
@@ -59,62 +64,6 @@ MAX_THOUGHTS_WIDTH = 120
 MAX_BLOCK_CHARS = 12_000
 THINKING_LABEL = "思考过程"
 
-# GrokBuild default: GrokNight (xai-grok-pager-render/theme/groknight.rs).
-# Neutral gray canvas + TokyoNight accents — no blue-tinted ink background.
-DETAIL_STYLE_RULES = {
-    "detail.header": "bg:#141414 #c4789a",
-    "detail.meta": "bg:#141414 #6c6c6c",
-    # Active filter chips (消息/工具/计划) + status (已完成).
-    "detail.active": "bg:#141414 #e1e1e1",
-    "detail.separator": "bg:#141414 #242424",
-    "detail.border.left": "bg:#141414 #363636",
-    "detail.border.right": "bg:#141414 #363636",
-    "detail.text": "bg:#141414 #e1e1e1",
-    "detail.actor": "bg:#141414 #c8c8c8",
-    "detail.actor.user": "bg:#141414 #c8c8c8",
-    "detail.actor.assistant": "bg:#141414 #c4789a",
-    "detail.actor.tool": "bg:#141414 #787878",
-    "detail.tool": "bg:#141414 #7aa2f7",
-    "detail.block": "bg:#1c1c1c #c8c8c8",
-    "detail.code": "bg:#1c1c1c #c8c8c8",
-    "detail.code.rail": "bg:#1c1c1c #363636",
-    "detail.code.gutter": "bg:#1c1c1c #585858",
-    "detail.code.gutter.mark": "bg:#1c1c1c #6c6c6c",
-    "detail.code.gutter.sep": "bg:#1c1c1c #242424",
-    "detail.code.meta": "bg:#141414 #6c6c6c",
-    "detail.code.kw": "bg:#1c1c1c #c4789a bold",
-    "detail.code.str": "bg:#1c1c1c #9ece6a",
-    "detail.code.cmt": "bg:#1c1c1c #6c6c6c italic",
-    "detail.code.num": "bg:#1c1c1c #ff9e64",
-    "detail.code.sym": "bg:#1c1c1c #7dcfff",
-    "detail.code.plain": "bg:#1c1c1c #e1e1e1",
-    "detail.diff.add": "bg:#063806 #9ece6a",
-    "detail.diff.remove": "bg:#420e14 #f7768e",
-    "detail.diff.hunk": "bg:#1c1c1c #e0af68",
-    "detail.diff.gutter": "bg:#1c1c1c #6c6c6c",
-    "detail.success": "bg:#1c1c1c #9ece6a",
-    "detail.error": "bg:#1c1c1c #f7768e",
-    "detail.warning": "bg:#1c1c1c #e0af68",
-    "detail.link": "bg:#141414 #7aa6da underline",
-    "detail.link.hint": "bg:#141414 #e0af68",
-    "detail.fold.active": "bg:#141414 #c8c8c8",
-    "detail.md.ol": "bg:#141414 #7aa2f7",
-    "detail.md.ul": "bg:#141414 #6c6c6c",
-    "detail.md.h1": "bg:#141414 #1abc9c bold",
-    "detail.md.h2": "bg:#141414 #7aa2f7 bold",
-    "detail.md.h3": "bg:#141414 #a86888 bold",
-    "detail.md.quote": "bg:#141414 #6c6c6c italic",
-    "detail.md.inline": "bg:#1c1c1c #3A95AB",
-    "detail.md.bold": "bg:#141414 #e1e1e1 bold",
-    "detail.md.italic": "bg:#141414 #c8c8c8 italic",
-    "detail.md.strike": "bg:#141414 #6c6c6c strike",
-    "detail.thinking.header": "bg:#141414 #c4789a",
-    "detail.thinking.rail": "bg:#1c1c1c #585858",
-    "detail.thinking.body": "bg:#1c1c1c #c8c8c8",
-    "detail.thinking.meta": "bg:#141414 #6c6c6c",
-    "detail.actor.think": "bg:#141414 #c4789a",
-}
-
 
 @dataclass(frozen=True, slots=True)
 class DetailBlock:
@@ -138,6 +87,8 @@ class DetailRecord:
     blocks: tuple[DetailBlock, ...] = ()
     timestamp: str = ""
     status: str = "completed"
+    # Full filesystem paths for Ctrl+click open (Write/Read/edit/attachments).
+    open_paths: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -285,6 +236,7 @@ def snapshot_from_messages(
                 category = _tool_category(name, arguments)
                 # Grok-style headline: "Read path", "Ran cmd" — not "TOOL · name".
                 headline = _tool_headline(name, arguments)
+                open_paths = tool_paths_from_arguments(arguments)
                 record = DetailRecord(
                     id=call_id,
                     sequence=sequence,
@@ -294,6 +246,7 @@ def snapshot_from_messages(
                     blocks=(_arguments_block(name, arguments),),
                     timestamp=f"#{sequence:03d}",
                     status="running",
+                    open_paths=open_paths,
                 )
                 tool_positions[call_id] = len(records)
                 records.append(record)
@@ -402,27 +355,49 @@ def render_detail_header(
             ("class:detail.active", _truncate_display(right, width)),
             ("", "\n"),
         ]
-    fragments.append(("class:detail.separator", "─" * width + "\n"))
+    fragments.append(("class:detail.separator", "─" * min(width, 28) + "\n"))
     used = 0
+    sep = " · "
+    sep_w = get_cwidth(sep)
     for item in DETAIL_FILTERS:
-        label = f"[{DETAIL_FILTER_LABELS[item]}]"
-        item_width = get_cwidth(label) + (2 if used else 0)
-        if used and used + item_width > width:
+        label = DETAIL_FILTER_LABELS[item]
+        label_w = get_cwidth(label)
+        need = label_w + (sep_w if used else 0)
+        if used and used + need > width:
             fragments.append(("", "\n"))
             used = 0
-            item_width = get_cwidth(label)
+            need = label_w
         if used:
-            fragments.append(("", "  "))
+            fragments.append(("class:detail.meta", sep))
+            used += sep_w
         style = "class:detail.active" if item == active_filter else "class:detail.meta"
         fragments.append((style, label))
-        used += item_width
+        used += label_w
     fragments.extend(
         [
             ("", "\n"),
-            ("class:detail.separator", "─" * width + "\n"),
+            ("", "\n"),
         ]
     )
     return fragments
+
+
+def _section_break(width: int) -> StyleAndTextTuples:
+    """Reading rhythm between records: air + short soft rule + air.
+
+    Inspired by Linear/Notion/Medium: space carries hierarchy; the rule is a
+    quiet hairline, not a full-width terminal box rail.
+    """
+    rule_w = min(20, max(4, width // 4))
+    rule_w = min(rule_w, max(1, width))
+    rule = "─" * rule_w
+    pad = max(0, (width - get_cwidth(rule)) // 2)
+    line = ((" " * pad) + rule)[:width]
+    return [
+        ("", "\n"),
+        ("class:detail.separator", line + "\n"),
+        ("", "\n"),
+    ]
 
 
 def render_detail_body(
@@ -450,38 +425,24 @@ def render_detail_body(
     fragments: StyleAndTextTuples = []
     for index, record in enumerate(records):
         if index:
-            fragments.extend(
-                [
-                    ("class:detail.border.left", "╾"),
-                    ("class:detail.separator", "┈" * max(1, width - 2)),
-                    ("class:detail.border.right", "╼\n"),
-                ]
-            )
+            fragments.extend(_section_break(width))
         fragments.extend(
             _render_record(
                 record,
                 width,
                 collapsed_keys=collapsed,
                 fold_mouse=fold_mouse,
+                path_mouse=path_mouse,
             )
         )
         if path_mouse is not None:
-            for image_path in paths_from_detail_record(record):
-                short = image_path
-                try:
-                    from pathlib import Path as _P
-
-                    short = _P(image_path).name or image_path
-                except Exception:  # noqa: BLE001
-                    pass
-                label = f"  ╭ 点击打开 {short} ╮"
+            for file_path in paths_from_detail_record(record):
+                label = f"  Ctrl+点击 {link_label_for_path(file_path)}"
                 label = _truncate_display(label, width)
-                handler = path_mouse(image_path)
+                handler = path_mouse(file_path)
                 if handler is not None:
-                    fragments.append(("class:detail.link.hint", label, handler))
                     fragments.append(("", "\n"))
-                    hint = _truncate_display(f"     {image_path}", width)
-                    fragments.append(("class:detail.link", hint, handler))
+                    fragments.append(("class:detail.link.hint", label, handler))
                     fragments.append(("", "\n"))
     return fragments
 
@@ -515,6 +476,7 @@ def _render_record(
     *,
     collapsed_keys: set[str],
     fold_mouse: Callable[[str], Any] | None,
+    path_mouse: Callable[[str], Any] | None = None,
 ) -> StyleAndTextTuples:
     """Render one transcript row.
 
@@ -535,7 +497,6 @@ def _render_record(
             bullet, bstyle = "×", "class:detail.error"
         else:
             bullet, bstyle = "·", "class:detail.meta"
-        head = _truncate_display(f"  {bullet} {title}", width)
         # Whole header is a hit target: toggle all tool bodies for this record.
         tool_keys = [
             block_collapse_key(record.id, i)
@@ -543,9 +504,8 @@ def _render_record(
             if b.label in {"调用参数", "返回结果"}
         ]
         all_collapsed = bool(tool_keys) and all(k in collapsed_keys for k in tool_keys)
+        prefer = None
         if fold_mouse is not None and tool_keys:
-            # Click header expands/collapses first foldable key (fold mouse is per-key).
-            # Use the result key if present else the first arg key.
             prefer = next(
                 (
                     block_collapse_key(record.id, i)
@@ -554,7 +514,27 @@ def _render_record(
                 ),
                 tool_keys[0],
             )
-            fragments.append((bstyle, head + "\n", fold_mouse(prefer)))
+        open_path = (record.open_paths[0] if record.open_paths else "") or ""
+        # Prefer Ctrl+click open on the filename; plain click still folds.
+        path_handler = (
+            path_mouse(open_path) if (path_mouse is not None and open_path) else None
+        )
+        fold_handler = fold_mouse(prefer) if (fold_mouse is not None and prefer) else None
+        head = _truncate_display(f"  {bullet}  {title}", width)
+        if path_handler is not None and " " in title:
+            verb, _, name = title.partition(" ")
+            prefix = _truncate_display(f"  {bullet}  {verb} ", width)
+            rest_w = max(1, width - get_cwidth(prefix))
+            name_txt = _truncate_display(name, rest_w)
+            if fold_handler is not None:
+                fragments.append((bstyle, prefix, fold_handler))
+            else:
+                fragments.append((bstyle, prefix))
+            fragments.append(("class:detail.link", name_txt + "\n", path_handler))
+        elif fold_handler is not None:
+            fragments.append((bstyle, head + "\n", fold_handler))
+        elif path_handler is not None:
+            fragments.append(("class:detail.link", head + "\n", path_handler))
         else:
             fragments.append((bstyle, head + "\n"))
         # Bodies only when expanded (not all_collapsed).
@@ -575,33 +555,20 @@ def _render_record(
         return fragments
 
     # ── Non-tool (user / think / assistant) ──────────────────────────
+    # Web reading: small muted byline, then body — not a terminal "USER · 进度" rail.
     actor_short = {
         "USER": "你",
         "THINK": "思考",
         "MAIN": "MAIN",
     }.get(actor.strip().upper(), actor.strip()[:8] or "AGENT")
     actor_style = _actor_style(actor)
-    line = f"  {actor_short} · {title}" if title else f"  {actor_short}"
-    if get_cwidth(line) <= width:
-        parts: StyleAndTextTuples = [
-            (actor_style, f"  {actor_short}"),
-        ]
-        if title:
-            parts.extend(
-                [
-                    ("class:detail.meta", " · "),
-                    ("class:detail.text", title),
-                ]
-            )
-        parts.append(("", "\n"))
-        fragments.extend(parts)
-    else:
-        fragments.extend(
-            [
-                ("class:detail.meta", _truncate_display(line, width)),
-                ("", "\n"),
-            ]
-        )
+    # Byline only — drop redundant "进度" titles that add noise without meaning.
+    byline = actor_short
+    if title and title not in {"进度", "回复", "输出"}:
+        byline = f"{actor_short}  ·  {title}"
+    fragments.append((actor_style, f"  {byline}"))
+    fragments.append(("", "\n"))
+    fragments.append(("", "\n"))
     for block_index, block in enumerate(record.blocks):
         key = block_collapse_key(record.id, block_index)
         is_thinking = block.kind == "thinking" or block.label == THINKING_LABEL
@@ -1109,10 +1076,13 @@ def _render_text_block(text: str, width: int) -> StyleAndTextTuples:
 
         list_marker_w = 0
         if not raw.strip():
+            # Paragraph air (Medium/Notion): blank line stays blank, plus a little more.
             fragments.append(("", "\n"))
             continue
-        for piece in _wrap_display(raw, max(1, width - 2)):
-            fragments.append(("class:detail.text", "  "))
+        # Comfortable reading column: indent body like a content pane, not edge-flush.
+        gutter = "   "
+        for piece in _wrap_display(raw, max(1, width - get_cwidth(gutter))):
+            fragments.append(("class:detail.text", gutter))
             fragments.extend(_render_inline_md(piece))
             fragments.append(("", "\n"))
 

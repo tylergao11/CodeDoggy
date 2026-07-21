@@ -573,11 +573,15 @@ def test_detail_scroll_helpers_move_cursor_and_window() -> None:
 
 
 def test_interactive_scrollbar_margin_emits_handlers() -> None:
-    """Scrollbar cells must carry mouse handlers (stock PT margin is paint-only)."""
+    """Margin paints glyphs; mouse wiring is via install_mouse_handlers."""
+    from prompt_toolkit.data_structures import Point
+    from prompt_toolkit.layout.mouse_handlers import MouseHandlers
+    from prompt_toolkit.mouse_events import MouseButton, MouseEvent, MouseEventType
+
     from codedoggy.tui.app import InteractiveScrollbarMargin
 
     class _Win:
-        vertical_scroll = 0
+        vertical_scroll = 5
 
     class _Info:
         content_height = 40
@@ -585,12 +589,127 @@ def test_interactive_scrollbar_margin_emits_handlers() -> None:
         vertical_scroll = 5
         window = _Win()
 
-    margin = InteractiveScrollbarMargin(on_scroll=lambda s: None)
+    margin = InteractiveScrollbarMargin()
     fr = margin.create_margin(_Info(), 1, 10)
-    # At least one fragment should be a 3-tuple with a handler.
-    handled = [f for f in fr if len(f) >= 3 and f[2] is not None]
-    assert handled
-    assert any("▴" in f[1] or "▾" in f[1] or f[1] == " " for f in handled)
+    assert any(f[1] in {"▴", "▾", " "} for f in fr)
+
+    handlers = MouseHandlers()
+    info = _Info()
+    win = info.window
+
+    def _set(w: object, max_scroll: int, value: int) -> None:
+        setattr(w, "vertical_scroll", max(0, min(max_scroll, int(value))))
+
+    margin._set_scroll = _set  # type: ignore[method-assign]
+    margin.install_mouse_handlers(
+        handlers,
+        window_render_info=info,
+        bar_xpos=20,
+        ypos=0,
+        height=10,
+        capture_x_min=0,
+        capture_x_max=21,
+    )
+    # Row 0 = ▴; thumb near top; row 7 is track below → jump scroll.
+    before = win.vertical_scroll
+    handlers.mouse_handlers[7][20](
+        MouseEvent(
+            position=Point(x=20, y=7),
+            event_type=MouseEventType.MOUSE_DOWN,
+            button=MouseButton.LEFT,
+            modifiers=frozenset(),
+        )
+    )
+    assert win.vertical_scroll != before
+
+    # Thumb at track index 1 → screen y=2 → starts drag.
+    win.vertical_scroll = 5
+    info.vertical_scroll = 5
+    margin._dragging = False
+    margin.install_mouse_handlers(
+        handlers,
+        window_render_info=info,
+        bar_xpos=20,
+        ypos=0,
+        height=10,
+        capture_x_min=0,
+        capture_x_max=21,
+    )
+    handlers.mouse_handlers[2][20](
+        MouseEvent(
+            position=Point(x=20, y=2),
+            event_type=MouseEventType.MOUSE_DOWN,
+            button=MouseButton.LEFT,
+            modifiers=frozenset(),
+        )
+    )
+    assert margin._dragging
+
+
+def test_scrollbar_drag_capture_follows_move_off_rail() -> None:
+    """While dragging, MOVE over content (not the 1-cell rail) still scrolls."""
+    from prompt_toolkit.data_structures import Point
+    from prompt_toolkit.layout.mouse_handlers import MouseHandlers
+    from prompt_toolkit.mouse_events import MouseButton, MouseEvent, MouseEventType
+
+    from codedoggy.tui.app import InteractiveScrollbarMargin
+
+    class _Win:
+        vertical_scroll = 10
+
+    class _Info:
+        content_height = 100
+        window_height = 10
+        vertical_scroll = 10
+        window = _Win()
+
+    margin = InteractiveScrollbarMargin()
+    info = _Info()
+    win = info.window
+
+    def _set(w: object, max_scroll: int, value: int) -> None:
+        setattr(w, "vertical_scroll", max(0, min(max_scroll, int(value))))
+
+    margin._set_scroll = _set  # type: ignore[method-assign]
+    handlers = MouseHandlers()
+    margin.install_mouse_handlers(
+        handlers,
+        window_render_info=info,
+        bar_xpos=20,
+        ypos=0,
+        height=10,
+        capture_x_min=0,
+        capture_x_max=21,
+    )
+    # Thumb at track index 1 → screen y=2.
+    handlers.mouse_handlers[2][20](
+        MouseEvent(
+            position=Point(x=20, y=2),
+            event_type=MouseEventType.MOUSE_DOWN,
+            button=MouseButton.LEFT,
+            modifiers=frozenset(),
+        )
+    )
+    assert margin._dragging
+    margin.install_mouse_handlers(
+        handlers,
+        window_render_info=info,
+        bar_xpos=20,
+        ypos=0,
+        height=10,
+        capture_x_min=0,
+        capture_x_max=21,
+    )
+    start = win.vertical_scroll
+    handlers.mouse_handlers[7][5](
+        MouseEvent(
+            position=Point(x=5, y=7),
+            event_type=MouseEventType.MOUSE_MOVE,
+            button=MouseButton.LEFT,
+            modifiers=frozenset(),
+        )
+    )
+    assert win.vertical_scroll != start
 
 
 def test_task_cards_never_show_agent_rows() -> None:

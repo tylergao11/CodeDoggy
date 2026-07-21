@@ -65,6 +65,10 @@ def create_client(config: ModelConfig, *, require_auth: bool | None = None) -> C
     from codedoggy.model.auth.resolve import apply_auth_to_config
     from codedoggy.model.context_limits import ensure_model_context_window
 
+    key0 = (config.provider or "").strip().lower()
+    if key0 == "unconfigured":
+        return _UnconfiguredClient(config)
+
     cfg = apply_auth_to_config(config, require=require_auth)
     # Always re-derive window from provider+model (never trust a stale 32k).
     cfg = ensure_model_context_window(cfg)
@@ -115,10 +119,14 @@ def model_config_from_env(
     else:
         from codedoggy.model.preferred_provider import resolve_startup_provider
 
-        prov = resolve_startup_provider()
+        resolved = resolve_startup_provider()
+        prov = (resolved or "unconfigured").strip().lower()
     profile = get_profile(prov)
 
-    if profile is not None:
+    if prov == "unconfigured":
+        default_base = ""
+        default_model = ""
+    elif profile is not None:
         default_base = profile.resolve_base_url(None) or profile.base_url
         default_model = profile.default_model or "gpt-4o-mini"
     elif prov == "ollama":
@@ -128,40 +136,46 @@ def model_config_from_env(
         default_base = "http://127.0.0.1:11434/v1"
         default_model = "gpt-4o-mini"
 
-    # Auto-picked imperial must not inherit a leftover local Ollama BASE_URL.
-    env_base = os.environ.get("CODEDOGGY_BASE_URL")
-    if (
-        not explicit_provider
-        and prov != "ollama"
-        and env_base
-        and _looks_like_local_ollama_url(env_base)
-    ):
-        env_base = None
-
-    resolved_base = (
-        base_url
-        or env_base
-        or (profile.resolve_base_url(None) if profile else None)
-        or (os.environ.get("OLLAMA_HOST") if prov == "ollama" else None)
-        or default_base
-        or ""
-    )
-    if prov == "ollama":
-        resolved_base = _normalize_ollama_base(resolved_base)
-    elif _looks_like_local_ollama_url(resolved_base):
-        # Explicit grok/claude/codex + stale 11434 — fail closed to profile URL.
-        resolved_base = str(
-            (profile.resolve_base_url(None) if profile else None) or default_base or ""
-        )
-
-    env_model = os.environ.get("CODEDOGGY_MODEL")
-    if (
-        not explicit_provider
-        and prov != "ollama"
-        and env_model
-        and _looks_like_ollama_model_tag(env_model)
-    ):
+    if prov == "unconfigured":
+        resolved_base = ""
         env_model = None
+    else:
+        # Auto-picked imperial must not inherit a leftover local Ollama BASE_URL.
+        env_base = os.environ.get("CODEDOGGY_BASE_URL")
+        if (
+            not explicit_provider
+            and prov != "ollama"
+            and env_base
+            and _looks_like_local_ollama_url(env_base)
+        ):
+            env_base = None
+
+        resolved_base = (
+            base_url
+            or env_base
+            or (profile.resolve_base_url(None) if profile else None)
+            or (os.environ.get("OLLAMA_HOST") if prov == "ollama" else None)
+            or default_base
+            or ""
+        )
+        if prov == "ollama":
+            resolved_base = _normalize_ollama_base(resolved_base)
+        elif _looks_like_local_ollama_url(resolved_base):
+            # Explicit grok/claude/codex + stale 11434 — fail closed to profile URL.
+            resolved_base = str(
+                (profile.resolve_base_url(None) if profile else None)
+                or default_base
+                or ""
+            )
+
+        env_model = os.environ.get("CODEDOGGY_MODEL")
+        if (
+            not explicit_provider
+            and prov != "ollama"
+            and env_model
+            and _looks_like_ollama_model_tag(env_model)
+        ):
+            env_model = None
 
     resolved_model = (
         model
@@ -182,6 +196,8 @@ def model_config_from_env(
         context_window=None,  # filled by ensure_model_context_window
         extra=_reasoning_extra_from_env(),
     )
+    if prov == "unconfigured":
+        return cfg
     # Soft hydrate: fill tokens when present; do not raise LoginRequired here
     # (callers that need hard gate use create_client / apply_auth with require).
     try:
@@ -309,6 +325,18 @@ def _codex_app_server_factory(config: ModelConfig) -> ChatClient:
     return CodexAppServerClient(
         config, profile=get_profile(config.provider) or get_profile("codex_app_server")
     )
+
+
+class _UnconfiguredClient:
+    """Placeholder client when the user has not chosen a provider yet."""
+
+    def __init__(self, config: ModelConfig) -> None:
+        self.config = config
+
+    def complete(self, messages: Any, **kwargs: Any) -> Any:
+        raise RuntimeError(
+            "未选择模型 — 按 Ctrl+L 选择 Provider 并登录/应用后再发送"
+        )
 
 
 def _ollama_factory(config: ModelConfig) -> ChatClient:

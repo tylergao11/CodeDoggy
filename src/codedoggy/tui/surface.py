@@ -85,12 +85,18 @@ def session_mode_label(session: Any) -> str:
 
 
 def model_and_mode_text(session: Any) -> str:
-    """Prompt caption: ``model · 推理:high · auto|plan``."""
+    """Prompt caption: ``provider/model · 推理:high · auto|plan``.
+
+    Unconfigured sessions show only ``未选择模型`` — never a fake local default.
+    """
     snap = active_connection(session)
-    model = snap.model if snap is not None else "model"
+    if snap is None or not snap.ready_to_sample:
+        return "未选择模型"
+    # Show provider/model so caption cannot lie about which backend is live.
+    identity = snap.label
     mode = session_mode_label(session)
-    reason = snap.reasoning_label if snap is not None else ""
-    parts = [model]
+    reason = snap.reasoning_label
+    parts = [identity]
     if reason:
         parts.append(reason)
     parts.append(mode)

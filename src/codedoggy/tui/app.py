@@ -13,7 +13,7 @@ from typing import Any
 
 from prompt_toolkit.application import Application
 from prompt_toolkit.application.current import get_app
-from prompt_toolkit.filters import Condition
+from prompt_toolkit.filters import Condition, has_selection
 from prompt_toolkit.formatted_text import StyleAndTextTuples
 from prompt_toolkit.history import FileHistory, InMemoryHistory
 from prompt_toolkit.key_binding import KeyBindings
@@ -38,25 +38,30 @@ from prompt_toolkit.layout.processors import (
 )
 from prompt_toolkit.mouse_events import MouseEvent, MouseEventType
 from prompt_toolkit.output.color_depth import ColorDepth
-from prompt_toolkit.styles import Style
 from prompt_toolkit.utils import get_cwidth
 from prompt_toolkit.widgets import Frame, TextArea
 
 from codedoggy.session.types import SessionPhase, TurnStatus
 from codedoggy.tui.clipboard_image import (
     get_system_clipboard_text,
+    insert_image_chip,
     insert_path_token,
     save_clipboard_image,
 )
 from codedoggy.tui.agent_detail import (
     DETAIL_FILTERS,
     DETAIL_FILTER_LABELS,
-    DETAIL_STYLE_RULES,
     AgentDetailSnapshot,
     DetailFilter,
     render_detail_body,
     snapshot_from_messages,
 )
+from codedoggy.tui.open_path import (
+    VIEW_IMAGE_LABEL,
+    open_local_path,
+    path_under_cursor,
+)
+from codedoggy.tui.theme import build_style
 from codedoggy.tui.activity import LiveActivityBoard
 from codedoggy.tui.login_wizard import AuthWizard, WizardStep, run_browser_login
 from codedoggy.tui.model import TaskLedger, TaskView
@@ -162,10 +167,10 @@ _DOUBLE_CLICK_S = 0.45  # task/plan card double-click window
 class InteractiveScrollbarMargin(Margin):
     """Clickable/draggable scrollbar (stock PT ScrollbarMargin is paint-only).
 
-    Glyphs + styles keep a quiet GrokNight look; mouse arrows/track/thumb
-    update ``window.vertical_scroll`` and optionally notify ``on_scroll`` so
-    FormattedTextControl cursor anchors stay in sync (otherwise the next paint
-    snaps the viewport back via get_cursor_position).
+    Important: prompt_toolkit's ``Window._copy_margin`` paints margin glyphs but
+    never registers fragment mouse handlers. Use :class:`ScrollableWindow` so
+    :meth:`install_mouse_handlers` wires the right-margin column (and expands
+    to the full window while dragging — a 1-cell rail cannot receive MOVE).
     """
 
     def __init__(
@@ -183,20 +188,16 @@ class InteractiveScrollbarMargin(Margin):
     def get_width(self, get_ui_content: Callable[[], Any]) -> int:
         return 1
 
-    def create_margin(
-        self, window_render_info: Any, width: int, height: int
-    ) -> StyleAndTextTuples:
+    def _geometry(
+        self, window_render_info: Any
+    ) -> tuple[Any, int, int, int, int, int, int, bool]:
         content_height = int(window_render_info.content_height)
         window_height = int(window_render_info.window_height)
         scroll = int(window_render_info.vertical_scroll)
         win = window_render_info.window
         show_arrows = bool(self.display_arrows)
         track_height = max(1, window_height - (2 if show_arrows else 0))
-
         max_scroll = max(0, content_height - window_height)
-        if content_height <= 0:
-            return [("", "\n") for _ in range(max(1, height))]
-
         fraction_visible = min(
             1.0, window_height / float(max(1, content_height))
         )
@@ -208,24 +209,125 @@ class InteractiveScrollbarMargin(Margin):
             travel = max(0, track_height - thumb_h)
             thumb_top = int(round((scroll / float(max_scroll)) * travel))
             thumb_top = max(0, min(travel, thumb_top))
+        return (
+            win,
+            scroll,
+            track_height,
+            max_scroll,
+            thumb_h,
+            thumb_top,
+            content_height,
+            show_arrows,
+        )
 
-        def set_scroll(value: int) -> None:
-            new_scroll = max(0, min(max_scroll, int(value)))
+    def _set_scroll(self, win: Any, max_scroll: int, value: int) -> None:
+        new_scroll = max(0, min(max_scroll, int(value)))
+        try:
+            win.vertical_scroll = new_scroll
+        except Exception:  # noqa: BLE001
+            return
+        if self.on_scroll is not None:
             try:
-                win.vertical_scroll = new_scroll
-            except Exception:  # noqa: BLE001
-                return
-            if self.on_scroll is not None:
-                try:
-                    self.on_scroll(new_scroll)
-                except Exception:  # noqa: BLE001
-                    pass
-            try:
-                get_app().invalidate()
+                self.on_scroll(new_scroll)
             except Exception:  # noqa: BLE001
                 pass
+        try:
+            get_app().invalidate()
+        except Exception:  # noqa: BLE001
+            pass
 
-        def handler_for(kind: str, track_row: int = 0) -> Callable[[MouseEvent], object]:
+    def create_margin(
+        self, window_render_info: Any, width: int, height: int
+    ) -> StyleAndTextTuples:
+        (
+            _win,
+            _scroll,
+            track_height,
+            max_scroll,
+            thumb_h,
+            thumb_top,
+            content_height,
+            show_arrows,
+        ) = self._geometry(window_render_info)
+        if content_height <= 0:
+            return [("", "\n") for _ in range(max(1, height))]
+
+        # Fragments are paint-only unless ScrollableWindow installs handlers.
+        result: StyleAndTextTuples = []
+        if show_arrows:
+            result.append(("class:scrollbar.arrow", "▴"))
+            result.append(("", "\n"))
+
+        for i in range(track_height):
+            is_thumb = thumb_top <= i < thumb_top + thumb_h
+            if is_thumb:
+                style = "class:scrollbar.button"
+                if i == thumb_top + thumb_h - 1:
+                    style = "class:scrollbar.button,scrollbar.end"
+                result.append((style, " "))
+            else:
+                style = "class:scrollbar.background"
+                if i + 1 == thumb_top:
+                    style = "class:scrollbar.background,scrollbar.start"
+                result.append((style, " "))
+            result.append(("", "\n"))
+
+        if show_arrows:
+            result.append(("class:scrollbar.arrow", "▾"))
+
+        return result
+
+    def install_mouse_handlers(
+        self,
+        mouse_handlers: Any,
+        *,
+        window_render_info: Any,
+        bar_xpos: int,
+        ypos: int,
+        height: int,
+        capture_x_min: int,
+        capture_x_max: int,
+    ) -> None:
+        """Register click/drag handlers on the PT mouse raster (screen coords)."""
+        (
+            win,
+            _scroll,
+            track_height,
+            max_scroll,
+            thumb_h,
+            thumb_top,
+            content_height,
+            show_arrows,
+        ) = self._geometry(window_render_info)
+        if content_height <= 0 or height <= 0:
+            return
+
+        set_scroll = lambda value: self._set_scroll(win, max_scroll, value)
+
+        def track_row_from_screen_y(screen_y: int) -> int:
+            local = int(screen_y) - int(ypos)
+            if show_arrows:
+                local -= 1
+            return max(0, min(track_height - 1, local))
+
+        def apply_thumb_drag(screen_y: int) -> None:
+            if track_height <= 1 or max_scroll <= 0:
+                return
+            travel = max(1, track_height - thumb_h)
+            row = track_row_from_screen_y(screen_y)
+            delta = row - self._drag_grab_row
+            set_scroll(self._drag_start_scroll + int(round((delta / travel) * max_scroll)))
+
+        def jump_track(screen_y: int) -> None:
+            if track_height <= 1 or max_scroll <= 0:
+                set_scroll(0)
+                return
+            travel = max(1, track_height - thumb_h)
+            row = track_row_from_screen_y(screen_y)
+            target_top = max(0, min(travel, row - thumb_h // 2))
+            set_scroll(int(round((target_top / travel) * max_scroll)))
+
+        def cell_handler(kind: str) -> Callable[[MouseEvent], object]:
             def handler(event: MouseEvent) -> object:
                 et = event.event_type
                 if et is MouseEventType.SCROLL_UP:
@@ -241,65 +343,118 @@ class InteractiveScrollbarMargin(Margin):
                         set_scroll(int(getattr(win, "vertical_scroll", 0) or 0) + 1)
                     elif kind == "thumb":
                         self._dragging = True
-                        self._drag_grab_row = track_row
+                        self._drag_grab_row = track_row_from_screen_y(event.position.y)
                         self._drag_start_scroll = int(
                             getattr(win, "vertical_scroll", 0) or 0
                         )
+                        # Re-paint so install_mouse_handlers expands capture
+                        # beyond the 1-cell rail for subsequent MOVE events.
+                        try:
+                            get_app().invalidate()
+                        except Exception:  # noqa: BLE001
+                            pass
                     elif kind == "track":
-                        # Jump so the thumb centers on the click (page-like).
-                        if track_height <= 1 or max_scroll <= 0:
-                            set_scroll(0)
-                        else:
-                            travel = max(1, track_height - thumb_h)
-                            target_top = max(
-                                0, min(travel, track_row - thumb_h // 2)
-                            )
-                            set_scroll(int(round((target_top / travel) * max_scroll)))
+                        jump_track(event.position.y)
                     return None
                 if et is MouseEventType.MOUSE_MOVE and self._dragging:
-                    # MOVE hits the fragment under the cursor; track_row is that
-                    # cell's index within the track (0..track_height-1).
-                    if track_height <= 1 or max_scroll <= 0:
-                        return None
-                    travel = max(1, track_height - thumb_h)
-                    target_top = max(0, min(travel, track_row - thumb_h // 2))
-                    set_scroll(int(round((target_top / travel) * max_scroll)))
+                    apply_thumb_drag(event.position.y)
                     return None
                 if et is MouseEventType.MOUSE_UP:
+                    if self._dragging:
+                        apply_thumb_drag(event.position.y)
                     self._dragging = False
                     return None
                 return NotImplemented
 
             return handler
 
-        result: StyleAndTextTuples = []
-        if show_arrows:
-            result.append(
-                ("class:scrollbar.arrow", "▴", handler_for("up"))
-            )
-            result.append(("", "\n"))
+        def drag_capture(event: MouseEvent) -> object:
+            """Full-window capture while thumb-dragging (cursor leaves the rail)."""
+            et = event.event_type
+            if not self._dragging:
+                return NotImplemented
+            if et is MouseEventType.MOUSE_MOVE:
+                apply_thumb_drag(event.position.y)
+                return None
+            if et is MouseEventType.MOUSE_UP:
+                apply_thumb_drag(event.position.y)
+                self._dragging = False
+                return None
+            return NotImplemented
 
-        for i in range(track_height):
-            # Space + bg color (Grok-like solid rail); no pink glyph, no cyan.
-            is_thumb = thumb_top <= i < thumb_top + thumb_h
-            if is_thumb:
-                style = "class:scrollbar.button"
-                if i == thumb_top + thumb_h - 1:
-                    style = "class:scrollbar.button,scrollbar.end"
-                result.append((style, " ", handler_for("thumb", i)))
+        # While dragging, own the whole window so MOVE/UP still reach us.
+        if self._dragging:
+            mouse_handlers.set_mouse_handler_for_range(
+                x_min=capture_x_min,
+                x_max=capture_x_max,
+                y_min=ypos,
+                y_max=ypos + height,
+                handler=drag_capture,
+            )
+
+        # Always wire the 1-cell rail (arrows / track / thumb).
+        for row in range(height):
+            screen_y = ypos + row
+            if show_arrows and row == 0:
+                kind = "up"
+            elif show_arrows and row == height - 1:
+                kind = "down"
             else:
-                style = "class:scrollbar.background"
-                if i + 1 == thumb_top:
-                    style = "class:scrollbar.background,scrollbar.start"
-                result.append((style, " ", handler_for("track", i)))
-            result.append(("", "\n"))
+                track_i = row - (1 if show_arrows else 0)
+                if thumb_top <= track_i < thumb_top + thumb_h:
+                    kind = "thumb"
+                else:
+                    kind = "track"
+            mouse_handlers.mouse_handlers[screen_y][bar_xpos] = cell_handler(kind)
 
-        if show_arrows:
-            result.append(
-                ("class:scrollbar.arrow", "▾", handler_for("down"))
-            )
 
-        return result
+class ScrollableWindow(Window):
+    """Window whose right InteractiveScrollbarMargin receives real mouse events."""
+
+    def write_to_screen(
+        self,
+        screen: Any,
+        mouse_handlers: Any,
+        write_position: Any,
+        parent_style: str,
+        erase_bg: bool,
+        z_index: int | None,
+    ) -> None:
+        super().write_to_screen(
+            screen,
+            mouse_handlers,
+            write_position,
+            parent_style,
+            erase_bg,
+            z_index,
+        )
+        info = getattr(self, "render_info", None)
+        if info is None:
+            return
+        right_widths = [self._get_margin_width(m) for m in self.right_margins]
+        total_right = sum(right_widths)
+        if total_right <= 0:
+            return
+        # Prefer the clamped rect Window actually painted into.
+        painted = getattr(screen, "visible_windows_to_write_positions", {}).get(self)
+        wp = painted if painted is not None else write_position
+        xpos = int(wp.xpos)
+        ypos = int(wp.ypos)
+        width = int(wp.width)
+        height = int(wp.height)
+        bar_x = xpos + width - total_right
+        for margin, mw in zip(self.right_margins, right_widths):
+            if mw > 0 and isinstance(margin, InteractiveScrollbarMargin):
+                margin.install_mouse_handlers(
+                    mouse_handlers,
+                    window_render_info=info,
+                    bar_xpos=bar_x,
+                    ypos=ypos,
+                    height=height,
+                    capture_x_min=xpos,
+                    capture_x_max=xpos + width,
+                )
+            bar_x += mw
 
 
 def _rounded_title(title: str, width: int, *, fill: str = "─") -> str:
@@ -315,108 +470,8 @@ def _rounded_title(title: str, width: int, *, fill: str = "─") -> str:
     return "╭" + fill * left + core + fill * right + "╮"
 
 
-CODEDOGGY_DARK = Style.from_dict(
-    {
-        # GrokBuild default theme: GrokNight
-        # (neutral gray base + TokyoNight accents — see xai-grok-pager-render
-        # theme/groknight.rs). No blue-tinted “ink” canvas.
-        #
-        #   bg_base #141414 · text #e1e1e1 · comment #6c6c6c
-        #   soft pink #c4789a · blue #7aa2f7 · cyan #7dcfff
-        #   green #9ece6a · yellow #e0af68 · orange #ff9e64 · red #f7768e
-        #   plan gold #FFDB8D · teal #1abc9c
-        "root": "bg:#141414 #e1e1e1",
-        "header": "bg:#141414 #c8c8c8",
-        "brand": "#c4789a",
-        "brand.edge.pink": "#a86888",
-        "header.rule.dim": "#242424",
-        "meta": "#6c6c6c",
-        "separator": "#242424",
-        "task.spine": "#363636",
-        "task.spine.active": "#7dcfff",
-        "task.marker.active": "#7dcfff",
-        # Selected card uses prompt.border.focus / .dim (identical to input focus).
-        "task.marker.selected": "#c4789a",
-        "task.marker.idle": "#414141",
-        "task.title": "#e1e1e1",
-        "task.status": "#6c6c6c",
-        "task.status.running": "#c4789a",
-        "task.status.reporting": "#7dcfff",
-        "task.status.completed": "#6c6c6c",
-        "task.status.failed": "#f7768e",
-        "agent.border": "#505058",
-        "report": "#c8c8c8",
-        "input": "bg:#111111 #e1e1e1",
-        "input.placeholder": "bg:#111111 #585858",
-        "prompt": "bg:#111111 #FFDB8D",
-        "prompt.border": "bg:#141414 #323237",
-        # Focus: soft light pink rail so the active box is obvious.
-        "prompt.border.focus": "bg:#141414 #d4a0b8",
-        "prompt.border.dim": "bg:#141414 #242424",
-        "prompt.caption": "bg:#141414 #6c6c6c",
-        "turn.status": "bg:#141414 #c4789a",
-        "turn.elapsed": "bg:#141414 #787878",
-        "turn.stop": "bg:#141414 #f7768e",
-        "task.interject": "bg:#141414 #FFDB8D",
-        "task.marker.interject": "#FFDB8D",
-        "feedback.info": "bg:#141414 #7dcfff",
-        "feedback.success": "bg:#141414 #9ece6a",
-        "feedback.warning": "bg:#141414 #f7768e",
-        "todo.badge": "bg:#141414 #787878",
-        "todo.badge.open": "bg:#141414 #FFDB8D",
-        "todo.pane": "bg:#141414 #c8c8c8",
-        "todo.pane.title": "bg:#141414 #FFDB8D",
-        "todo.pane.border": "bg:#141414 #363636",
-        "todo.item.pending": "bg:#141414 #6c6c6c",
-        "todo.item.progress": "bg:#141414 #FFDB8D",
-        "todo.item.done": "bg:#141414 #9ece6a",
-        "todo.item.cancelled": "bg:#141414 #585858",
-        "shortcut.key": "bg:#141414 #c8c8c8",
-        "shortcut.label": "bg:#141414 #6c6c6c",
-        "shortcut.separator": "bg:#141414 #242424",
-        "shortcut.pending": "bg:#141414 #e0af68",
-        "agent-window": "bg:#141414 #e1e1e1",
-        "agent-window.header": "bg:#141414 #c4789a",
-        "agent-window.close": "bg:#1c1c1c #f7768e",
-        "agent-window.hint": "bg:#141414 #6c6c6c",
-        # ask_user questionnaire float
-        "ask.dialog": "bg:#1c1c1c #e1e1e1",
-        "ask.border": "bg:#1c1c1c #FFDB8D",
-        "ask.header": "bg:#1c1c1c #FFDB8D bold",
-        "ask.question": "bg:#1c1c1c #e1e1e1 bold",
-        "ask.meta": "bg:#1c1c1c #6c6c6c",
-        "ask.option": "bg:#1c1c1c #c8c8c8",
-        "ask.option.selected": "bg:#242424 #FFDB8D bold",
-        "ask.option.desc": "bg:#1c1c1c #6c6c6c",
-        "ask.hint": "bg:#1c1c1c #6c6c6c",
-        "modal.border.left": "bg:#141414 #363636",
-        "modal.border.right": "bg:#141414 #363636",
-        "modal.border.dim": "bg:#141414 #242424",
-        "detail.input": "bg:#111111 #e1e1e1",
-        "detail.input.prompt": "bg:#111111 #FFDB8D",
-        # Auth menu: blue cursor, yellow for in-use, white for logged-in, quiet gray else.
-        "auth.item": "bg:#141414 #6c6c6c",
-        "auth.item.selected": "bg:#141414 #7dcfff",
-        "auth.item.active": "bg:#141414 #FFDB8D",
-        "auth.item.logged": "bg:#141414 #e1e1e1",
-        "auth.item.muted": "bg:#141414 #585858",
-        "auth.hint": "bg:#141414 #6c6c6c",
-        "auth.note": "bg:#141414 #787878",
-        "hud.title": "fg:#c4789a bg:#0a0a0a",
-        "hud.ok": "fg:#9ece6a bg:#0a0a0a",
-        "hud.warn": "fg:#f7768e bg:#0a0a0a",
-        "hud.cyan": "fg:#7dcfff bg:#0a0a0a",
-        "hud.dim": "fg:#585858 bg:#0a0a0a",
-        "hud.bg": "bg:#0a0a0a",
-        # GrokBuild-style scrollbar: black track + gray thumb.
-        "scrollbar.background": "bg:#0a0a0a #242424",
-        "scrollbar.start": "bg:#0a0a0a #363636",
-        "scrollbar.button": "bg:#505058 #6c6c6c",
-        "scrollbar.end": "bg:#505058 #6c6c6c",
-        "scrollbar.arrow": "bg:#0a0a0a #505058",
-        **DETAIL_STYLE_RULES,
-    }
-)
+# Default ``fresh``; override with CODEDOGGY_THEME=groknight|dark|quiet|cute.
+CODEDOGGY_DARK = build_style()
 
 
 class CodeDoggyTUI:
@@ -528,6 +583,7 @@ class CodeDoggyTUI:
         self._external_turn_views: dict[int, dict[str, Any]] = {}
         self._view_lock = threading.RLock()
         self._prompt_history = self._make_prompt_history()
+        self._last_pasted_path: str | None = None
 
         self._task_control = FormattedTextControl(
             text=self._render_tasks,
@@ -535,7 +591,7 @@ class CodeDoggyTUI:
             show_cursor=False,
             get_cursor_position=self._task_cursor_position,
         )
-        self._task_window = Window(
+        self._task_window = ScrollableWindow(
             content=self._task_control,
             wrap_lines=False,  # line y == content row; wrap broke scroll/cursor map
             scroll_offsets=ScrollOffsets(top=1, bottom=3),
@@ -574,7 +630,7 @@ class CodeDoggyTUI:
             show_cursor=False,
             get_cursor_position=self._detail_cursor_position,
         )
-        self._detail_window = Window(
+        self._detail_window = ScrollableWindow(
             content=self._detail_control,
             wrap_lines=False,
             scroll_offsets=ScrollOffsets(top=1, bottom=2),
@@ -649,6 +705,8 @@ class CodeDoggyTUI:
         self._detail_input.buffer.on_text_changed += (
             lambda _buf: self._invalidate_safe()
         )
+        self._wire_buffer_ctrl_click(self._input)
+        self._wire_buffer_ctrl_click(self._detail_input)
 
         header = Window(
             FormattedTextControl(self._render_header),
@@ -1336,6 +1394,13 @@ class CodeDoggyTUI:
             """Clipboard image → save file → insert path; else OS/text paste."""
             self._paste_into_buffer(event)
 
+        # Mouse selection does not set shift_mode — stock Backspace won't cut.
+        @keys.add("delete", filter=prompt_paste & has_selection, eager=True)
+        @keys.add("backspace", filter=prompt_paste & has_selection, eager=True)
+        def _cut_input_selection(event: Any) -> None:
+            event.current_buffer.cut_selection()
+            event.app.invalidate()
+
         # Enter = submit. Ctrl+Enter (c-j; on Windows: Esc then c-j) = hard newline.
         # When questionnaire is waiting for Other free-text, Enter finishes Other.
         @keys.add("enter", filter=main_input_focused, eager=True)
@@ -1631,24 +1696,33 @@ class CodeDoggyTUI:
             pass
 
     def _paste_into_buffer(self, event: Any) -> None:
-        """If OS clipboard holds an image, dump it and insert the path.
+        """If OS clipboard holds an image, dump it and insert a「查看图片」chip.
 
         Otherwise paste OS / prompt_toolkit text. Intercepting Ctrl+V means we
         must read the *system* clipboard ourselves — PT's pad is often empty.
         """
         buffer = event.current_buffer
+        if buffer.selection_state is not None:
+            buffer.cut_selection()
         cwd = getattr(self.session, "cwd", None) or Path.cwd()
         try:
             saved = save_clipboard_image(cwd)
         except Exception:  # noqa: BLE001
             saved = None
         if saved is not None:
-            token = insert_path_token(saved)
+            token = insert_image_chip(saved, cwd=cwd)
             pos = buffer.cursor_position
             before = buffer.text[:pos]
             lead = " " if before and not before[-1].isspace() else ""
-            buffer.insert_text(f"{lead}{token} ")
-            self._set_feedback(f"已粘贴图片 → {saved.name}", "info")
+            insert = f"{lead}{token} "
+            text = buffer.text
+            buffer.text = text[:pos] + insert + text[pos:]
+            buffer.cursor_position = pos + len(insert)
+            self._last_pasted_path = str(saved)
+            self._set_feedback(
+                f"已粘贴{VIEW_IMAGE_LABEL} · Ctrl+点击路径可打开",
+                "info",
+            )
             event.app.invalidate()
             return
 
@@ -1666,7 +1740,12 @@ class CodeDoggyTUI:
             except Exception:  # noqa: BLE001
                 text = None
         if text:
-            buffer.insert_text(text)
+            pos = buffer.cursor_position
+            body = buffer.text
+            buffer.text = body[:pos] + text + body[pos:]
+            buffer.cursor_position = pos + len(text)
+        else:
+            self._set_feedback("剪贴板没有可用图片或文字", "warning")
         event.app.invalidate()
 
     def _accept_prompt(self, buffer: Any) -> bool:
@@ -1895,6 +1974,8 @@ class CodeDoggyTUI:
             if not output:
                 output = (result.final_text or "".join(streamed) or result.error or "").strip()
             status = _turn_status(result.status)
+            if status != "completed" and result.error:
+                output = _friendly_failure_toast(str(result.error))
             self.ledger.update_agent(
                 task_id,
                 f"{task_id}:main",
@@ -1933,7 +2014,7 @@ class CodeDoggyTUI:
                 feedback = None
             else:
                 self.ledger.finish_task(task_id, status)
-                feedback = ("任务未能完成", "warning")
+                feedback = (_friendly_failure_toast(result.error or output), "warning")
 
             def apply_success() -> None:
                 if feedback is None:
@@ -1945,14 +2026,15 @@ class CodeDoggyTUI:
         except Exception as exc:  # noqa: BLE001
             callback_state["active"] = False
             message = f"{type(exc).__name__}: {exc}"
+            friendly = _friendly_failure_toast(message)
             self.ledger.update_agent(
                 task_id,
                 f"{task_id}:main",
                 label="MAIN",
                 status="failed",
-                output=message,
+                output=friendly,
             )
-            self.ledger.set_report(task_id, "MAIN", message)
+            self.ledger.set_report(task_id, "MAIN", friendly)
             task = next(
                 (item for item in self.ledger.snapshots() if item.id == task_id),
                 None,
@@ -1969,7 +2051,7 @@ class CodeDoggyTUI:
                 self.ledger.finish_task(task_id, "failed")
 
             def apply_fail() -> None:
-                self._set_feedback("任务执行失败", "warning")
+                self._set_feedback(friendly, "warning")
 
             self._call_in_ui_thread(apply_fail)
         finally:
@@ -5643,24 +5725,83 @@ class CodeDoggyTUI:
             source="panel",
         )
 
-    def _image_path_mouse(self, path: str) -> Callable[[MouseEvent], object]:
-        """Click-to-open for image_gen/image_edit paths (OS default viewer)."""
+    def _wire_buffer_ctrl_click(self, area: TextArea) -> None:
+        """Ctrl+click a path /「查看图片(…)」chip in the prompt → open file."""
+        control = area.control
+        original = control.mouse_handler
 
-        def _on_up(_event: MouseEvent) -> None:
-            from codedoggy.tui.open_path import open_local_path
+        def mouse_handler(mouse_event: MouseEvent) -> object:
+            from prompt_toolkit.mouse_events import MouseButton, MouseModifier
 
+            result = original(mouse_event)
+            if mouse_event.event_type is not MouseEventType.MOUSE_UP:
+                return result
+            btn = getattr(mouse_event, "button", None)
+            if btn not in (None, MouseButton.LEFT):
+                return result
+            mods = getattr(mouse_event, "modifiers", None) or ()
+            if MouseModifier.CONTROL not in mods:
+                return result
+            buf = area.buffer
+            path = path_under_cursor(buf.text, buf.cursor_position)
+            if path is None and self._last_pasted_path:
+                # Cursor may sit on「查看图片」label — open last paste.
+                label = VIEW_IMAGE_LABEL
+                pos = buf.cursor_position
+                start = max(0, pos - len(label))
+                if label in buf.text[start : pos + len(label)]:
+                    path = self._last_pasted_path
+            if path is None:
+                # Chip form: 查看图片(relative/path.png)
+                m = re.search(
+                    rf"{re.escape(VIEW_IMAGE_LABEL)}\(([^)]+)\)",
+                    buf.text,
+                )
+                if m and m.start() <= buf.cursor_position <= m.end():
+                    path = m.group(1)
+            if not path:
+                return result
             cwd = getattr(self.session, "cwd", None)
             ok, message = open_local_path(path, cwd=cwd)
-            self._set_feedback(
-                message,
-                "success" if ok else "warning",
-            )
+            self._set_feedback(message, "success" if ok else "warning")
             try:
                 self.app.invalidate()
             except Exception:  # noqa: BLE001
                 pass
+            return None
 
-        return self._only_mouse_up(_on_up, scroll_target="detail")
+        control.mouse_handler = mouse_handler  # type: ignore[method-assign]
+
+    def _image_path_mouse(self, path: str) -> Callable[[MouseEvent], object]:
+        """Ctrl+click-to-open for image / script paths in the agent detail pane."""
+
+        def handler(event: MouseEvent) -> object:
+            from prompt_toolkit.mouse_events import MouseModifier
+
+            if event.event_type in {
+                MouseEventType.SCROLL_UP,
+                MouseEventType.SCROLL_DOWN,
+            }:
+                step = -3 if event.event_type is MouseEventType.SCROLL_UP else 3
+                if self._modal_open or self._ask_active:
+                    self._scroll_detail(step)
+                    return None
+                return NotImplemented
+            if event.event_type is not MouseEventType.MOUSE_UP:
+                return NotImplemented
+            mods = getattr(event, "modifiers", None) or ()
+            if MouseModifier.CONTROL not in mods:
+                return NotImplemented
+            cwd = getattr(self.session, "cwd", None)
+            ok, message = open_local_path(path, cwd=cwd)
+            self._set_feedback(message, "success" if ok else "warning")
+            try:
+                self.app.invalidate()
+            except Exception:  # noqa: BLE001
+                pass
+            return None
+
+        return handler
 
 
 def _render_doggy_idle_panel(width: int) -> StyleAndTextTuples:
@@ -5734,12 +5875,54 @@ def task_report_from_agent(text: str, *, max_chars: int | None = None) -> str:
     clean = text.strip()
     if not clean:
         return "任务已结束。"
+    soft = _friendly_failure_toast(clean)
+    if soft != "任务未能完成" or _looks_like_transport_error(clean):
+        # Prefer the human one-liner on the card; detail modal keeps raw if needed.
+        if _looks_like_transport_error(clean) or clean.lower().startswith("sampler"):
+            clean = soft
     paragraphs = [" ".join(part.split()) for part in re.split(r"\n\s*\n", clean)]
     report = next((part for part in paragraphs if part), clean)
     report = re.sub(r"^#{1,6}\s+", "", report)
     if max_chars is not None and len(report) > max_chars:
         return report[:max_chars].rstrip()
     return report
+
+
+def _looks_like_transport_error(text: str) -> bool:
+    low = (text or "").lower()
+    return any(
+        needle in low
+        for needle in (
+            "failed to reach",
+            "winerror 10061",
+            "积极拒绝",
+            "connection refused",
+            "timed out",
+            "sampler error",
+            "sampler failed",
+        )
+    )
+
+
+def _friendly_failure_toast(text: str | None) -> str:
+    """Short owner-facing failure line — no raw URL / WinError dump in the toast."""
+    raw = (text or "").strip()
+    if not raw:
+        return "任务未能完成"
+    low = raw.lower()
+    if "10061" in low or "积极拒绝" in raw:
+        return "连不上模型 · 检查网络或代理是否开启"
+    if "failed to reach" in low or "connection refused" in low:
+        return "连不上模型服务 · 请稍后重试或检查代理"
+    if "timed out" in low or "timeout" in low:
+        return "模型响应超时 · 可以再试一次"
+    if "sampler" in low:
+        return "模型调用失败"
+    # Keep short; card should not reprint a novel.
+    one = " ".join(raw.split())
+    if len(one) > 42:
+        return one[:41] + "…"
+    return one or "任务未能完成"
 
 
 def _turn_status(status: TurnStatus | Any) -> str:

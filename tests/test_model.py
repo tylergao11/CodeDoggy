@@ -65,19 +65,27 @@ def test_register_custom_provider() -> None:
         unregister_provider("testfake")
 
 
-def test_model_config_from_env_ollama_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("CODEDOGGY_PROVIDER", raising=False)
+def test_model_config_from_env_ollama_when_explicit(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("CODEDOGGY_PROVIDER", "ollama")
     monkeypatch.delenv("CODEDOGGY_MODEL", raising=False)
     monkeypatch.delenv("CODEDOGGY_BASE_URL", raising=False)
-    # Isolate from the developer's real ~/.grok login + preferred provider.
-    monkeypatch.setattr(
-        "codedoggy.model.preferred_provider.resolve_startup_provider",
-        lambda: "ollama",
-    )
     cfg = model_config_from_env()
     assert cfg.provider == "ollama"
     assert "11434" in cfg.base_url or "ollama" in cfg.base_url.lower()
     assert cfg.model
+
+
+def test_model_config_from_env_no_silent_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("CODEDOGGY_PROVIDER", raising=False)
+    monkeypatch.delenv("CODEDOGGY_MODEL", raising=False)
+    monkeypatch.delenv("CODEDOGGY_BASE_URL", raising=False)
+    monkeypatch.setattr(
+        "codedoggy.model.preferred_provider.resolve_startup_provider",
+        lambda: None,
+    )
+    cfg = model_config_from_env()
+    assert cfg.provider == "unconfigured"
+    assert cfg.model == ""
 
 
 def test_ollama_factory_normalizes_port_url() -> None:

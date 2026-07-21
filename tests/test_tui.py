@@ -627,7 +627,7 @@ def test_full_screen_agent_window_is_opaque_and_interactive() -> None:
         assert "›" in prefix
         assert "∪" not in prefix
         assert "∪" not in header
-        assert bottom.startswith("  ╰") and "model · auto" in bottom
+        assert bottom.startswith("  ╰") and "未选择模型" in bottom
         # Default chrome: Tab=最新任务, S-Tab=Plan/Auto, ^Enter=换行; no arrows.
         tui.app.layout.focus(tui._input)
         shortcuts_input = "".join(fragment[1] for fragment in tui._render_shortcuts())

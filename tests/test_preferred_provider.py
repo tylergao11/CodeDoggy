@@ -1,4 +1,4 @@
-"""Startup provider preference — auth success must not leave MAIN on ollama."""
+"""Startup provider preference — never invent a live ollama connection."""
 
 from __future__ import annotations
 
@@ -18,6 +18,13 @@ from codedoggy.model.registry import model_config_from_env
 def test_save_load_preferred_provider(tmp_path: Path) -> None:
     save_preferred_provider("grok", home=tmp_path)
     assert load_preferred_provider(home=tmp_path) == "grok"
+
+
+def test_ollama_preferred_is_cleared_not_sticky(tmp_path: Path) -> None:
+    path = tmp_path / "active_provider"
+    path.write_text("ollama\n", encoding="utf-8")
+    assert load_preferred_provider(home=tmp_path) is None
+    assert not path.is_file()
 
 
 def test_resolve_startup_prefers_remembered_when_usable(
@@ -47,6 +54,37 @@ def test_resolve_startup_scans_imperial_login(
         lambda name: name == "grok",
     )
     assert resolve_startup_provider() == "grok"
+
+
+def test_resolve_startup_unconfigured_when_nothing_chosen(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        "codedoggy.model.preferred_provider.preferred_provider_path",
+        lambda home=None: tmp_path / "missing",
+    )
+    monkeypatch.setattr(
+        "codedoggy.model.preferred_provider.provider_usable",
+        lambda _name: False,
+    )
+    assert resolve_startup_provider() is None
+
+
+def test_model_config_from_env_unconfigured_when_no_choice(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("CODEDOGGY_PROVIDER", raising=False)
+    monkeypatch.delenv("CODEDOGGY_MODEL", raising=False)
+    monkeypatch.delenv("CODEDOGGY_BASE_URL", raising=False)
+    monkeypatch.setenv("CODEDOGGY_HOME", str(tmp_path))
+    monkeypatch.setattr(
+        "codedoggy.model.preferred_provider.resolve_startup_provider",
+        lambda: None,
+    )
+    cfg = model_config_from_env()
+    assert cfg.provider == "unconfigured"
+    assert cfg.model == ""
+    assert "11434" not in (cfg.base_url or "")
 
 
 def test_model_config_from_env_prefers_logged_in_grok(
