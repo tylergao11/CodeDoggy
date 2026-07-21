@@ -2082,23 +2082,18 @@ class CodeDoggyTUI:
         self._dismiss_startup_brand()
         self._bind_subagent_listener()
         task = self.ledger.create(prompt)
+        # Keep keyboard on the prompt — do not auto-open detail on send.
         self._active_task_id = task.id
         # New task is not mid-cancel; keep _cancel_grace_until so a lagged Esc
         # from the previous cancel cannot instantly kill this turn.
         self._cancelling_task_id = None
-        # Seed user turn so detail is not blank the moment it opens.
-        self._detail_messages[(task.id, f"{task.id}:main")] = [
-            Message(role=Role.USER, content=prompt)
-        ]
+        self._detail_messages[(task.id, f"{task.id}:main")] = []
         self._activity.clear_task(task.id)
         self._task_started_at = time.monotonic()
         self._subagent_baselines[task.id] = {
             item.subagent_id for item in self._subagents()
         }
         self._clear_feedback()
-        # Open MAIN detail immediately on send — watch the turn live, do not
-        # wait until finish (finish path stays as a no-op once already opened).
-        self._open_task_detail_on_start(task.id)
         worker = threading.Thread(
             target=self._run_task,
             args=(task.id, prompt),
@@ -2107,12 +2102,10 @@ class CodeDoggyTUI:
         )
         self._worker = worker
         worker.start()
-        # Prefer live detail focus after send; leave auth/ask alone.
+        # Do not yank focus off a card/modal the user already moved to.
         try:
             layout = self.app.layout
-            if self._modal_open and self._modal_kind == "agent":
-                pass  # _open_agent already focused detail
-            elif self._modal_open:
+            if self._modal_open:
                 pass
             elif (
                 layout.has_focus(self._task_window)
@@ -2214,19 +2207,6 @@ class CodeDoggyTUI:
             status = _turn_status(result.status)
             if status != "completed" and result.error:
                 output = _friendly_failure_toast(str(result.error))
-            # Ensure detail transcript has the final answer even without live
-            # stream callbacks (tests / minimal hosts).
-            if output and not any(
-                str(getattr(getattr(m, "role", None), "value", getattr(m, "role", "")))
-                .lower()
-                == "assistant"
-                or str(getattr(m, "role", "")).lower() == "assistant"
-                for m in messages
-            ):
-                turn_messages.append(
-                    Message(role=Role.ASSISTANT, content=output)
-                )
-                messages = list(turn_messages)
             self.ledger.update_agent(
                 task_id,
                 f"{task_id}:main",
@@ -2281,8 +2261,6 @@ class CodeDoggyTUI:
                     self._clear_feedback()
                 else:
                     self._set_feedback(feedback[0], feedback[1])
-                # Live-opened detail must repaint when MAIN output arrives.
-                self._invalidate_detail_body_cache()
                 if open_detail:
                     self._open_task_detail_on_finish(task_id, status=finish_status)
 
@@ -4915,24 +4893,14 @@ class CodeDoggyTUI:
         snapshot = self._current_detail_snapshot()
         width = max(12, _terminal_width() - 8)
         # Cache key: avoid re-walking huge tool transcripts every paint.
-        # Include agent status/output so open-on-send (empty live msgs) still
-        # refreshes when MAIN output lands at turn end.
         if self._modal_ref is not None:
             task_id, agent_id = self._modal_ref
             msgs = self._detail_messages.get((task_id, agent_id), [])
-            agent = self.ledger.get_agent(task_id, agent_id)
-            agent_fp = (
-                (agent.status if agent else ""),
-                len((agent.output if agent else "") or ""),
-                ((agent.output if agent else "") or "")[:48],
-                ((agent.output if agent else "") or "")[-24:],
-            )
             cache_key: tuple[Any, ...] = (
                 self._modal_ref,
                 self._detail_filter,
                 width,
                 self._detail_messages_signature(list(msgs)),
-                agent_fp,
                 self._todo_badge_label(),
             )
             if (
@@ -6431,26 +6399,11 @@ class CodeDoggyTUI:
         self._detail_cursor_line = 0
         self._detail_line_count = 1
 
-    def _open_task_detail_on_start(self, task_id: str) -> None:
-        """Open MAIN detail the moment a prompt is sent (live stream surface).
-
-        Skips auth/ask overlays. Marks the task so finish-time auto-open is a
-        no-op. Preferred path for "send → immediately read the turn".
-        """
-        if self._closing:
-            return
-        # Do not clobber login / questionnaire.
-        if self._ask_active or (
-            self._modal_open and self._modal_kind in {"auth", "ask"}
-        ):
-            return
-        self._select_task_and_open_main(task_id)
-
     def _open_task_detail_on_finish(self, task_id: str, *, status: str) -> None:
-        """Fallback: open MAIN detail when a turn ends if not already opened.
+        """After a task ends, open MAIN detail so the user can read the result.
 
-        Primary open is on send (``_open_task_detail_on_start``). This still
-        covers edge cases (e.g. start was blocked by auth). Skips cancel.
+        Skips cancel (user already stopped), auth/ask overlays, and tasks we
+        already auto-opened. Safe to call from worker finish + sync paths.
         """
         if self._closing:
             return
@@ -6473,10 +6426,7 @@ class CodeDoggyTUI:
         ):
             self._auto_opened_detail_tasks.add(task_id)
             return
-        self._select_task_and_open_main(task_id)
 
-    def _select_task_and_open_main(self, task_id: str) -> None:
-        """Select the task card and open its MAIN agent detail once."""
         main_id = f"{task_id}:main"
         agent = self.ledger.get_agent(task_id, main_id)
         if agent is None:

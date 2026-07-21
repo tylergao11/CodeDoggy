@@ -188,21 +188,21 @@ def snapshot_from_messages(
             # Pure plan/MCP system-reminder injects: hide entirely from the UI.
             if not content:
                 continue
-            # Always show user text — including the opening prompt (same as the
-            # task title). Skipping it left open-on-send detail empty when no
-            # live assistant messages had landed yet.
-            records.append(
-                DetailRecord(
-                    id=f"message-{sequence}",
-                    sequence=sequence,
-                    actor="USER",
-                    category="message",
-                    title="补充指令" if sequence else "你",
-                    blocks=(DetailBlock("text", content),),
-                    timestamp=f"#{sequence:03d}",
+            # Skip the first user line when it only restates the task title
+            # (the card / modal header already show that text).
+            if content and not (not records and content == _clean_text(task_title)):
+                records.append(
+                    DetailRecord(
+                        id=f"message-{sequence}",
+                        sequence=sequence,
+                        actor="USER",
+                        category="message",
+                        title="补充指令",
+                        blocks=(DetailBlock("text", content),),
+                        timestamp=f"#{sequence:03d}",
+                    )
                 )
-            )
-            sequence += 1
+                sequence += 1
         elif role_value == "assistant":
             # Grok order: thinking block first, then visible assistant prose.
             reasoning = _extract_reasoning(message)
