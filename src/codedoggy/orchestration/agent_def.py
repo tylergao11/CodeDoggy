@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any  # Path used by resolve/refresh
 
 from codedoggy.orchestration.capability import kinds_for_capability
 from codedoggy.orchestration.types import CapabilityMode, IsolationMode, SessionMode
@@ -237,12 +237,56 @@ BUILTIN_AGENTS: dict[str, AgentDefinition] = {
     "general_purpose": builtin_general_purpose(),  # underscore alias
 }
 
+# Custom agents discovered from disk (never override builtins).
+_CUSTOM_AGENTS: dict[str, AgentDefinition] = {}
+_CUSTOM_AGENTS_LOADED_FOR: str | None = None
 
-def resolve_agent_definition(name: str) -> AgentDefinition | None:
+
+def refresh_custom_agents(cwd: str | Path | None = None, *, force: bool = False) -> int:
+    """Scan agent definition directories and cache customs. Returns count loaded."""
+    global _CUSTOM_AGENTS, _CUSTOM_AGENTS_LOADED_FOR
+    from codedoggy.orchestration.subagent_policy import load_discovered_agents
+
+    key = str(Path(cwd).resolve()) if cwd else ""
+    if not force and _CUSTOM_AGENTS_LOADED_FOR == key and _CUSTOM_AGENTS:
+        return len(_CUSTOM_AGENTS)
+    found = load_discovered_agents(cwd)
+    # Builtins always win name conflicts.
+    custom = {
+        k: v
+        for k, v in found.items()
+        if k not in BUILTIN_AGENTS and k.replace("_", "-") not in BUILTIN_AGENTS
+    }
+    _CUSTOM_AGENTS = custom
+    _CUSTOM_AGENTS_LOADED_FOR = key
+    return len(_CUSTOM_AGENTS)
+
+
+def resolve_agent_definition(
+    name: str, *, cwd: str | Path | None = None
+) -> AgentDefinition | None:
     key = (name or "").strip().lower()
     if not key:
         return None
-    return BUILTIN_AGENTS.get(key)
+    hit = BUILTIN_AGENTS.get(key)
+    if hit is not None:
+        return hit
+    # underscore / hyphen alias
+    alt = key.replace("_", "-")
+    hit = BUILTIN_AGENTS.get(alt)
+    if hit is not None:
+        return hit
+    refresh_custom_agents(cwd)
+    return _CUSTOM_AGENTS.get(key) or _CUSTOM_AGENTS.get(alt)
+
+
+def available_agent_type_names(*, cwd: str | Path | None = None) -> list[str]:
+    """Builtin + discovered custom type names for Task validation."""
+    refresh_custom_agents(cwd)
+    names = set(BUILTIN_AGENTS.keys()) | set(_CUSTOM_AGENTS.keys())
+    # Prefer hyphen form in listings
+    prefer = sorted({n.replace("_", "-") for n in names})
+    return prefer
 
 
 def load_agent_definition_file(path: Path) -> AgentDefinition:
@@ -275,11 +319,15 @@ def load_agent_definition_file(path: Path) -> AgentDefinition:
         "normal": SessionMode.NORMAL,
         "agent": SessionMode.NORMAL,
     }.get(mode_s, SessionMode.NORMAL)
+    isolation = IsolationMode.parse(
+        str(meta.get("isolation") or meta.get("isolationMode") or "none")
+    )
     return AgentDefinition(
         name=name,
         description=str(meta.get("description") or ""),
         tools=tools,
         capability_mode=cap,
+        isolation=isolation,
         prompt_mode=str(meta.get("promptMode") or meta.get("prompt_mode") or "extend"),
         system_prompt_body=body,
         session_mode=session_mode,

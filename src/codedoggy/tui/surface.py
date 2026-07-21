@@ -85,14 +85,14 @@ def session_mode_label(session: Any) -> str:
 
 
 def model_and_mode_text(session: Any) -> str:
-    """Prompt caption: ``provider/model · 推理:high · auto|plan``.
+    """Prompt caption: compact ``model · high · auto|plan`` (no redundant words).
 
     Unconfigured sessions show only ``未选择模型`` — never a fake local default.
     """
     snap = active_connection(session)
     if snap is None or not snap.ready_to_sample:
         return "未选择模型"
-    # Show provider/model so caption cannot lie about which backend is live.
+    # Compact identity (e.g. grok-4.5 not grok/grok-4.5) + effort chip + mode.
     identity = snap.label
     mode = session_mode_label(session)
     reason = snap.reasoning_label

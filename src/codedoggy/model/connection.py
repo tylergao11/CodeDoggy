@@ -70,19 +70,20 @@ class ActiveConnection:
 
     @property
     def label(self) -> str:
+        """Compact identity for chrome: avoid ``grok/grok-4.5`` double-naming."""
         pid = (self.provider or "").strip() or "—"
         mid = (self.model or "").strip() or "—"
         if pid == "unconfigured":
             return "未选择模型"
-        return f"{pid}/{mid}"
+        return compact_provider_model_label(pid, mid)
 
     @property
     def reasoning_label(self) -> str:
-        """Short UI label for reasoning effort (e.g. ``推理:high`` / ``推理:off``)."""
+        """Short effort chip only — ``high`` / ``medium`` / ``off`` (no 推理: prefix)."""
         if not self.reasoning_enabled:
-            return "推理:off"
+            return "off"
         effort = (self.reasoning_effort or "high").strip().lower() or "high"
-        return f"推理:{effort}"
+        return effort
 
     @property
     def model_mode_caption(self) -> str:
@@ -110,6 +111,33 @@ class ActiveConnection:
             context_window=self.context_window,
             extra={"reasoning": reasoning},
         )
+
+
+def compact_provider_model_label(provider: str, model: str) -> str:
+    """``provider/model`` unless model already names the provider family.
+
+    Examples:
+      grok + grok-4.5     → grok-4.5
+      claude + claude-…   → claude-…
+      ollama + qwen3:8b   → ollama/qwen3:8b
+    """
+    pid = (provider or "").strip()
+    mid = (model or "").strip()
+    if not pid or not mid:
+        return f"{pid or '—'}/{mid or '—'}"
+    pl = pid.lower()
+    ml = mid.lower()
+    # Model already names the family: grok-4.5 / grok4.5 / claude-… → model only.
+    if ml.startswith(pl):
+        rest = ml[len(pl) :]
+        if not rest or not rest[0].isalpha():
+            return mid
+    # OpenAI-family ids omit provider in the model string.
+    if pl in {"openai", "custom"} and (
+        ml.startswith("gpt") or ml.startswith("o1") or ml.startswith("o3")
+    ):
+        return mid
+    return f"{pid}/{mid}"
 
 
 def reasoning_from_extra(extra: dict[str, Any] | None) -> tuple[bool, str]:

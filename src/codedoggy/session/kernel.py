@@ -21,6 +21,13 @@ from codedoggy.turn.types import Message, Role, ToolCall
 logger = logging.getLogger(__name__)
 
 
+def _default_task_model_validator(slug: str) -> str | None:
+    """Permissive Task.model check: non-empty only (host may replace with catalog)."""
+    if not str(slug or "").strip():
+        return "model is empty"
+    return None
+
+
 @dataclass
 class RuntimeKernel:
     """Unified runtime state for one Session."""
@@ -164,6 +171,10 @@ class RuntimeKernel:
             extra["subagent_coordinator"] = self.subagent_coordinator
         if self.subagent_run_fn is not None:
             extra["subagent_run_fn"] = self.subagent_run_fn
+        # Task.model validation: permissive non-empty check so spawn can pin
+        # a model without a full catalog (Grok host installs a richer one).
+        if "task_model_validator" not in prev:
+            extra["task_model_validator"] = _default_task_model_validator
         if self.task_manager is not None:
             extra["task_manager"] = self.task_manager
         if self.scheduler is not None:

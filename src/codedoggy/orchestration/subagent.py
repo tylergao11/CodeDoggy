@@ -14,6 +14,7 @@ Resume:
 
 from __future__ import annotations
 
+import json
 import logging
 import threading
 import time
@@ -65,6 +66,12 @@ class SubagentRequest:
     worktree_path: str | None = None
     worktree_branch: str | None = None
     system_prompt: str | None = None
+    # Grok TaskTool model pin — child sampler uses this model when set.
+    model: str | None = None
+    # Explicit child working directory (mutually exclusive with worktree isolation).
+    cwd: str | None = None
+    # Nesting depth of the *parent* that is spawning (MAIN = 0).
+    spawn_depth: int = 0
 
 
 @dataclass
@@ -668,6 +675,78 @@ def _copy_snap(s: SubagentSnapshot) -> SubagentSnapshot:
     )
 
 
+def resolve_subagent_model(
+    subagent_type: str,
+    *,
+    explicit: str | None = None,
+) -> str | None:
+    """Resolve child model: explicit Task.model > per-type env > None (inherit).
+
+    Env (Grok ``[subagents.models]`` spirit):
+      CODEDOGGY_SUBAGENT_MODELS=explore=grok-3,general-purpose=grok-4.5
+      CODEDOGGY_SUBAGENT_MODEL_EXPLORE=grok-3
+    """
+    if explicit and str(explicit).strip():
+        return str(explicit).strip()
+    import os
+
+    key = (subagent_type or "").strip().lower().replace("-", "_")
+    if key:
+        per = os.environ.get(f"CODEDOGGY_SUBAGENT_MODEL_{key.upper()}")
+        if per and per.strip():
+            return per.strip()
+    raw = (os.environ.get("CODEDOGGY_SUBAGENT_MODELS") or "").strip()
+    if not raw:
+        return None
+    # JSON object or comma map
+    if raw.startswith("{"):
+        try:
+            data = json.loads(raw)
+            if isinstance(data, dict):
+                for k, v in data.items():
+                    if str(k).strip().lower().replace("-", "_") == key and str(v).strip():
+                        return str(v).strip()
+        except Exception:  # noqa: BLE001
+            pass
+    for part in raw.split(","):
+        if "=" not in part:
+            continue
+        k, _, v = part.partition("=")
+        if k.strip().lower().replace("-", "_") == key and v.strip():
+            return v.strip()
+    return None
+
+
+def pin_sampler_model(sampler: Any, model: str) -> Any:
+    """Return a ChatSampler whose client uses ``model`` (same provider/auth)."""
+    if not model or not str(model).strip():
+        return sampler
+    client = getattr(sampler, "client", None)
+    if client is None:
+        return sampler
+    cfg = getattr(client, "config", None) or getattr(client, "_config", None)
+    if cfg is None:
+        return sampler
+    try:
+        from dataclasses import replace
+
+        from codedoggy.model.chat_sampler import ChatSampler
+
+        new_cfg = replace(cfg, model=str(model).strip())
+        profile = getattr(client, "profile", None) or getattr(client, "_profile", None)
+        try:
+            if profile is not None:
+                new_client = type(client)(new_cfg, profile=profile)
+            else:
+                new_client = type(client)(new_cfg)
+        except TypeError:
+            new_client = type(client)(new_cfg)
+        return ChatSampler(new_client)
+    except Exception:  # noqa: BLE001
+        logger.debug("pin_sampler_model failed model=%s", model, exc_info=True)
+        return sampler
+
+
 def make_child_runner(
     *,
     parent_cwd: Path,
@@ -727,9 +806,14 @@ def make_child_runner(
             )
             system_prompt = None  # filled after worktree cwd known
         parent_memory_manager = _parent_resource(parent_session, "memory_manager")
+        child_depth = max(0, int(getattr(request, "spawn_depth", 0) or 0) + 1)
+        from codedoggy.orchestration.subagent_policy import effective_max_subagent_depth
+
+        allow_nested_spawn = child_depth < effective_max_subagent_depth()
         child_tools = _strip_child_private_tools(
             agent.tools,
             memory_manager=parent_memory_manager,
+            allow_nested_spawn=allow_nested_spawn,
         )
 
         compactor = None
@@ -749,6 +833,12 @@ def make_child_runner(
                 runtime_sampler = parent_sampler_factory()
             except Exception:  # noqa: BLE001
                 logger.debug("child sampler factory failed", exc_info=True)
+        # Grok Task.model: pin child model (explicit or per-type env map).
+        pinned_model = resolve_subagent_model(
+            request.subagent_type, explicit=request.model
+        )
+        if pinned_model:
+            runtime_sampler = pin_sampler_model(runtime_sampler, pinned_model)
         if compactor is not None:
             try:
                 from codedoggy.turn.runner import _bind_compactor_model_window
@@ -765,6 +855,14 @@ def make_child_runner(
             return cancel.is_set()
 
         child_cwd = Path(parent_cwd).resolve()
+        # Explicit cwd (schema-validated by Task tool) when not using worktree.
+        if request.cwd and isolation is IsolationMode.NONE:
+            try:
+                override = Path(str(request.cwd)).expanduser().resolve()
+                if override.is_dir():
+                    child_cwd = override
+            except Exception:  # noqa: BLE001
+                logger.debug("child cwd override failed", exc_info=True)
         wt: WorktreeHandle | None = None
         isolation_mode = definition.isolation
         is_resume = bool(request.resume_from or request.prior_messages)
@@ -892,6 +990,8 @@ def make_child_runner(
             ),
         )
 
+        parent_coord = _parent_resource(parent_session, "subagent_coordinator")
+        parent_run_fn = _parent_resource(parent_session, "subagent_run_fn")
         tool_extra: dict[str, Any] = {
             "kernel": child_resources,
             "is_subagent": True,
@@ -907,6 +1007,10 @@ def make_child_runner(
             "mutations": [],
             "isolation": isolation_mode.value,
             "resumed": is_resume,
+            # Nesting: child Task.spawn sees this as its depth (MAIN = 0).
+            "subagent_depth": child_depth,
+            "subagent_coordinator": parent_coord if allow_nested_spawn else None,
+            "subagent_run_fn": parent_run_fn if allow_nested_spawn else None,
         }
         # Media extras follow the parent's ActiveConnection (same login as MAIN).
         parent_connection = _parent_resource(parent_session, "connection")
@@ -971,13 +1075,11 @@ def make_child_runner(
                 persona_instructions=request.persona,
             )
 
-        coord = _parent_resource(parent_session, "subagent_coordinator")
-
         def _on_archive(msg: Any) -> None:
-            if coord is None:
+            if parent_coord is None:
                 return
             try:
-                coord.publish_live_message(request.id, msg)
+                parent_coord.publish_live_message(request.id, msg)
             except Exception:  # noqa: BLE001
                 logger.debug(
                     "publish_live_message failed id=%s",
@@ -1124,6 +1226,12 @@ def make_child_runner(
                 ),
                 "resumed": is_resume,
                 "message_count": len(live),
+                "cwd": str(child_cwd),
+                **(
+                    {"model": pinned_model}
+                    if pinned_model
+                    else {}
+                ),
                 **todo_meta,
             },
         )
@@ -1232,21 +1340,32 @@ def _strip_child_private_tools(
     tools: FinalizedToolset,
     *,
     memory_manager: Any = None,
+    allow_nested_spawn: bool = False,
 ) -> FinalizedToolset:
-    """Apply Grok nesting and Hermes child-memory visibility boundaries."""
+    """Apply Grok nesting and Hermes child-memory visibility boundaries.
+
+    When ``allow_nested_spawn`` is True (``CODEDOGGY_MAX_SUBAGENT_DEPTH`` > 1
+    and this child has remaining depth budget), Task / parallel_tasks stay
+    available so deeper fan-out is possible. Memory tools remain denied.
+    """
     from codedoggy.tools.kinds import ToolKind
 
     deny = {
-        "task",
-        "spawn_subagent",
-        "spawn_agent",
-        "parallel_tasks",
         # Hermes children run with skip_memory=True. Session search remains
         # available through the parent's read-only SessionStore handle.
         "memory",
         "memory_search",
         "memory_get",
     }
+    if not allow_nested_spawn:
+        deny.update(
+            {
+                "task",
+                "spawn_subagent",
+                "spawn_agent",
+                "parallel_tasks",
+            }
+        )
     get_memory_names = getattr(memory_manager, "get_all_tool_names", None)
     if callable(get_memory_names):
         try:
@@ -1258,7 +1377,15 @@ def _strip_child_private_tools(
         short = getattr(ft, "short_id", None) or ""
         if name in deny or short in deny:
             continue
-        if getattr(ft, "kind", None) is ToolKind.Task:
+        if not allow_nested_spawn and getattr(ft, "kind", None) is ToolKind.Task:
+            # Block Task-kind tools (incl. merge_subagent_worktree is Task —
+            # merge is MAIN-only; children should not land into parent).
+            continue
+        if allow_nested_spawn and short in {
+            "merge_subagent_worktree",
+            "merge_worktree",
+        }:
+            # Merge lands into parent — MAIN only.
             continue
         by[name] = ft
     if len(by) == len(tools.by_client_name):

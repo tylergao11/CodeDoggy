@@ -73,19 +73,20 @@ def test_message_adapter_keeps_prose_tool_arguments_and_tool_results() -> None:
     )
 
     assert [record.category for record in snapshot.records] == [
-        "message",
-        "message",
+        "message",  # opening prompt (same as task title — still shown)
+        "message",  # interject
+        "message",  # assistant prose
         "file",
         "test",
     ]
     assert snapshot.records[0].actor == "USER"
+    assert "实现详情页" in text
     assert "补充：必须显示完整工具记录" in text
     assert "我先读取入口" in text
     assert "path: src/codedoggy/tui/app.py" in text
     assert "369 def _start_task" in text
     assert "$ pytest tests/test_tui.py -q" in text
     assert "12 passed in 0.84s" in text
-    assert "实现详情页" not in text
 
 
 def test_message_adapter_accepts_serialized_subagent_transcripts() -> None:
@@ -269,6 +270,8 @@ def test_tool_blocks_can_collapse_arguments_and_results() -> None:
         )
     )
     assert "Read" in collapsed and "app.py" in collapsed
+    assert "◆" in collapsed  # Grok diamond tool bullet
+    assert "›" in collapsed  # collapsed expandable indicator
     assert "tail payload" not in collapsed
     assert "调用参数" not in collapsed
 
@@ -286,7 +289,87 @@ def test_tool_blocks_can_collapse_arguments_and_results() -> None:
         )
     )
     assert "Read" in expanded
-    assert "tail payload" in expanded
+    assert "◆" in expanded  # diamond stays when expanded
+    assert "点击收起" in expanded
+    # Read dumps are head/tail previews — not the whole buffer painted.
+    assert "省略" in expanded or "tail payload" in expanded
+
+
+def test_edit_tool_shows_change_hunk_not_full_file() -> None:
+    """Expanding an edit tool paints only old→new, never the whole file."""
+    old = "def alpha():\n    return 1\n"
+    new = "def alpha():\n    return 2\n"
+    # Huge surrounding file must NOT appear in the change block.
+    junk = "x = 0\n" * 200
+    snapshot = snapshot_from_messages(
+        [
+            Message(
+                role=Role.ASSISTANT,
+                tool_calls=[
+                    ToolCall(
+                        id="edit-1",
+                        name="search_replace",
+                        arguments={
+                            "path": "src/app.py",
+                            "old_string": old,
+                            "new_string": new,
+                            # Accidental full dump in args should be ignored.
+                            "contents": junk,
+                        },
+                    )
+                ],
+            ),
+            Message(
+                role=Role.TOOL,
+                name="search_replace",
+                tool_call_id="edit-1",
+                content="ok",
+            ),
+        ],
+        task_id="task",
+        agent_id="main",
+        agent_label="MAIN",
+        task_title="改一行",
+    )
+    tool = next(r for r in snapshot.records if r.actor == "TOOL")
+    labels = [b.label for b in tool.blocks]
+    assert "变更" in labels
+    change = next(b for b in tool.blocks if b.label == "变更")
+    assert change.kind == "diff"
+    assert "-    return 1" in change.text or "-return 1" in change.text.replace(
+        " ", ""
+    )
+    assert "+    return 2" in change.text or "+return 2" in change.text.replace(
+        " ", ""
+    )
+    # Full-file junk must not be painted into the change hunk.
+    assert change.text.count("x = 0") < 5
+
+    expanded = _plain(
+        render_detail_body(
+            snapshot,
+            72,
+            active_filter="tool",
+            collapsed_keys=set(),
+            fold_mouse=lambda _k: None,
+        )
+    )
+    assert "变更" in expanded
+    assert "return 2" in expanded
+    assert expanded.count("x = 0") < 5
+
+
+def test_read_result_is_head_tail_preview() -> None:
+    from codedoggy.tui.agent_detail import _compact_read_preview
+
+    lines = [f"{i}→line {i}" for i in range(1, 40)]
+    raw = "\n".join(lines)
+    preview = _compact_read_preview(raw)
+    assert "省略" in preview
+    assert "line 1" in preview
+    assert "line 39" in preview
+    # Middle of the file must not all be present.
+    assert "line 20" not in preview
 
 
 def test_system_reminder_hidden_from_detail_snapshot() -> None:
@@ -472,19 +555,44 @@ def test_reasoning_content_appears_in_message_tab_before_prose() -> None:
     # Thinking starts expanded in the data model (not in default collapse set).
     assert not (think_keys & defaults)
 
-    # Product: once assistant prose exists, message tab drops thinking from paint.
+    # Product: message tab keeps thinking expanded alongside the answer.
     plain = _plain(
         render_detail_body(
             snapshot, 72, active_filter="message", collapsed_keys=defaults
         )
     )
     assert "我先读取入口" in plain
-    assert "思考过程" not in plain
-    assert "step 7" not in plain
+    assert "思考" in plain
+    assert "step 1" in plain
+    assert "step 7" in plain
+    # Expanded thinking is not line-truncated (all steps visible).
+    assert "另有" not in plain
 
 
-def test_message_tab_hides_thinking_once_assistant_prose_exists() -> None:
-    """真实回答出现后，消息页不再画思考过程（transcript 仍保留）。"""
+def test_expanded_thinking_keeps_full_body_not_preview_cap() -> None:
+    """Default expanded paint shows many thinking lines — not a 3-line stub."""
+    body = "\n".join(f"reason line {i} with enough text" for i in range(1, 40))
+    snapshot = snapshot_from_messages(
+        [
+            Message(
+                role=Role.ASSISTANT,
+                content="结论。",
+                reasoning_content=body,
+            )
+        ],
+        task_id="task",
+        agent_id="main",
+        agent_label="MAIN",
+        task_title="长思考",
+    )
+    plain = _plain(render_detail_body(snapshot, 80, active_filter="message"))
+    assert "reason line 1" in plain
+    assert "reason line 39" in plain
+    assert "另有" not in plain
+
+
+def test_message_tab_keeps_thinking_once_assistant_prose_exists() -> None:
+    """真实回答出现后，消息页默认仍展示思考过程（可点击折叠）。"""
     snapshot = snapshot_from_messages(
         [
             Message(
@@ -500,9 +608,10 @@ def test_message_tab_hides_thinking_once_assistant_prose_exists() -> None:
     )
     filtered = filter_detail_records(snapshot.records, "message")
     assert any(r.actor == "THINK" for r in snapshot.records)
-    assert all(r.actor != "THINK" for r in filtered)
+    assert any(r.actor == "THINK" for r in filtered)
     plain = _plain(render_detail_body(snapshot, 72, active_filter="message"))
-    assert "思考过程" not in plain
+    assert "思考" in plain
+    assert "长篇思考" in plain
     assert "最终方案用 JWT" in plain
 
 
@@ -544,6 +653,27 @@ def test_redacted_thinking_placeholder_from_provider_blocks() -> None:
     )
     assert snapshot.records[0].title == "思考"
     assert "隐藏" in snapshot.records[0].blocks[0].text
+
+
+def test_message_body_does_not_spam_main_bylines() -> None:
+    """Assistant prose is not prefixed with MAIN on every turn (title owns identity)."""
+    snapshot = snapshot_from_messages(
+        [
+            Message(role=Role.USER, content="继续"),
+            Message(role=Role.ASSISTANT, content="第一段说明。"),
+            Message(role=Role.ASSISTANT, content="第二段说明。"),
+            Message(role=Role.ASSISTANT, content="第三段说明。"),
+        ],
+        task_id="task",
+        agent_id="main",
+        agent_label="MAIN",
+        task_title="别刷 MAIN",
+    )
+    plain = _plain(render_detail_body(snapshot, 72, active_filter="message"))
+    assert "第一段说明" in plain and "第三段说明" in plain
+    assert "你" in plain  # user stamp kept
+    # Body must not repeat MAIN for each assistant chunk.
+    assert plain.count("MAIN") == 0
 
 
 def test_message_lists_style_ordered_markers() -> None:

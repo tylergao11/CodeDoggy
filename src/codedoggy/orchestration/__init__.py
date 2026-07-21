@@ -21,11 +21,13 @@ from codedoggy.orchestration.agent_def import (
     BUILTIN_AGENTS,
     Agent,
     AgentDefinition,
+    available_agent_type_names,
     build_agent,
     builtin_explore,
     builtin_plan,
     filter_toolset,
     load_agent_definition_file,
+    refresh_custom_agents,
     resolve_agent_definition,
 )
 from codedoggy.orchestration.capability import kind_allowed, kinds_for_capability
@@ -49,6 +51,14 @@ from codedoggy.orchestration.subagent import (
     format_parallel_aggregate,
     format_parallel_dispatched,
     make_child_runner,
+    pin_sampler_model,
+    resolve_subagent_model,
+)
+from codedoggy.orchestration.subagent_policy import (
+    default_isolation_for,
+    drain_prompt_queue_after_cancel,
+    effective_max_subagent_depth,
+    load_discovered_agents,
 )
 from codedoggy.orchestration.worktree import (
     MergeResult,
@@ -119,6 +129,7 @@ __all__ = [
     "load_agent_definition_file",
     "make_child_runner",
     "merge_worktree_into_parent",
+    "pin_sampler_model",
     "plan_mode_edit_gate",
     "plan_mode_json_path",
     "load_plan_mode_state",
@@ -127,5 +138,12 @@ __all__ = [
     "prepare_tool_call",
     "reattach_worktree",
     "remove_worktree",
+    "available_agent_type_names",
+    "default_isolation_for",
+    "drain_prompt_queue_after_cancel",
+    "effective_max_subagent_depth",
+    "load_discovered_agents",
+    "refresh_custom_agents",
     "resolve_agent_definition",
+    "resolve_subagent_model",
 ]

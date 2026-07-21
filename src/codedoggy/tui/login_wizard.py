@@ -129,9 +129,10 @@ class AuthWizard:
 
     @property
     def active_reasoning_label(self) -> str:
+        """Effort chip only — matches connection.reasoning_label (no 推理: prefix)."""
         if not self.active_reasoning_enabled or self.active_reasoning_effort == "off":
-            return "推理:off"
-        return f"推理:{self.active_reasoning_effort or 'high'}"
+            return "off"
+        return (self.active_reasoning_effort or "high").strip().lower() or "high"
 
     def _rebuild(self) -> None:
         if self.step == WizardStep.HOME:
@@ -520,7 +521,7 @@ class AuthWizard:
                     mid: str | None = self.pending_model.strip()
                 else:
                     mid = None
-                label = f"推理:{effort}" if enabled else "推理:off"
+                label = effort if enabled else "off"
                 model_label = mid or self.active_model or "—"
                 return WizardAction(
                     kind="reload_client",

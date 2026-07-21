@@ -93,11 +93,16 @@ def is_openable_file_path(path: str | None) -> bool:
 
 
 def link_label_for_path(path: str) -> str:
-    """Short affordance shown in the TUI (path stays in the model prompt)."""
+    """Short filename (or image label) for TUI open links — no duplicated verbs.
+
+    Callers compose a single verb once, e.g. ``打开 · {label}`` or
+    ``查看图片 · {label}``. Do not embed "打开文件" here (it stacked with
+    "点击打开" as "点击打开 打开文件 foo.py").
+    """
+    name = Path(str(path).strip().strip("\"'")).name
     if is_image_path(path):
-        return VIEW_IMAGE_LABEL
-    name = Path(str(path).strip().strip("\"'")).name or OPEN_FILE_LABEL
-    return f"{OPEN_FILE_LABEL} {name}"
+        return name or VIEW_IMAGE_LABEL
+    return name or "file"
 
 
 def extract_image_paths(text: str | None) -> list[str]:

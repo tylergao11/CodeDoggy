@@ -47,6 +47,9 @@ def register_builtins(builder: ToolRegistryBuilder) -> None:
     from codedoggy.tools.builtins.search_tool import SearchToolTool
     from codedoggy.tools.builtins.session_search import SessionSearchTool
     from codedoggy.tools.builtins.skill import SkillTool
+    from codedoggy.tools.builtins.merge_subagent_worktree import (
+        MergeSubagentWorktreeTool,
+    )
     from codedoggy.tools.builtins.parallel_tasks import ParallelTasksTool
     from codedoggy.tools.builtins.spawn_subagent import (
         GetSubagentOutputTool,
@@ -86,6 +89,7 @@ def register_builtins(builder: ToolRegistryBuilder) -> None:
     builder.register(AskUserQuestionTool())
     builder.register(TaskTool())  # wire id `task` → product spawn_subagent
     builder.register(ParallelTasksTool())  # MAIN-opt-in multi-spawn (not auto)
+    builder.register(MergeSubagentWorktreeTool())  # explicit worktree land
     builder.register(GetSubagentOutputTool())  # legacy; not in product list
     # Web
     builder.register(WebFetchTool())

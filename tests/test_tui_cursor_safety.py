@@ -188,10 +188,7 @@ def test_scroll_mouse_routing_modal_vs_tasks() -> None:
         def make_event(etype: MouseEventType) -> MouseEvent:
             return MouseEvent(position=_Pos(), event_type=etype, button=None, modifiers=None)
 
-        # Task handler moves card focus when modal closed (not line-scroll).
-        # Wheel is damped — fire enough same-direction ticks to commit one move.
-        from codedoggy.tui.app import _WHEEL_TASK_NOTCHES
-
+        # Homepage wheel must NOT switch task cards (left for Window scroll).
         handler = tui._only_mouse_up(lambda _e: None, scroll_target="tasks")
         tui._modal_open = False
         tui._task_selection_active = True
@@ -199,13 +196,12 @@ def test_scroll_mouse_routing_modal_vs_tasks() -> None:
         tui._follow_latest_task = True
         tui._wheel_task_accum = 0
         tui._wheel_task_last_move_at = 0.0
-        for _ in range(_WHEEL_TASK_NOTCHES):
-            assert handler(make_event(MouseEventType.SCROLL_DOWN)) is None
-        assert tui._selected_task == 1
-        assert tui._follow_latest_task is False
+        for _ in range(6):
+            assert handler(make_event(MouseEventType.SCROLL_DOWN)) is NotImplemented
+        assert tui._selected_task == 0
+        assert tui._follow_latest_task is True
 
         # Same handler must not scroll tasks while modal is open.
-        tui._follow_latest_task = True
         tui._selected_line = before
         tui._modal_open = True
         assert handler(make_event(MouseEventType.SCROLL_DOWN)) is NotImplemented
@@ -221,9 +217,7 @@ def test_scroll_mouse_routing_modal_vs_tasks() -> None:
         assert none_h(make_event(MouseEventType.SCROLL_UP)) is NotImplemented
 
 
-def test_task_card_wheel_moves_focus() -> None:
-    from codedoggy.tui.app import _WHEEL_TASK_NOTCHES
-
+def test_task_card_wheel_does_not_switch_tasks() -> None:
     with create_pipe_input() as pin:
         tui = CodeDoggyTUI(_Session(), input=pin, output=DummyOutput())
         for i in range(4):
@@ -251,40 +245,10 @@ def test_task_card_wheel_moves_focus() -> None:
             button=None,
             modifiers=None,
         )
-        # Single tick must not leap; need accumulated notches.
-        assert handler(up) is None
+        for _ in range(8):
+            assert handler(up) is NotImplemented
+            assert handler(down) is NotImplemented
         assert tui._selected_task == 1
-        for _ in range(_WHEEL_TASK_NOTCHES - 1):
-            assert handler(up) is None
-        assert tui._selected_task == 0
-        tui._wheel_task_last_move_at = 0.0
-        for _ in range(_WHEEL_TASK_NOTCHES):
-            assert handler(down) is None
-        assert tui._selected_task == 1
-
-
-def test_wheel_task_focus_resets_on_direction_flip() -> None:
-    from codedoggy.tui.app import _WHEEL_TASK_NOTCHES
-
-    with create_pipe_input() as pin:
-        tui = CodeDoggyTUI(_Session(), input=pin, output=DummyOutput())
-        for i in range(3):
-            tui.ledger.create(f"t{i}")
-        tui._task_selection_active = True
-        tui._selected_task = 1
-        tui._wheel_task_accum = 0
-        tui._wheel_task_last_move_at = 0.0
-        # Two down, then up should wipe the accumulator (no move yet).
-        tui._wheel_task_focus(1)
-        tui._wheel_task_focus(1)
-        assert tui._selected_task == 1
-        assert abs(tui._wheel_task_accum) == 2
-        tui._wheel_task_focus(-1)
-        assert tui._wheel_task_accum == -1
-        assert tui._selected_task == 1
-        for _ in range(_WHEEL_TASK_NOTCHES - 1):
-            tui._wheel_task_focus(-1)
-        assert tui._selected_task == 0
 
 
 def test_auth_set_cursor_rejects_disabled() -> None:
@@ -521,6 +485,58 @@ def test_tab_cycle_latest_enter_exit() -> None:
         assert tui._modal_open is False
         assert tui._selected_task == 2
         assert tui._task_selection_active is True
+
+
+def test_tab_from_input_restores_sticky_selection_not_latest() -> None:
+    """Space→input then Tab must return to the browsed card, not jump latest.
+
+    Mid-run stream redraws used to stack with Tab always focusing the newest
+    task, so user browse + auto focus fought each other.
+    """
+    with create_pipe_input() as pin:
+        tui = CodeDoggyTUI(_Session(), input=pin, output=DummyOutput())
+        for i in range(4):
+            t = tui.ledger.create(f"t{i}")
+            tui.ledger.update_agent(
+                t.id,
+                f"{t.id}:main",
+                label="MAIN",
+                status="running" if i == 3 else "completed",
+                output="…",
+            )
+        # Browse older card 1, then Space-style move to the prompt.
+        tui._selected_task = 1
+        tui._task_selection_active = True
+        tui._follow_latest_task = False
+        tui.app.layout.focus(tui._input)
+
+        tui._tab_task_cycle()
+        assert tui._selected_task == 1
+        assert tui._task_selection_active is True
+        assert tui._modal_open is False
+        assert tui.app.layout.has_focus(tui._task_window)
+
+
+def test_detail_line_count_keeps_history_scroll_follows_tail() -> None:
+    """Stream growth: stay put when reading history; stick to end when at tail."""
+    with create_pipe_input() as pin:
+        tui = CodeDoggyTUI(_Session(), input=pin, output=DummyOutput())
+        # Simulate a short document with cursor near the bottom.
+        fr_short = [("", f"line {i}\n") for i in range(10)]
+        tui._set_detail_line_count(fr_short)
+        assert tui._detail_line_count == 11  # PT trailing empty row
+        tui._detail_cursor_line = tui._detail_line_count - 1  # tail
+
+        fr_long = [("", f"line {i}\n") for i in range(40)]
+        tui._set_detail_line_count(fr_long)
+        # Was at tail → follow new bottom.
+        assert tui._detail_cursor_line == tui._detail_line_count - 1
+
+        # User scrolls up into history.
+        tui._detail_cursor_line = 5
+        fr_longer = [("", f"line {i}\n") for i in range(80)]
+        tui._set_detail_line_count(fr_longer)
+        assert tui._detail_cursor_line == 5
 
 
 def test_user_wants_latest_focus_respects_browse_above() -> None:

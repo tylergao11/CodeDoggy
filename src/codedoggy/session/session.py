@@ -622,6 +622,24 @@ class Session:
             elif not self._prompt_drain_active:
                 with self._lock:
                     drain_allowed = not self._prompt_ingress_stopped
+                # Grok: do not auto-wake queued full prompts after cancel
+                # (CODEDOGGY_DRAIN_AFTER_CANCEL=1 restores old drain-on-cancel).
+                cancelled_turn = (
+                    result is not None
+                    and getattr(result, "status", None) is not None
+                    and str(getattr(result.status, "value", result.status)).lower()
+                    == "cancelled"
+                )
+                if cancelled_turn:
+                    try:
+                        from codedoggy.orchestration.subagent_policy import (
+                            drain_prompt_queue_after_cancel,
+                        )
+
+                        if not drain_prompt_queue_after_cancel():
+                            drain_allowed = False
+                    except Exception:  # noqa: BLE001
+                        drain_allowed = False
                 if drain_allowed:
                     self._drain_prompt_queue()
 

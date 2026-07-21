@@ -42,10 +42,18 @@ RuntimeKernel
 ### Parallel MAIN（agent 倾向，非 harness 自动并行）
 
 - **Bias（prompt）：** 能拆的独立切片优先派子 agent；关键路径与最终答案仍由 MAIN 负责。
-- **Tools（opt-in）：** `parallel_tasks` / `spawn_subagent` / wait-get — 仅 MAIN 调用。
+- **Tools（opt-in）：** `parallel_tasks` / `spawn_subagent`（wire `task`）/ wait-get — 仅 MAIN 调用。
 - **Types：** `explore` · `plan` · `general-purpose`。
 - **Coordinator：** `SubagentCoordinator` 只执行 MAIN 已经 spawn 的工作。
+- **Isolation：** `none`（共享 cwd）或 `worktree`（`.codedoggy/worktrees/<id>`）；`cwd` 与 worktree 互斥。
+  - 默认：`CODEDOGGY_SUBAGENT_ISOLATION=none|worktree|auto`（auto：explore=none，写角色=worktree）。
+  - 合并：`merge_subagent_worktree`（MAIN 显式 land）。
+- **Model pin：** `Task.model` 或 env `CODEDOGGY_SUBAGENT_MODELS` / `CODEDOGGY_SUBAGENT_MODEL_<TYPE>` → 子 sampler 真 pin。
+- **Nesting：** `CODEDOGGY_MAX_SUBAGENT_DEPTH`（默认 1=Grok）；>1 时子 agent 可再 spawn。
+- **Agent 发现：** `~/.codedoggy/agents`、`{cwd}/.codedoggy/agents`、`CODEDOGGY_AGENTS_PATHS` 下 `*.md`。
+- **Cancel 不 auto-wake：** 取消后默认不 drain prompt_queue（`CODEDOGGY_DRAIN_AFTER_CANCEL=1` 可恢复）。
 - **另一层并行：** 同一轮 `tool_calls` 的 batch 执行可按 path-lock 并行（引擎效率，不是自动拆任务）。
+- **TUI 并行面：** 任务卡 ↳ roster（选中/进行中）；顶栏 `并行 n/m` badge → 底部 **全局** fleet 面板（跨任务 live 优先，↑↓/Enter/p 钉/`m` 合入）；详情页 Agent 芯片切换；worktree `wt`，完成后 **双击 m / 点合入** 确认 land（同 `merge_subagent_worktree`）。
 
 ### Release / audit
 

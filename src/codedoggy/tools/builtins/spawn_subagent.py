@@ -24,10 +24,10 @@ Fidelity notes:
   - Schema / descriptions / format strings: **S**
   - isolation=worktree: host SubagentCoordinator path exists (**C**);
     not full Grok fast-worktree kernel
-  - cwd override: schema+validation **S**; not applied on SubagentRequest (**X**)
-  - model: constraints messaging + optional validator **S**; not pinned on child (**X**)
-  - general-purpose advertised in schema (Grok); host agent catalog may only
-    resolve explore/plan until agent_def grows (**X** for that type)
+  - cwd override: schema+validation **S**; applied on SubagentRequest + child runner
+  - model: validated when host provides task_model_validator; pinned on child sampler
+    (explicit Task.model or CODEDOGGY_SUBAGENT_MODELS / CODEDOGGY_SUBAGENT_MODEL_*)
+  - general-purpose / explore / plan advertised and resolvable via agent_def
 """
 
 from __future__ import annotations
@@ -37,9 +37,12 @@ from typing import Any, Callable
 
 from codedoggy.orchestration.subagent import SubagentRequest, SubagentSnapshot
 from codedoggy.orchestration.types import CapabilityMode, IsolationMode
+from codedoggy.orchestration.subagent_policy import (
+    default_isolation_for,
+    effective_max_subagent_depth,
+)
 from codedoggy.tools.grok_build.task_format import (
     DEFAULT_SUBAGENT_TYPE,
-    MAX_SUBAGENT_DEPTH,
     MODEL_PARAM_DESCRIPTION,
     cwd_does_not_exist_message,
     cwd_not_directory_message,
@@ -170,18 +173,20 @@ class TaskTool(Tool):
         }
 
     def run(self, ctx: ToolCallContext, args: dict[str, Any]) -> str:
-        bag = ctx.extra or {}
+        bag = dict(ctx.extra or {})
+        bag.setdefault("cwd", str(ctx.cwd) if ctx.cwd is not None else None)
         coord = bag.get("subagent_coordinator")
         run_fn = bag.get("subagent_run_fn")
         if coord is None or run_fn is None:
             # Grok: missing SubagentBackendResource
             raise ToolError(missing_backend_message(), code="missing_resource")
 
-        # 1. Depth check (Grok MAX_SUBAGENT_DEPTH)
+        # 1. Depth check (Grok default 1; CODEDOGGY_MAX_SUBAGENT_DEPTH overrides)
         depth = _read_depth(bag)
-        if depth >= MAX_SUBAGENT_DEPTH:
+        max_depth = effective_max_subagent_depth()
+        if depth >= max_depth:
             raise ToolError.invalid_arguments(
-                depth_limit_error_message(depth, MAX_SUBAGENT_DEPTH)
+                depth_limit_error_message(depth, max_depth)
             )
 
         prompt = str(args.get("prompt") or "").strip()
@@ -201,15 +206,21 @@ class TaskTool(Tool):
         # subagent_type default general-purpose (Grok default_subagent_type)
         st = str(args.get("subagent_type") or "").strip() or DEFAULT_SUBAGENT_TYPE
 
-        # model: soft-ignored on resume
+        # model: soft-ignored on resume; else explicit Task.model or per-type env.
         model = sanitize_optional_arg(
             str(args["model"]) if args.get("model") is not None else None
         )
         if resume_from is not None:
             model = None
+        elif model is None:
+            from codedoggy.orchestration.subagent import resolve_subagent_model
+
+            model = resolve_subagent_model(st, explicit=None)
 
         # cwd sanitize + mutual exclusion with isolation=worktree
         isolation_mode, isolation_explicit = _parse_isolation(args.get("isolation"))
+        if not isolation_explicit:
+            isolation_mode = default_isolation_for(st)
         cwd = sanitize_cwd_value(
             str(args["cwd"]) if args.get("cwd") is not None else None
         )
@@ -227,12 +238,11 @@ class TaskTool(Tool):
                 raise ToolError.invalid_arguments(cwd_not_directory_message(cwd))
             if not p.is_dir():
                 raise ToolError.invalid_arguments(cwd_does_not_exist_message(cwd))
-        # Host SubagentRequest has no cwd field yet (**X**): validated only.
 
         # 2. Eager type validation (Grok backend.validate_type)
         _validate_subagent_type(bag, st, parent_session_id=ctx.session_id or "")
 
-        # Model catalog validation when explicit model is requested
+        # Model catalog validation when a model is selected (explicit or env).
         if model is not None:
             _validate_model(bag, model)
 
@@ -276,7 +286,10 @@ class TaskTool(Tool):
             parent_session_id=parent_sid,
             run_in_background=run_in_background,
             capability_mode=cap,
-            isolation=isolation_mode if isolation_explicit else IsolationMode.NONE,
+            isolation=isolation_mode,
+            model=model,
+            cwd=cwd,
+            spawn_depth=depth,
         )
         snap: SubagentSnapshot = coord.spawn(req, run_fn=run_fn)
         return _format_result(
@@ -378,13 +391,14 @@ def _available_types(bag: dict[str, Any]) -> list[str]:
     raw = bag.get("subagent_available_types")
     if isinstance(raw, (list, tuple)) and raw:
         return [str(x) for x in raw]
-    # Honest host catalog: what resolve_agent_definition knows today.
+    # Honest host catalog: builtins + disk-discovered customs.
     try:
-        from codedoggy.orchestration.agent_def import BUILTIN_AGENTS
+        from codedoggy.orchestration.agent_def import available_agent_type_names
 
-        return sorted(BUILTIN_AGENTS.keys())
+        cwd = bag.get("cwd")
+        return available_agent_type_names(cwd=cwd)
     except Exception:  # noqa: BLE001
-        return ["explore", "plan"]
+        return ["explore", "plan", "general-purpose"]
 
 
 def _validate_subagent_type(

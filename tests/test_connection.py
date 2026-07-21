@@ -37,12 +37,12 @@ def test_connection_from_config_snapshot_fields() -> None:
     assert snap.provider == "ollama"
     assert snap.model == "qwen3:8b"
     assert snap.ready_to_sample is True
-    assert snap.label == "ollama/qwen3:8b"
+    assert snap.label == "ollama/qwen3:8b"  # model does not name provider
     assert snap.generation == 0
     # Missing extra → product default high
     assert snap.reasoning_enabled is True
     assert snap.reasoning_effort == "high"
-    assert snap.reasoning_label == "推理:high"
+    assert snap.reasoning_label == "high"
 
 
 def test_connection_reads_reasoning_from_config_extra() -> None:
@@ -50,12 +50,12 @@ def test_connection_reads_reasoning_from_config_extra() -> None:
         _cfg(extra={"reasoning": {"enabled": True, "effort": "medium"}}),
     )
     assert snap.reasoning_effort == "medium"
-    assert snap.reasoning_label == "推理:medium"
+    assert snap.reasoning_label == "medium"
     off = connection_from_config(
         _cfg(extra={"reasoning": {"enabled": False}}),
     )
     assert off.reasoning_enabled is False
-    assert off.reasoning_label == "推理:off"
+    assert off.reasoning_label == "off"
 
 
 def test_bootstrap_service_snapshot_stable() -> None:
@@ -116,7 +116,8 @@ def test_connection_of_reads_extensions() -> None:
     assert session_surface.model_id(session) == "qwen3:8b"
     caption = session_surface.model_and_mode_text(session)
     assert "qwen3:8b" in caption
-    assert "推理:high" in caption
+    assert "high" in caption
+    assert "推理" not in caption
     assert "auto" in caption
 
 
@@ -190,7 +191,7 @@ def test_apply_sets_reasoning_effort(monkeypatch: pytest.MonkeyPatch) -> None:
         require_auth=False,
     )
     assert snap.reasoning_effort == "medium"
-    assert snap.reasoning_label == "推理:medium"
+    assert snap.reasoning_label == "medium"
     assert snap.reasoning_enabled is True
     import os
 

@@ -57,6 +57,36 @@ def test_insert_image_chip_shows_view_label(tmp_path: Path) -> None:
     assert path_under_cursor(chip, 1) is not None
 
 
+def test_input_areas_focus_on_click() -> None:
+    """Middle of the prompt box must accept clicks (not only chrome edges)."""
+    from prompt_toolkit.application.current import set_app
+    from prompt_toolkit.mouse_events import MouseEvent, MouseEventType
+
+    class _Pos:
+        x = 12
+        y = 0
+
+    with create_pipe_input() as pin:
+        tui = CodeDoggyTUI(_Session(), input=pin, output=DummyOutput())
+        assert tui._input.control.focus_on_click()
+        assert tui._detail_input.control.focus_on_click()
+
+        with set_app(tui.app):
+            # Move focus away from the main input, then click the buffer middle.
+            tui.app.layout.focus(tui._task_window)
+            assert not tui.app.layout.has_focus(tui._input)
+
+            handler = tui._input.control.mouse_handler
+            event = MouseEvent(
+                position=_Pos(),
+                event_type=MouseEventType.MOUSE_DOWN,
+                button=None,
+                modifiers=None,
+            )
+            handler(event)
+            assert tui.app.layout.has_focus(tui._input)
+
+
 def test_cut_selection_on_delete_and_backspace() -> None:
     with create_pipe_input() as pin:
         tui = CodeDoggyTUI(_Session(), input=pin, output=DummyOutput())

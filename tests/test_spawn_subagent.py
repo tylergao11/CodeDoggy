@@ -418,6 +418,89 @@ def test_model_without_validator_is_validation_unavailable(tmp_path: Path) -> No
     coord.shutdown(wait=True)
 
 
+def test_spawn_passes_model_and_cwd_on_request(tmp_path: Path) -> None:
+    """Task.model + cwd must land on SubagentRequest (not validate-only)."""
+    coord = SubagentCoordinator()
+    seen: list[SubagentRequest] = []
+    child = tmp_path / "work"
+    child.mkdir()
+
+    def run_fn(req: SubagentRequest, cancel) -> SubagentSnapshot:
+        seen.append(req)
+        return SubagentSnapshot(
+            subagent_id=req.id,
+            subagent_type=req.subagent_type,
+            status="completed",
+            description=req.description,
+            output="ok",
+            tool_calls=0,
+            turns=1,
+            duration_ms=1,
+        )
+
+    def validator(slug: str) -> str | None:
+        return None if slug == "child-model" else f"bad {slug}"
+
+    out = TaskTool().run(
+        _ctx(
+            tmp_path,
+            coord=coord,
+            run_fn=run_fn,
+            extra={"task_model_validator": validator},
+        ),
+        {
+            "prompt": "do work",
+            "description": "slice",
+            "subagent_type": "explore",
+            "run_in_background": False,
+            "model": "child-model",
+            "cwd": str(child),
+        },
+    )
+    assert "ok" in out or "done" in out.lower() or "Completed" in out or out
+    assert len(seen) == 1
+    assert seen[0].model == "child-model"
+    assert seen[0].cwd == str(child)
+    coord.shutdown(wait=True)
+
+
+def test_resolve_subagent_model_env(monkeypatch: object) -> None:
+    from codedoggy.orchestration.subagent import resolve_subagent_model
+
+    monkeypatch.setenv("CODEDOGGY_SUBAGENT_MODELS", "explore=env-explore,plan=env-plan")
+    assert resolve_subagent_model("explore") == "env-explore"
+    assert resolve_subagent_model("plan") == "env-plan"
+    assert resolve_subagent_model("explore", explicit="win") == "win"
+    monkeypatch.setenv("CODEDOGGY_SUBAGENT_MODEL_GENERAL_PURPOSE", "gp-model")
+    assert resolve_subagent_model("general-purpose") == "gp-model"
+
+
+def test_pin_sampler_model_rewrites_client_model() -> None:
+    from dataclasses import replace
+
+    from codedoggy.model.chat_sampler import ChatSampler
+    from codedoggy.model.types import ModelConfig
+    from codedoggy.orchestration.subagent import pin_sampler_model
+
+    class _Client:
+        def __init__(self, config: ModelConfig, profile=None) -> None:
+            self._config = config
+            self.config = config
+            self._profile = profile
+            self.profile = profile
+
+    cfg = ModelConfig(
+        provider="openai_compat",
+        model="parent-model",
+        base_url="http://localhost",
+        api_key="k",
+    )
+    base = ChatSampler(_Client(cfg))
+    pinned = pin_sampler_model(base, "child-model")
+    assert pinned is not base
+    assert pinned.client.config.model == "child-model"
+
+
 def test_cwd_and_worktree_mutex(tmp_path: Path) -> None:
     coord = SubagentCoordinator()
     real = tmp_path / "child_cwd"

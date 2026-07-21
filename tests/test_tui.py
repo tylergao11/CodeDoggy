@@ -293,6 +293,9 @@ def test_startup_brand_is_one_shot_and_never_returns_after_first_task() -> None:
         assert tui._startup_brand is False
         assert tui._showing_startup_brand() is False
         assert _wait_until(lambda: not tui._is_running())
+        # Finish may auto-open detail; dismiss so the underlay is paint-able.
+        tui._modal_open = False
+        tui._modal_ref = None
 
         # Even if the ledger were empty again, splash must not return.
         tui.ledger = TaskLedger()
@@ -351,11 +354,12 @@ def test_parallel_runtime_uses_child_descriptions_as_clickable_participants() ->
         assert snapshot.phase == "parallel"
         assert _task_stage_text(snapshot) == "3 个 Agent 并行中"
         rendered = "".join(fragment[1] for fragment in tui._render_tasks())
-        # Homepage cards stay compact — no ↳ MAIN / child agent rows (avoids jiggle).
-        assert "↳" not in rendered
-        assert "正在检查 API" not in rendered
-        assert "正在验证交互" not in rendered
-        assert "调用中" not in rendered
+        # Live parallel kids show compact roster rows (click → open that agent).
+        assert "↳" in rendered
+        assert "API" in rendered or "入口" in rendered
+        assert "交互" in rendered or "验证" in rendered
+        # Tool-noise chips still stay off the MAIN cover prose.
+        assert "调用中" not in rendered or "→" in rendered
 
 
 def test_child_agent_detail_uses_serialized_runtime_transcript() -> None:
@@ -516,20 +520,19 @@ def test_task_panel_keeps_reference_layout_across_terminal_widths(
             assert "DOGGY" in header or "DOG" in header
             assert header.strip().startswith("╭") or "DOGGY" in header
             assert "main ·" not in header
-            # Compact list: title + stage + one human summary (no dog-ear separators).
+            # Compact list: title + stage + summary + live child roster.
             assert "∪" not in rendered
             assert "CLI" in rendered or "任务面板" in rendered
             # Cover badge stays compact at every width (detail owns the long form).
             assert "3 并行" in rendered
-            # No ↳ agent rows on homepage cards.
-            assert "↳" not in rendered
+            # Live kids: roster rows (click opens that agent).
+            assert "↳" in rendered
             compact = rendered.replace("\n", "").replace(" ", "")
-            assert "面板" in compact or "对齐" in compact
+            assert "面板" in compact or "对齐" in compact or "BUILDER" in compact
 
-        # No tool-call live noise in the list body.
-        assert "调用中" not in "".join(
-            fragment[1] for fragment in tui._render_tasks()
-        )
+        # Tool activity may appear on roster lines, not as MAIN cover dump only.
+        body = "".join(fragment[1] for fragment in tui._render_tasks())
+        assert "BUILDER" in body or "TESTER" in body
 
 
 def test_running_status_and_feedback_fit_narrow_terminals(monkeypatch: object) -> None:
@@ -547,8 +550,10 @@ def test_running_status_and_feedback_fit_narrow_terminals(monkeypatch: object) -
                 lambda width=width: width,
             )
             status = "".join(fragment[1] for fragment in tui._render_turn_status())
-            assert get_cwidth(status) <= width
-            expected_stop = "[停]" if width < 36 else "[停止]"
+            # Chrome paints into content width (terminal minus edge pad).
+            content_w = max(1, width - 2 * tui_app._EDGE_PAD_X)
+            assert get_cwidth(status) <= content_w
+            expected_stop = "[停]" if content_w < 36 else "[停止]"
             assert expected_stop in status
 
         monkeypatch.setattr(tui, "_is_running", lambda: False)  # type: ignore[attr-defined]
@@ -560,7 +565,8 @@ def test_running_status_and_feedback_fit_narrow_terminals(monkeypatch: object) -
                 lambda width=width: width,
             )
             feedback = "".join(fragment[1] for fragment in tui._render_turn_status())
-            assert get_cwidth(feedback) <= width
+            content_w = max(1, width - 2 * tui_app._EDGE_PAD_X)
+            assert get_cwidth(feedback) <= content_w
 
 
 def test_reload_client_deferred_until_idle(monkeypatch: object) -> None:
@@ -615,7 +621,9 @@ def test_full_screen_agent_window_is_opaque_and_interactive() -> None:
         )
         float_layer = tui.app.layout.container.floats[0]
         assert float_layer.transparent() is False
-        assert float_layer.top == 1 and float_layer.bottom == 1
+        # Modal inset matches outer body pad (air from terminal edges).
+        assert float_layer.top == 2 and float_layer.bottom == 2
+        assert float_layer.left == 3 and float_layer.right == 3
         top = "".join(fragment[1] for fragment in tui._render_prompt_top())
         bottom = "".join(fragment[1] for fragment in tui._render_prompt_bottom())
         prefix = "".join(fragment[1] for fragment in tui._render_prompt_prefix())
@@ -675,8 +683,17 @@ def test_full_screen_agent_window_is_opaque_and_interactive() -> None:
 
         thread = threading.Thread(target=tui.run, daemon=True)
         thread.start()
+        # Send opens MAIN detail immediately (before the turn finishes).
         assert _wait_until(lambda: bool(tui.ledger.snapshots()))
+        assert _wait_until(lambda: tui._modal_open and tui._modal_kind == "agent")
         assert _wait_until(lambda: tui.ledger.snapshots()[0].phase == "done")
+        detail_text = "".join(fragment[1] for fragment in tui._render_modal_body())
+        assert "已完成：实现 CLI" in detail_text
+        assert tui.app.layout.has_focus(tui._detail_window)
+
+        # Tab exits detail → task list shows the finished card.
+        pipe_input.send_text("\t")
+        assert _wait_until(lambda: not tui._modal_open)
         task_text = "".join(fragment[1] for fragment in tui._render_tasks())
         assert "完成·1" in task_text
         # Compact card: frame + title; summary is MAIN report prose.
@@ -684,16 +701,6 @@ def test_full_screen_agent_window_is_opaque_and_interactive() -> None:
         assert "实现 CLI" in task_text
         assert "已完成：实现 CLI" in task_text
 
-        # Tab → latest task → Tab enter detail (idle Esc no longer closes).
-        pipe_input.send_text("\t\t")
-        assert _wait_until(lambda: tui._modal_open)
-        detail_text = "".join(fragment[1] for fragment in tui._render_modal_body())
-        assert "已完成：实现 CLI" in detail_text
-        assert tui.app.layout.has_focus(tui._detail_window)
-
-        # Tab exits detail (Esc is cancel-only when running).
-        pipe_input.send_text("\t")
-        assert _wait_until(lambda: not tui._modal_open)
         pipe_input.send_text("\x11")
         assert _wait_until(lambda: tui._quit_armed_until > time.monotonic())
         pipe_input.send_text("\x11")
@@ -931,6 +938,451 @@ def test_live_plan_prefers_main_prose_over_draft_placeholder() -> None:
     # Still planning phase → stage can say 起草中, but summary shows live prose.
     assert "起草" in _task_stage_text(snap)
     assert "我先读入口" in _task_list_summary(snap)
+
+
+def test_parallel_agent_roster_on_selected_or_live_card() -> None:
+    """Selected / live tasks paint clickable child rows; idle stacks stay compact."""
+    with create_pipe_input() as pipe_input:
+        tui = CodeDoggyTUI(_Session(), input=pipe_input, output=DummyOutput())
+        t = tui.ledger.create("fan-out")
+        tui.ledger.update_agent(
+            t.id, f"{t.id}:main", label="MAIN", status="running", output="…"
+        )
+        tui.ledger.update_agent(
+            t.id, "sub_a", label="EXPLORE A", status="running", output="dig"
+        )
+        tui.ledger.update_agent(
+            t.id, "sub_b", label="BUILD B", status="completed", output="done"
+        )
+        tui.ledger.set_task_phase(t.id, "parallel")
+        # Not selected but has live kids → roster shows.
+        tui._task_selection_active = False
+        rendered = "".join(f[1] for f in tui._render_tasks())
+        assert "↳" in rendered
+        assert "EXPLORE" in rendered or "BUILD" in rendered
+
+        # Click helper selects agent and opens modal.
+        tui._task_agent_mouse(0, 1)(
+            type(
+                "E",
+                (),
+                {
+                    "event_type": __import__(
+                        "prompt_toolkit.mouse_events", fromlist=["MouseEventType"]
+                    ).MouseEventType.MOUSE_UP,
+                    "button": None,
+                    "modifiers": None,
+                    "position": type("P", (), {"x": 0, "y": 0})(),
+                },
+            )()
+        )
+        assert tui._modal_open is True
+        assert tui._modal_ref is not None
+        assert tui._modal_ref[1] == "sub_a"
+
+
+def test_fleet_badge_and_pane_render() -> None:
+    """Header 并行 badge + expandable fleet roster under turn status."""
+    with create_pipe_input() as pipe_input:
+        tui = CodeDoggyTUI(_Session(), input=pipe_input, output=DummyOutput())
+        t = tui.ledger.create("fan-out-fleet")
+        tui.ledger.update_agent(
+            t.id, f"{t.id}:main", label="MAIN", status="running", output="…"
+        )
+        tui.ledger.update_agent(
+            t.id, "sub_a", label="EXPLORE A", status="running", output="dig"
+        )
+        tui.ledger.update_agent(
+            t.id, "sub_b", label="BUILD B", status="completed", output="done"
+        )
+        tui.ledger.set_task_phase(t.id, "parallel")
+        tui._active_task_id = t.id
+
+        badge = tui._fleet_badge_label()
+        assert badge is not None
+        assert "2" in badge  # total children
+        header = "".join(fragment[1] for fragment in tui._render_header())
+        assert "并行" in header
+        assert badge in header
+
+        # Closed by default
+        assert tui._render_fleet_pane() == []
+        tui._toggle_fleet_pane()
+        assert tui._fleet_pane_open
+        pane = "".join(fragment[1] for fragment in tui._render_fleet_pane())
+        assert "并行" in pane
+        assert "EXPLORE" in pane or "BUILD" in pane
+        assert "›" in pane  # cursor mark on focused row
+
+        tui._move_fleet_cursor(1)
+        assert tui._fleet_cursor == 1
+        tui._toggle_fleet_pane()
+        assert not tui._fleet_pane_open
+
+
+def test_fleet_pin_and_open_cursor() -> None:
+    """p pins an agent; Enter / open cursor opens its detail modal."""
+    with create_pipe_input() as pipe_input:
+        tui = CodeDoggyTUI(_Session(), input=pipe_input, output=DummyOutput())
+        t = tui.ledger.create("pin-me")
+        tui.ledger.update_agent(
+            t.id, f"{t.id}:main", label="MAIN", status="running", output="…"
+        )
+        tui.ledger.update_agent(
+            t.id, "sub_pin", label="PIN ME", status="running", output="work"
+        )
+        tui.ledger.update_agent(
+            t.id, "sub_other", label="OTHER", status="running", output="x"
+        )
+        tui._active_task_id = t.id
+        tui._fleet_pane_open = True
+        tui._fleet_cursor = 0
+        tui._pin_fleet_cursor()
+        assert tui._pinned_agent_ref == (t.id, "sub_pin")
+        pane = "".join(fragment[1] for fragment in tui._render_fleet_pane())
+        assert "★" in pane
+        # Pin again toggles off.
+        tui._pin_fleet_cursor()
+        assert tui._pinned_agent_ref is None
+        tui._pin_fleet_cursor()
+        assert tui._pinned_agent_ref == (t.id, "sub_pin")
+
+        tui._open_pinned_agent()
+        assert tui._modal_open
+        assert tui._modal_ref == (t.id, "sub_pin")
+
+        tui._modal_open = False
+        tui._modal_ref = None
+        tui._fleet_cursor = 1
+        tui._open_fleet_cursor()
+        assert tui._modal_open
+        assert tui._modal_ref == (t.id, "sub_other")
+
+
+def test_fleet_and_todo_panes_are_mutually_exclusive() -> None:
+    """Opening one bottom drawer closes the other (↑↓ ownership)."""
+    from codedoggy.tools.grok_build.todo_logic import TodoItem, TodoState
+
+    with create_pipe_input() as pipe_input:
+        session = _Session()
+        todos = TodoState()
+        todos.push("1", TodoItem("step", status="pending"))
+        session.extensions.kernel.todo_state = todos
+        tui = CodeDoggyTUI(session, input=pipe_input, output=DummyOutput())
+        t = tui.ledger.create("both")
+        tui.ledger.update_agent(
+            t.id, "sub_x", label="CHILD", status="running", output="…"
+        )
+        tui._active_task_id = t.id
+
+        tui._toggle_todo_pane()
+        assert tui._todo_pane_open
+        tui._toggle_fleet_pane()
+        assert tui._fleet_pane_open
+        assert not tui._todo_pane_open
+        tui._toggle_todo_pane()
+        assert tui._todo_pane_open
+        assert not tui._fleet_pane_open
+
+
+def test_worktree_hint_in_detail_and_fleet() -> None:
+    """Completed worktree agents surface merge action in chrome."""
+    with create_pipe_input() as pipe_input:
+        session = _Session()
+
+        def _lookup(sid: str) -> SimpleNamespace | None:
+            if sid != "sub_wt":
+                return None
+            return SimpleNamespace(
+                worktree_path="C:/repo/.codedoggy/worktrees/sub_wt",
+                metadata={"isolation": "worktree"},
+            )
+
+        session.extensions.kernel.subagent_coordinator = SimpleNamespace(
+            list_for_parent=lambda _: list(session.subagents),
+            lookup=_lookup,
+        )
+        tui = CodeDoggyTUI(session, input=pipe_input, output=DummyOutput())
+        t = tui.ledger.create("wt-task")
+        tui.ledger.update_agent(
+            t.id, f"{t.id}:main", label="MAIN", status="running", output="…"
+        )
+        tui.ledger.update_agent(
+            t.id, "sub_wt", label="WT CHILD", status="completed", output="landed"
+        )
+        tui._active_task_id = t.id
+
+        assert tui._agent_worktree_short("sub_wt") == "wt"
+        info = tui._agent_worktree_info("sub_wt")
+        assert info["is_worktree"] is True
+        assert "sub_wt" in info["short_path"]
+
+        tui._fleet_pane_open = True
+        tui._fleet_cursor = 0
+        pane = "".join(fragment[1] for fragment in tui._render_fleet_pane())
+        assert "wt" in pane or "合入" in pane
+        assert "合入" in pane
+
+        tui._open_agent(t.id, "sub_wt")
+        hint = "".join(fragment[1] for fragment in tui._render_modal_hint())
+        assert "合入" in hint or "wt" in hint
+        title = "".join(fragment[1] for fragment in tui._render_modal_title())
+        assert "wt" in title
+
+
+def test_fleet_global_across_tasks() -> None:
+    """Fleet lists children from every task; live rows sort first."""
+    with create_pipe_input() as pipe_input:
+        tui = CodeDoggyTUI(_Session(), input=pipe_input, output=DummyOutput())
+        t1 = tui.ledger.create("older-task")
+        tui.ledger.update_agent(
+            t1.id, "sub_old", label="OLD DONE", status="completed", output="ok"
+        )
+        t2 = tui.ledger.create("newer-task")
+        tui.ledger.update_agent(
+            t2.id, "sub_live", label="LIVE NOW", status="running", output="…"
+        )
+        # Active selection is older task — fleet still global.
+        tui._active_task_id = t1.id
+        tui._selected_task = 0
+        tui._task_selection_active = True
+
+        entries = tui._fleet_child_entries()
+        labels = [a.label for _tid, _tt, _i, a in entries]
+        assert "LIVE NOW" in labels
+        assert "OLD DONE" in labels
+        # Live first.
+        assert labels[0] == "LIVE NOW"
+
+        badge = tui._fleet_badge_label()
+        assert badge is not None
+        assert badge.startswith("1/")  # 1 live / 2 total
+
+        tui._toggle_fleet_pane()
+        pane = "".join(fragment[1] for fragment in tui._render_fleet_pane())
+        assert "全局" in pane
+        assert "LIVE" in pane
+        assert "OLD" in pane or "older" in pane or "DONE" in pane
+
+
+def test_worktree_merge_double_confirm() -> None:
+    """m arms merge; second m lands via coordinator.merge_worktree."""
+    with create_pipe_input() as pipe_input:
+        session = _Session()
+        merged: list[str] = []
+
+        def _lookup(sid: str) -> SimpleNamespace | None:
+            if sid != "sub_wt":
+                return None
+            return SimpleNamespace(
+                worktree_path="C:/repo/.codedoggy/worktrees/sub_wt",
+                metadata={"isolation": "worktree"},
+            )
+
+        def _merge(sid: str, _cwd: object, **_kw: object) -> SimpleNamespace:
+            merged.append(str(sid))
+            return SimpleNamespace(
+                ok=True,
+                strategy="merge",
+                branch="codedoggy/sub_wt",
+                commit="abc123def",
+                conflicts=[],
+                message="ok",
+                cleaned_worktree=True,
+                worktree_path=None,
+            )
+
+        session.extensions.kernel.subagent_coordinator = SimpleNamespace(
+            list_for_parent=lambda _: list(session.subagents),
+            lookup=_lookup,
+            merge_worktree=_merge,
+        )
+        tui = CodeDoggyTUI(session, input=pipe_input, output=DummyOutput())
+        t = tui.ledger.create("merge-me")
+        tui.ledger.update_agent(
+            t.id, "sub_wt", label="WT CHILD", status="completed", output="done"
+        )
+        tui._active_task_id = t.id
+        tui._fleet_pane_open = True
+        tui._fleet_cursor = 0
+
+        assert tui._agent_mergeable("sub_wt", "completed") is True
+        # First m — arm only.
+        tui._merge_fleet_cursor()
+        assert merged == []
+        assert tui._merge_confirm_active() is True
+        assert tui._merge_confirm_ref == (t.id, "sub_wt")
+        # Second m — land.
+        tui._merge_fleet_cursor()
+        assert merged == ["sub_wt"]
+        assert "sub_wt" in tui._merged_worktrees
+        assert tui._agent_mergeable("sub_wt", "completed") is False
+        assert tui._merge_confirm_active() is False
+        # Feedback success.
+        assert "合入" in (tui._feedback_text or "")
+
+
+def test_detail_jump_fab_is_viewport_float_not_scroll_content() -> None:
+    """↓ 到底 must be a separate Float, not baked into detail body fragments."""
+    with create_pipe_input() as pipe_input:
+        tui = CodeDoggyTUI(_Session(), input=pipe_input, output=DummyOutput())
+        t = tui.ledger.create("long")
+        tui.ledger.update_agent(
+            t.id,
+            f"{t.id}:main",
+            label="MAIN",
+            status="completed",
+            output="结果。",
+        )
+        # Closed: FAB off.
+        assert tui._detail_jump_fab_visible() is False
+
+        tui._open_agent(t.id, f"{t.id}:main")
+        # Short body → no need to jump.
+        tui._detail_line_count = 3
+        assert tui._detail_jump_fab_visible() is False
+
+        # Long body without render_info → show FAB.
+        tui._detail_line_count = 80
+        assert tui._detail_jump_fab_visible() is True
+
+        plain = "".join(f[1] for f in tui._render_detail_jump_fab())
+        assert "到底" in plain
+        # Mouse handler present on the chip.
+        assert any(
+            len(f) >= 3 and f[2] is not None for f in tui._render_detail_jump_fab()
+        )
+
+        # Click path scrolls cursor to end.
+        tui._detail_cursor_line = 0
+        tui._scroll_detail_to_bottom()
+        assert tui._detail_cursor_line == tui._detail_line_count - 1
+
+
+def test_start_task_opens_detail_immediately() -> None:
+    """Send opens MAIN detail right away — do not wait for the turn to finish."""
+    with create_pipe_input() as pipe_input:
+        tui = CodeDoggyTUI(_Session(), input=pipe_input, output=DummyOutput())
+        tui._start_task("马上看详情")
+        assert tui._modal_open is True
+        assert tui._modal_kind == "agent"
+        snaps = tui.ledger.snapshots()
+        assert snaps
+        tid = snaps[0].id
+        assert tui._modal_ref == (tid, f"{tid}:main")
+        assert tid in tui._auto_opened_detail_tasks
+        assert tui.app.layout.has_focus(tui._detail_window)
+        # Finish path is a no-op once already opened.
+        tui._modal_open = False
+        tui._modal_ref = None
+        tui._open_task_detail_on_finish(tid, status="completed")
+        assert tui._modal_open is False
+
+
+def test_open_task_detail_on_finish_opens_main() -> None:
+    """Finish still opens MAIN if start was blocked (e.g. auth overlay)."""
+    with create_pipe_input() as pipe_input:
+        tui = CodeDoggyTUI(_Session(), input=pipe_input, output=DummyOutput())
+        t = tui.ledger.create("done-me")
+        tui.ledger.update_agent(
+            t.id,
+            f"{t.id}:main",
+            label="MAIN",
+            status="completed",
+            output="全部完成。",
+        )
+        tui.ledger.finish_task(t.id, "completed")
+
+        tui._open_task_detail_on_finish(t.id, status="completed")
+        assert tui._modal_open is True
+        assert tui._modal_kind == "agent"
+        assert tui._modal_ref == (t.id, f"{t.id}:main")
+        assert tui._detail_filter == "message"
+        assert t.id in tui._auto_opened_detail_tasks
+
+        # Second call is a no-op (does not re-seed collapse / steal elsewhere).
+        tui._modal_open = False
+        tui._modal_ref = None
+        tui._open_task_detail_on_finish(t.id, status="completed")
+        assert tui._modal_open is False
+
+        # Cancelled tasks do not auto-open.
+        t2 = tui.ledger.create("cancel-me")
+        tui.ledger.finish_task(t2.id, "cancelled")
+        tui._open_task_detail_on_finish(t2.id, status="cancelled")
+        assert tui._modal_open is False
+
+
+def test_cancel_swallows_repeat_and_grace_protects_next_task() -> None:
+    """Esc once cancels; key-repeat / delayed Esc must not kill the next task."""
+    with create_pipe_input() as pipe_input:
+        tui = CodeDoggyTUI(_Session(), input=pipe_input, output=DummyOutput())
+        t1 = tui.ledger.create("first")
+        tui._active_task_id = t1.id
+        tui._worker = threading.Thread(target=lambda: None)
+        # Pretend the worker is alive so _is_running is true.
+        tui._worker = threading.current_thread()
+        tui._task_started_at = time.monotonic()
+
+        tui._cancel_current()
+        assert tui._cancelling_task_id == t1.id
+        assert tui.ledger.snapshots()[0].status == "cancelled"
+        assert tui.session.cancelled is True
+
+        # Repeat Esc while same task is "running" — no double work / no raise.
+        tui.session.cancelled = False
+        tui._cancel_current()
+        assert tui.session.cancelled is False  # swallowed
+
+        # Simulate next task after cancel (still within grace window).
+        t2 = tui.ledger.create("second")
+        tui._active_task_id = t2.id
+        tui._cancelling_task_id = None
+        tui.session.cancelled = False
+        tui._cancel_current()
+        # Grace blocks cancel of the new task.
+        assert tui.session.cancelled is False
+        assert tui.ledger.snapshots()[1].status == "running"
+
+        # After grace expires, Esc can cancel the new task.
+        tui._cancel_grace_until = 0.0
+        tui._cancel_current()
+        assert tui.session.cancelled is True
+        assert tui.ledger.snapshots()[1].status == "cancelled"
+
+
+def test_task_card_summary_hides_tool_activity_lines() -> None:
+    """Cover description is message-only; tools belong under the 工具 tab."""
+    from codedoggy.tui.app import _is_tool_activity_line
+
+    assert _is_tool_activity_line("→ read_file · 调用中")
+    assert _is_tool_activity_line("✓ shell · 完成")
+    assert _is_tool_activity_line("✗ grep · 失败")
+    assert not _is_tool_activity_line("我先读取入口，再改模型。")
+
+    ledger = TaskLedger()
+    task = ledger.create("tool noise cover")
+    ledger.update_agent(
+        task.id,
+        f"{task.id}:main",
+        label="MAIN",
+        status="running",
+        output="✓ read_file · 完成",
+    )
+    snap = ledger.snapshots()[0]
+    # Tool chip must not become the card description.
+    assert "read_file" not in _task_list_summary(snap)
+    assert "完成" not in _task_list_summary(snap)
+
+    ledger.update_agent(
+        task.id,
+        f"{task.id}:main",
+        label="MAIN",
+        status="running",
+        output="入口已经确认，开始改文件。",
+    )
+    snap = ledger.snapshots()[0]
+    assert "入口已经确认" in _task_list_summary(snap)
 
 
 def test_plan_cover_copy_stays_quiet() -> None:

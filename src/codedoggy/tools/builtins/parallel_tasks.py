@@ -15,9 +15,12 @@ from codedoggy.orchestration.subagent import (
     format_parallel_dispatched,
 )
 from codedoggy.orchestration.types import CapabilityMode, IsolationMode
+from codedoggy.orchestration.subagent_policy import (
+    default_isolation_for,
+    effective_max_subagent_depth,
+)
 from codedoggy.tools.grok_build.task_format import (
     DEFAULT_SUBAGENT_TYPE,
-    MAX_SUBAGENT_DEPTH,
     depth_limit_error_message,
 )
 from codedoggy.tools.kinds import ToolKind, ToolNamespace
@@ -99,6 +102,20 @@ class ParallelTasksTool(Tool):
                                 "type": "string",
                                 "description": '"none" (default) or "worktree".',
                             },
+                            "model": {
+                                "type": "string",
+                                "description": (
+                                    "Optional model slug for this child only. "
+                                    "Omit to use per-type env default or parent model."
+                                ),
+                            },
+                            "cwd": {
+                                "type": "string",
+                                "description": (
+                                    "Optional working directory for this child. "
+                                    'Mutually exclusive with isolation="worktree".'
+                                ),
+                            },
                         },
                         "required": ["prompt", "description"],
                     },
@@ -137,9 +154,10 @@ class ParallelTasksTool(Tool):
             )
 
         depth = _read_depth(bag)
-        if depth >= MAX_SUBAGENT_DEPTH:
+        max_depth = effective_max_subagent_depth()
+        if depth >= max_depth:
             raise ToolError.invalid_arguments(
-                depth_limit_error_message(depth, MAX_SUBAGENT_DEPTH)
+                depth_limit_error_message(depth, max_depth)
             )
 
         raw_tasks = args.get("tasks")
@@ -168,9 +186,34 @@ class ParallelTasksTool(Tool):
             raw_cap = item.get("capability_mode")
             if isinstance(raw_cap, str) and raw_cap.strip():
                 cap = CapabilityMode.parse(raw_cap)
-            isolation = IsolationMode.parse(
-                str(item.get("isolation")) if item.get("isolation") is not None else None
-            )
+            if item.get("isolation") is not None and str(item.get("isolation")).strip():
+                isolation = IsolationMode.parse(str(item.get("isolation")))
+            else:
+                isolation = default_isolation_for(st)
+            model = None
+            raw_model = item.get("model")
+            if isinstance(raw_model, str) and raw_model.strip():
+                model = raw_model.strip()
+            if model is None:
+                from codedoggy.orchestration.subagent import resolve_subagent_model
+
+                model = resolve_subagent_model(st, explicit=None)
+            if model is not None:
+                validator = bag.get("task_model_validator")
+                if callable(validator):
+                    err = validator(model)
+                    if err:
+                        raise ToolError.invalid_arguments(
+                            f"tasks[{i}].model: {err}"
+                        )
+            cwd = None
+            raw_cwd = item.get("cwd")
+            if isinstance(raw_cwd, str) and raw_cwd.strip():
+                cwd = raw_cwd.strip()
+                if isolation is IsolationMode.WORKTREE:
+                    raise ToolError.invalid_arguments(
+                        f'tasks[{i}]: cwd is mutually exclusive with isolation="worktree"'
+                    )
             requests.append(
                 SubagentRequest(
                     subagent_type=st,
@@ -180,6 +223,9 @@ class ParallelTasksTool(Tool):
                     run_in_background=True,
                     capability_mode=cap,
                     isolation=isolation,
+                    model=model,
+                    cwd=cwd,
+                    spawn_depth=depth,
                 )
             )
 
