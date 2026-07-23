@@ -396,12 +396,6 @@ class InteractiveScrollbarMargin(Margin):
                         self._drag_start_scroll = int(
                             getattr(win, "vertical_scroll", 0) or 0
                         )
-                        # Re-paint so install_mouse_handlers expands capture
-                        # beyond the 1-cell rail for subsequent MOVE events.
-                        try:
-                            get_app().invalidate()
-                        except Exception:  # noqa: BLE001
-                            pass
                     elif kind == "track":
                         jump_track(event.position.y)
                     return None
@@ -417,29 +411,45 @@ class InteractiveScrollbarMargin(Margin):
 
             return handler
 
-        def drag_capture(event: MouseEvent) -> object:
-            """Full-window capture while thumb-dragging (cursor leaves the rail)."""
-            et = event.event_type
-            if not self._dragging:
-                return NotImplemented
-            if et is MouseEventType.MOUSE_MOVE:
-                apply_thumb_drag(event.position.y)
-                return None
-            if et is MouseEventType.MOUSE_UP:
-                apply_thumb_drag(event.position.y)
-                self._dragging = False
-                return None
+        original_handlers: list[list[Callable[[MouseEvent], object]]] = []
+
+        def capture_or_delegate(event: MouseEvent) -> object:
+            """Capture an active drag; otherwise preserve the cell's real handler."""
+            if self._dragging:
+                et = event.event_type
+                if et is MouseEventType.MOUSE_MOVE:
+                    apply_thumb_drag(event.position.y)
+                    return None
+                if et is MouseEventType.MOUSE_UP:
+                    apply_thumb_drag(event.position.y)
+                    self._dragging = False
+                    return None
+            local_y = int(event.position.y) - ypos
+            local_x = int(event.position.x) - capture_x_min
+            if (
+                0 <= local_y < len(original_handlers)
+                and 0 <= local_x < len(original_handlers[local_y])
+            ):
+                return original_handlers[local_y][local_x](event)
             return NotImplemented
 
-        # While dragging, own the whole window so MOVE/UP still reach us.
-        if self._dragging:
-            mouse_handlers.set_mouse_handler_for_range(
-                x_min=capture_x_min,
-                x_max=capture_x_max,
-                y_min=ypos,
-                y_max=ypos + height,
-                handler=drag_capture,
+        # Install capture on the first paint, before a drag starts. Waiting for
+        # MOUSE_DOWN to invalidate and repaint races with the first MOVE event:
+        # as soon as the pointer leaves the one-cell rail, that MOVE would be
+        # dispatched to the body and the drag would appear completely inert.
+        # Delegation preserves links, selection and wheel handlers while idle.
+        for screen_y in range(ypos, ypos + height):
+            row = mouse_handlers.mouse_handlers[screen_y]
+            original_handlers.append(
+                [row[screen_x] for screen_x in range(capture_x_min, capture_x_max)]
             )
+        mouse_handlers.set_mouse_handler_for_range(
+            x_min=capture_x_min,
+            x_max=capture_x_max,
+            y_min=ypos,
+            y_max=ypos + height,
+            handler=capture_or_delegate,
+        )
 
         # Always wire the 1-cell rail (arrows / track / thumb).
         for row in range(height):
@@ -867,36 +877,20 @@ class CodeDoggyTUI:
             ],
             style="class:root",
         )
-        body_inner = HSplit(
-            [
-                header,
-                separator,
-                self._task_window,
-                turn_status,
-                todo_pane,
-                fleet_pane,
-                Window(height=1, style="class:root"),
-                prompt_box,
-                shortcuts,
-            ],
-            style="class:root",
-        )
-        # Outer breathing room — never paint chrome flush to the terminal edge.
-        # Keep in sync with _EDGE_PAD_X / _EDGE_PAD_Y and _content_width().
-        body = HSplit(
-            [
-                Window(height=_EDGE_PAD_Y, style="class:root"),
-                VSplit(
-                    [
-                        Window(width=_EDGE_PAD_X, style="class:root"),
-                        body_inner,
-                        Window(width=_EDGE_PAD_X, style="class:root"),
-                    ],
-                    style="class:root",
-                ),
-                Window(height=_EDGE_PAD_Y, style="class:root"),
-            ],
-            style="class:root",
+        main_page = ConditionalContainer(
+            HSplit(
+                [
+                    self._task_window,
+                    turn_status,
+                    todo_pane,
+                    fleet_pane,
+                    Window(height=1, style="class:root"),
+                    prompt_box,
+                    shortcuts,
+                ],
+                style="class:root",
+            ),
+            filter=Condition(lambda: not self._detail_page_visible()),
         )
 
         close_control = FormattedTextControl(
@@ -983,10 +977,36 @@ class CodeDoggyTUI:
                 ],
                 style="class:agent-window",
             ),
-            # Agent detail + auth only — questionnaire is a separate float.
-            filter=Condition(
-                lambda: self._modal_open and self._modal_kind in {"agent", "auth"}
-            ),
+            # Detail/auth replace the main page below the persistent app header.
+            # They are not overlays: hidden main chrome must never leak around
+            # the page as disconnected rules or prompt-border fragments.
+            filter=Condition(self._detail_page_visible),
+        )
+        body_inner = HSplit(
+            [
+                header,
+                separator,
+                main_page,
+                modal_content,
+            ],
+            style="class:root",
+        )
+        # Outer breathing room — never paint chrome flush to the terminal edge.
+        # Keep in sync with _EDGE_PAD_X / _EDGE_PAD_Y and _content_width().
+        body = HSplit(
+            [
+                Window(height=_EDGE_PAD_Y, style="class:root"),
+                VSplit(
+                    [
+                        Window(width=_EDGE_PAD_X, style="class:root"),
+                        body_inner,
+                        Window(width=_EDGE_PAD_X, style="class:root"),
+                    ],
+                    style="class:root",
+                ),
+                Window(height=_EDGE_PAD_Y, style="class:root"),
+            ],
+            style="class:root",
         )
         street_hud = ConditionalContainer(
             Window(
@@ -1054,17 +1074,6 @@ class CodeDoggyTUI:
         root = FloatContainer(
             content=body,
             floats=[
-                # Modal first so existing tests and z-order treat it as primary float.
-                # Insets match body pad so detail never kisses the terminal edge.
-                Float(
-                    top=2,
-                    bottom=2,
-                    left=3,
-                    right=3,
-                    content=modal_content,
-                    transparent=False,
-                    z_index=10,
-                ),
                 # FAB: fixed on the viewport over agent detail (scroll-independent).
                 Float(
                     bottom=4,
@@ -5255,6 +5264,12 @@ class CodeDoggyTUI:
         if show_plan:
             return ("message", "tool", "plan")
         return ("message", "tool")
+
+    def _detail_page_visible(self) -> bool:
+        """Whether detail/auth owns the page below the persistent app header."""
+        return bool(
+            self._modal_open and self._modal_kind in {"agent", "auth"}
+        )
 
     def _detail_input_visible(self) -> bool:
         """Show interject/auth paste only when there is something to type for."""
