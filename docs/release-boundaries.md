@@ -56,9 +56,17 @@ CodeDoggy **已交付 / 胶水层 / 延期** 的诚实分界。不要在文档�
 
 ### Plan mode (GrokBuild)
 
+Product policy (agent soft-decide, **not** harness force-every-turn):
+
+- **Engineering work** → model should `enter_plan_mode`, talk normally, write plan file, `exit_plan_mode` → user **a/s/q** → on approve **Auto** implement.
+- **Chat / Q&A** → direct dialogue; no plan mode, no questionnaire required.
+- **`ask_user_question`** is optional multi-choice only — not required to "be in plan."
+- TUI has **no** S-Tab Plan/Auto toggle; mode is tool-driven. Enter-plan host consent is not wired (avoids extra confirm). Exit approval remains.
+- **Plan UX**: detail (计划 tab) is the main review surface; awaiting tasks show a card **批准** CTA (same path as `a`); open-detail defaults to 计划 when drafting/awaiting.
+
 | Area | What ships | Tests |
 |------|------------|-------|
-| **`enter_plan_mode` / `exit_plan_mode`** | Session plan lifecycle (pending/active/exit_pending); host consent + exit approval (TUI a/s/q) | `tests/test_plan_mode.py` |
+| **`enter_plan_mode` / `exit_plan_mode`** | Session plan lifecycle (pending/active/exit_pending); exit approval (TUI a/s/q); no enter-consent strip | `tests/test_plan_mode.py` |
 | **`plan_mode_edit_gate`** | **File edits only** while **Active** — only the plan file may be written; shell/MCP/spawn are **not** plan-gated (same spirit as Grok) | `tests/test_plan_mode.py`, `tests/test_orchestration.py` |
 | **`plan.md` + `plan_mode.json`** | Plan body + lifecycle under `{cwd}/.grok/sessions/{id}/`; restart collapses pending/exit_pending | `tests/test_plan_mode.py` |
 | **Approval re-park** | `awaiting_plan_approval` resume runs host approval before next turn (Grok re-park equivalent) | `tests/test_plan_mode.py` |
@@ -72,7 +80,7 @@ CodeDoggy **已交付 / 胶水层 / 延期** 的诚实分界。不要在文档�
 | **Badge → focus task** | Open todo pane focuses active/latest task card | `tests/test_tui.py` |
 | **Badge Ctrl+left** | Opens MAIN agent **计划** tab + keeps checklist pane | `tests/test_tui.py` |
 | **Task plan_state sync** | Session plan mode mirrors onto active task `planning` / `awaiting_approval` | `tests/test_tui.py` |
-| **Goal ↔ Plan exclusive** | Tab into Plan exits Goal first; Goal clears plan approval chrome; caption prefers live plan_phase | `tests/test_tui.py` |
+| **Goal ↔ Plan exclusive** | Goal clears plan approval chrome; caption prefers live plan_phase; plan enter is tool-driven (no S-Tab) | `tests/test_tui.py` |
 
 ### Incomplete-work / anti early-done
 

@@ -40,11 +40,13 @@ from codedoggy.tools.runtime import (
     ToolId,
 )
 
-# Grok description_template — exact
 _DESC = """\
-Exit plan mode and present your plan to the user.
+Present the plan for user approval and leave plan mode when approved.
 
-Use this after you have finished writing your plan to the plan file in plan mode.
+Use after the plan file is ready. On approval the session enters auto mode so \
+you can implement. If the user wants changes, stay in plan mode and revise. \
+Ordinary conversation in plan mode does not require this tool until the plan \
+is ready to approve.
 """
 
 

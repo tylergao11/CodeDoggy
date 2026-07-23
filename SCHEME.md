@@ -137,6 +137,7 @@ user prompt
 
 - Subagent = 完整子会话，独立 context；回传 summary
 - Plan mode hard gate 独立于 auto-approve（仅 plan 文件可写）
+- Product: 工程任务由模型软识别进 Plan → 正常对话/写 plan → `exit_plan_mode` 审批 → Auto 实现；闲聊直接交流；不强制问卷；无 S-Tab 手切 Plan/Auto
 - Session API: `session.interject`, `enter_plan_mode`, `exit_plan_mode`
 
 ## Context

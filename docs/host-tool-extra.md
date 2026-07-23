@@ -71,8 +71,8 @@ Host or session UI injects these. Refresh **preserves** them.
 | `skills_registry` / `skill_paths` | `list[SkillInfo\|dict]` 或额外目录 | `skill` tool；否则扫 `.codedoggy/skills` |
 | `native_tool_correction` | bool（默认 true） | `use_tool` 原生工具纠错 |
 | `ask_user_fn` | `fn(list[question_dict])` → answers | `ask_user_question` |
-| `plan_mode_consent_fn` | `fn() -> bool` | `enter_plan_mode` (decline → soft string) |
-| `plan_mode_exit_fn` | host outcome hook | `exit_plan_mode` |
+| `plan_mode_consent_fn` | `fn() -> bool` (optional) | `enter_plan_mode` only if host wants enter confirm; TUI product default **omits** it so enter is not blocked |
+| `plan_mode_exit_fn` | host outcome hook | `exit_plan_mode` (approval a/s/q; required for interactive approve UX) |
 | `plan_file_path` / `plan_tool_hints` | plan path + tool name hints | enter/exit plan |
 | `goal_ack_fn` | harness ack for `update_goal` | optional; else local ack |
 | `shell_state` | cwd + env overlays across `run_terminal_command` | shell tools |

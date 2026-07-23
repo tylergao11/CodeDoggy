@@ -225,17 +225,56 @@ def open_local_path(
     *,
     cwd: str | Path | None = None,
 ) -> tuple[bool, str]:
-    """Open with the OS default app. Returns (ok, message)."""
+    """Open with the OS default app without sharing the TUI terminal.
+
+    GUI launchers may attach their stdout/stderr to the parent console even
+    when invoked through ``os.startfile``.  In a full-screen prompt_toolkit
+    application that writes straight through the alternate screen and corrupts
+    the detail view.  Always launch through a detached, silenced helper.
+    """
     resolved = resolve_openable_path(path, cwd=cwd)
     if resolved is None:
         return False, f"文件不存在: {path}"
     try:
         if sys.platform == "win32":
-            os.startfile(str(resolved))  # type: ignore[attr-defined]
+            system_root = Path(os.environ.get("SystemRoot", r"C:\Windows"))
+            helper = system_root / "System32" / "rundll32.exe"
+            if not helper.is_file():
+                raise OSError(f"系统打开器不存在: {helper}")
+            creationflags = (
+                getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            )
+            subprocess.Popen(  # noqa: S603
+                [
+                    str(helper),
+                    "url.dll,FileProtocolHandler",
+                    str(resolved),
+                ],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                close_fds=True,
+                creationflags=creationflags,
+            )
         elif sys.platform == "darwin":
-            subprocess.Popen(["open", str(resolved)])  # noqa: S603
+            subprocess.Popen(  # noqa: S603
+                ["open", str(resolved)],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                close_fds=True,
+                start_new_session=True,
+            )
         else:
-            subprocess.Popen(["xdg-open", str(resolved)])  # noqa: S603
+            subprocess.Popen(  # noqa: S603
+                ["xdg-open", str(resolved)],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                close_fds=True,
+                start_new_session=True,
+            )
         if is_image_path(str(resolved)):
             return True, f"已打开 {VIEW_IMAGE_LABEL} · {resolved.name}"
         return True, f"已打开 {resolved.name}"

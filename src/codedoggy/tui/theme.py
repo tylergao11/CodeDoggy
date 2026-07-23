@@ -6,10 +6,12 @@ CodeDoggy only controls ANSI style tokens below.
 Inventory (class → role)
 ------------------------
 Chrome
-  root, header, brand, brand.edge.pink, header.rule.dim, meta, separator
+  root, header, brand, header.rule.dim, meta, separator
 Tasks
   task.marker[.active|.selected|.idle]
   task.title, task.status[.running|.reporting|.completed|.failed], task.interject
+  task.plan.approve — card 批准 CTA
+  plan.status.{draft,review,actions,approved,abandoned} — detail plan strip
 Prompt / input
   input, input.placeholder, prompt, prompt.border[.focus], prompt.caption
   turn.status, turn.elapsed, turn.stop
@@ -24,7 +26,6 @@ Shortcuts
   shortcut.key, shortcut.label, shortcut.separator, shortcut.pending
 Agent modal
   agent-window[.header|.close|.hint]
-  modal.border[.left|.right|.dim]
   detail.input[.prompt]
 Ask questionnaire
   ask.dialog, ask.border, ask.header, ask.question, ask.meta
@@ -39,11 +40,11 @@ Detail transcript (agent_detail)
   detail.{header,meta,active,separator,text,actor*}
   detail.{tool,block,code*,diff*,success,error,warning,link*}
   detail.md.{ol,ul,h1,h2,h3,quote,inline,bold,italic,strike}
-  detail.thinking.{header,rail,body,meta}
+  detail.thinking.{rail,body}
 
-``fresh`` (default): GrokBuild / GrokNight spirit — neutral pure-black canvas,
-soft body text (neither dim nor harsh white), muted mauve only as a light
-accent. No ink-blue base, no neon pink/cyan chrome.
+``fresh`` (default): neutral high-contrast canvas, bright readable prose,
+quiet surfaces, and one restrained rose accent.  Hierarchy comes from
+contrast and spacing rather than blue-gray text or decorative borders.
 ``groknight``: denser legacy TokyoNight-on-gray look (still available via env).
 """
 
@@ -63,12 +64,15 @@ _DETAIL_GROKNIGHT: dict[str, str] = {
     "detail.meta": "bg:#141414 #6c6c6c",
     "detail.active": "bg:#141414 #e1e1e1",
     "detail.separator": "bg:#141414 #2a2a2a",
+    "detail.tab": "bg:#141414 #6c6c6c",
+    "detail.tab.active": "bg:#222222 #e1e1e1 bold",
     "detail.text": "bg:#141414 #d6d6d6",
     "detail.actor": "bg:#141414 #9a9a9a",
     "detail.actor.user": "bg:#141414 #9a9a9a",
     "detail.actor.assistant": "bg:#141414 #e0b0c4",
     "detail.actor.tool": "bg:#141414 #6c6c6c",
     "detail.tool": "bg:#141414 #8a9bb3",
+    "detail.tool.link": "bg:#141414 #aab9c9 underline",
     "detail.block": "bg:#1a1a1a #c8c8c8",
     "detail.code": "bg:#1a1a1a #c8c8c8",
     "detail.code.rail": "bg:#1a1a1a #3a3a3a",
@@ -88,10 +92,16 @@ _DETAIL_GROKNIGHT: dict[str, str] = {
     "detail.diff.gutter": "bg:#1a1a1a #6c6c6c",
     "detail.success": "bg:#1a1a1a #8fad7a",
     "detail.error": "bg:#1a1a1a #c97b84",
+    "detail.error.link": "bg:#1a1a1a #d9919a underline",
     "detail.warning": "bg:#1a1a1a #b8a078",
     "detail.link": "bg:#141414 #8a9bb3 underline",
     "detail.link.hint": "bg:#141414 #7a7a7a",
-    "detail.fold.active": "bg:#141414 #c0c0c0",
+    "detail.fold.collapsed": "bg:#141414 #9aa8b8",
+    "detail.fold.collapsed.link": "bg:#141414 #afbdcc underline",
+    "detail.fold.expanded": "bg:#141414 #e0b0c4 bold",
+    "detail.fold.expanded.link": "bg:#141414 #efc3d5 bold underline",
+    "detail.fold.footer": "bg:#141414 #9aa8b8",
+    "detail.tool.section": "bg:#141414 #b8c2ce bold",
     "detail.md.ol": "bg:#141414 #9a9a9a",
     "detail.md.ul": "bg:#141414 #6c6c6c",
     "detail.md.h1": "bg:#141414 #e0e0e0 bold",
@@ -103,70 +113,95 @@ _DETAIL_GROKNIGHT: dict[str, str] = {
     "detail.md.italic": "bg:#141414 #c8c8c8 italic",
     "detail.md.strike": "bg:#141414 #6c6c6c strike",
     # Thinking: dim header, readable mid-gray body (Grok header_bright=false).
-    "detail.thinking.header": "bg:#141414 #7a7a7a",
     "detail.thinking.rail": "bg:#141414 #333333",
     "detail.thinking.body": "bg:#141414 #a0a0a0",
-    "detail.thinking.meta": "bg:#141414 #5a5a5a",
     "detail.actor.think": "bg:#141414 #7a7a7a",
     "detail.jump.fab": "bg:#2a2a2a #d0d0d0 bold",
 }
 
-# GrokBuild / GrokNight spirit — pure black canvas, soft text, quiet accents.
-# No ink-blue (#14131a) base; no neon pink/cyan chrome.
+# ``fresh`` has one palette shared by chrome, transcript and plan rendering.
+# Keeping the values here prevents each surface from inventing a slightly
+# different dark blue/gray hierarchy.
+_FRESH_CANVAS = "#0f0f0f"
+_FRESH_SURFACE = "#171717"
+_FRESH_SURFACE_ACTIVE = "#1d1d1d"
+_FRESH_SURFACE_SELECTED = "#242424"
+_FRESH_CODE = "#1b1b1b"
+_FRESH_TEXT = "#f2f2f2"
+_FRESH_BODY = "#dedede"
+_FRESH_SECONDARY = "#b8b8b8"
+_FRESH_MUTED = "#8b8b8b"
+_FRESH_DIM = "#626262"
+_FRESH_LINE = "#303030"
+_FRESH_ACCENT = "#e7b4c8"
+_FRESH_LINK = "#edb7cc"
+_FRESH_OK = "#8fcf9d"
+_FRESH_GOLD = "#e1c077"
+_FRESH_ERROR = "#ea929c"
+_FRESH_INFO = "#b8b8b8"
+
+
 _DETAIL_FRESH: dict[str, str] = {
-    "detail.header": "bg:#0c0c0c #d0d0d0",
-    "detail.meta": "bg:#0c0c0c #737373",
-    "detail.active": "bg:#0c0c0c #e2e2e2",
-    "detail.separator": "bg:#0c0c0c #2e2e2e",
-    # Body: soft off-white — readable for long prose, not pure #fff glare.
-    "detail.text": "bg:#0c0c0c #d4d4d4",
-    "detail.actor": "bg:#0c0c0c #8a8a8a",
-    "detail.actor.user": "bg:#0c0c0c #8a8a8a",
-    # Assistant stamp: brighter soft pink (readable, not neon).
-    "detail.actor.assistant": "bg:#0c0c0c #e0b0c4",
-    "detail.actor.tool": "bg:#0c0c0c #6e6e6e",
-    "detail.tool": "bg:#0c0c0c #8a8a8a",
-    "detail.block": "bg:#141414 #cfcfcf",
-    "detail.code": "bg:#141414 #cfcfcf",
-    "detail.code.rail": "bg:#141414 #333333",
-    "detail.code.gutter": "bg:#141414 #5a5a5a",
-    "detail.code.gutter.mark": "bg:#141414 #737373",
-    "detail.code.gutter.sep": "bg:#141414 #242424",
-    "detail.code.meta": "bg:#0c0c0c #737373",
-    "detail.code.kw": "bg:#141414 #e0b0c4",
-    "detail.code.str": "bg:#141414 #8fad7a",
-    "detail.code.cmt": "bg:#141414 #6e6e6e italic",
-    "detail.code.num": "bg:#141414 #b8a078",
-    "detail.code.sym": "bg:#141414 #8a9bb3",
-    "detail.code.plain": "bg:#141414 #d4d4d4",
-    "detail.diff.add": "bg:#0f1810 #8fad7a",
-    "detail.diff.remove": "bg:#1c1012 #c97b84",
-    "detail.diff.hunk": "bg:#141414 #b8a078",
-    "detail.diff.gutter": "bg:#141414 #737373",
-    "detail.success": "bg:#141414 #8fad7a",
-    "detail.error": "bg:#141414 #c97b84",
-    "detail.warning": "bg:#141414 #b8a078",
-    "detail.link": "bg:#0c0c0c #8a9bb3 underline",
-    "detail.link.hint": "bg:#0c0c0c #737373",
-    "detail.fold.active": "bg:#0c0c0c #c0c0c0",
-    "detail.md.ol": "bg:#0c0c0c #8a8a8a",
-    "detail.md.ul": "bg:#0c0c0c #737373",
-    # Headings: same family as body, one step brighter — no rainbow hierarchy.
-    "detail.md.h1": "bg:#0c0c0c #e2e2e2",
-    "detail.md.h2": "bg:#0c0c0c #dcdcdc",
-    "detail.md.h3": "bg:#0c0c0c #d0d0d0",
-    "detail.md.quote": "bg:#0c0c0c #737373 italic",
-    "detail.md.inline": "bg:#141414 #8a9bb3",
-    "detail.md.bold": "bg:#0c0c0c #e2e2e2",
-    "detail.md.italic": "bg:#0c0c0c #c8c8c8 italic",
-    "detail.md.strike": "bg:#0c0c0c #737373 strike",
-    # Thinking: dim header + mid-gray body (secondary to answer prose).
-    "detail.thinking.header": "bg:#0c0c0c #6e6e6e",
-    "detail.thinking.rail": "bg:#0c0c0c #2e2e2e",
-    "detail.thinking.body": "bg:#0c0c0c #9a9a9a",
-    "detail.thinking.meta": "bg:#0c0c0c #5a5a5a",
-    "detail.actor.think": "bg:#0c0c0c #6e6e6e",
-    "detail.jump.fab": "bg:#222222 #d0d0d0",
+    "detail.header": f"bg:{_FRESH_SURFACE} {_FRESH_TEXT}",
+    "detail.meta": f"bg:{_FRESH_SURFACE} {_FRESH_MUTED}",
+    "detail.active": f"bg:{_FRESH_SURFACE} {_FRESH_TEXT} bold",
+    "detail.separator": f"bg:{_FRESH_SURFACE} {_FRESH_LINE}",
+    "detail.tab": f"bg:{_FRESH_SURFACE} {_FRESH_MUTED}",
+    "detail.tab.active": f"bg:{_FRESH_SURFACE_SELECTED} {_FRESH_TEXT} bold",
+    "detail.text": f"bg:{_FRESH_SURFACE} {_FRESH_BODY}",
+    "detail.actor": f"bg:{_FRESH_SURFACE} {_FRESH_SECONDARY}",
+    "detail.actor.user": f"bg:{_FRESH_SURFACE} {_FRESH_SECONDARY}",
+    "detail.actor.assistant": f"bg:{_FRESH_SURFACE} {_FRESH_ACCENT}",
+    "detail.actor.tool": f"bg:{_FRESH_SURFACE} {_FRESH_MUTED}",
+    "detail.tool": f"bg:{_FRESH_SURFACE} {_FRESH_SECONDARY}",
+    "detail.tool.link": f"bg:{_FRESH_SURFACE} {_FRESH_LINK} underline",
+    "detail.block": f"bg:{_FRESH_CODE} {_FRESH_BODY}",
+    "detail.code": f"bg:{_FRESH_CODE} {_FRESH_BODY}",
+    "detail.code.rail": f"bg:{_FRESH_CODE} {_FRESH_LINE}",
+    "detail.code.gutter": f"bg:{_FRESH_CODE} {_FRESH_MUTED}",
+    "detail.code.gutter.mark": f"bg:{_FRESH_CODE} {_FRESH_SECONDARY}",
+    "detail.code.gutter.sep": f"bg:{_FRESH_CODE} {_FRESH_LINE}",
+    "detail.code.meta": f"bg:{_FRESH_SURFACE} {_FRESH_MUTED}",
+    "detail.code.kw": f"bg:{_FRESH_CODE} {_FRESH_ACCENT}",
+    "detail.code.str": f"bg:{_FRESH_CODE} {_FRESH_OK}",
+    "detail.code.cmt": f"bg:{_FRESH_CODE} {_FRESH_MUTED} italic",
+    "detail.code.num": f"bg:{_FRESH_CODE} {_FRESH_GOLD}",
+    "detail.code.sym": f"bg:{_FRESH_CODE} {_FRESH_SECONDARY}",
+    "detail.code.plain": f"bg:{_FRESH_CODE} {_FRESH_BODY}",
+    "detail.diff.add": f"bg:#132018 {_FRESH_OK}",
+    "detail.diff.remove": f"bg:#241417 {_FRESH_ERROR}",
+    "detail.diff.hunk": f"bg:{_FRESH_CODE} {_FRESH_GOLD}",
+    "detail.diff.gutter": f"bg:{_FRESH_CODE} {_FRESH_MUTED}",
+    "detail.success": f"bg:{_FRESH_CODE} {_FRESH_OK}",
+    "detail.error": f"bg:{_FRESH_CODE} {_FRESH_ERROR}",
+    "detail.error.link": f"bg:{_FRESH_CODE} {_FRESH_ERROR} underline",
+    "detail.warning": f"bg:{_FRESH_CODE} {_FRESH_GOLD}",
+    "detail.link": f"bg:{_FRESH_SURFACE} {_FRESH_LINK} underline",
+    "detail.link.hint": f"bg:{_FRESH_SURFACE} {_FRESH_MUTED}",
+    "detail.fold.collapsed": f"bg:{_FRESH_SURFACE} {_FRESH_SECONDARY}",
+    "detail.fold.collapsed.link": (
+        f"bg:{_FRESH_SURFACE} {_FRESH_LINK} underline"
+    ),
+    "detail.fold.expanded": f"bg:{_FRESH_SURFACE} {_FRESH_TEXT} bold",
+    "detail.fold.expanded.link": (
+        f"bg:{_FRESH_SURFACE} {_FRESH_LINK} bold underline"
+    ),
+    "detail.fold.footer": f"bg:{_FRESH_SURFACE} {_FRESH_MUTED}",
+    "detail.tool.section": f"bg:{_FRESH_SURFACE} {_FRESH_SECONDARY} bold",
+    "detail.md.ol": f"bg:{_FRESH_SURFACE} {_FRESH_SECONDARY}",
+    "detail.md.ul": f"bg:{_FRESH_SURFACE} {_FRESH_MUTED}",
+    "detail.md.h1": f"bg:{_FRESH_SURFACE} {_FRESH_TEXT} bold",
+    "detail.md.h2": f"bg:{_FRESH_SURFACE} {_FRESH_TEXT} bold",
+    "detail.md.h3": f"bg:{_FRESH_SURFACE} {_FRESH_BODY} bold",
+    "detail.md.quote": f"bg:{_FRESH_SURFACE} {_FRESH_SECONDARY} italic",
+    "detail.md.inline": f"bg:{_FRESH_CODE} {_FRESH_BODY}",
+    "detail.md.bold": f"bg:{_FRESH_SURFACE} {_FRESH_TEXT} bold",
+    "detail.md.italic": f"bg:{_FRESH_SURFACE} {_FRESH_BODY} italic",
+    "detail.md.strike": f"bg:{_FRESH_SURFACE} {_FRESH_MUTED} strike",
+    "detail.thinking.rail": f"bg:{_FRESH_SURFACE} {_FRESH_LINE}",
+    "detail.thinking.body": f"bg:{_FRESH_SURFACE} {_FRESH_SECONDARY}",
+    "detail.actor.think": f"bg:{_FRESH_SURFACE} {_FRESH_MUTED}",
+    "detail.jump.fab": f"bg:{_FRESH_SURFACE_SELECTED} {_FRESH_TEXT} bold",
 }
 
 
@@ -176,16 +211,12 @@ def _chrome_groknight() -> dict[str, str]:
         "root": "bg:#141414 #d6d6d6",
         "header": "bg:#141414 #9a9a9a",
         "brand": "#e0b0c4",
-        "brand.edge.pink": "#c498b0",
         "header.rule.dim": "#2a2a2a",
         "meta": "#6c6c6c",
         "separator": "#2a2a2a",
         "task.card": "bg:#141414 #d6d6d6",
         "task.card.active": "bg:#1a1a1a #d6d6d6",
         "task.card.selected": "bg:#1c1c1c #e0e0e0",
-        "task.card.border": "bg:#141414 #2e2e2e",
-        "task.card.border.active": "bg:#1a1a1a #6e6e6e",
-        "task.card.border.selected": "bg:#1c1c1c #e0b0c4",
         "task.marker.active": "#b0b0b0",
         "task.marker.selected": "#e0b0c4",
         "task.marker.idle": "#3a3a3a",
@@ -197,10 +228,37 @@ def _chrome_groknight() -> dict[str, str]:
         "task.status.reporting": "#9a9a9a",
         "task.status.completed": "#6c6c6c",
         "task.status.failed": "#c97b84",
+        "task.plan.approve": "bg:#2a2228 #e0b0c4 bold",
+        "plan.surface": "bg:#101010 #d8d8d8",
+        "plan.chrome": "bg:#151515 #d8d8d8",
+        "plan.body": "bg:#101010 #d8d8d8",
+        "plan.meta": "bg:#151515 #939393",
+        "plan.empty": "bg:#151515 #a0a0a0 italic",
+        "plan.status.draft": "bg:#151515 #cfb681 bold",
+        "plan.status.review": "bg:#151515 #efbfd2 bold",
+        "plan.status.actions": "bg:#151515 #c0c0c0",
+        "plan.status.approved": "bg:#151515 #9fc48e bold",
+        "plan.status.abandoned": "bg:#151515 #939393",
+        "plan.action.approve": "bg:#1b2a1e #a9ce97 bold",
+        "plan.action.revise": "bg:#2b251a #d7bd88 bold",
+        "plan.action.abandon": "bg:#2d1c20 #df9aa3 bold",
+        "plan.marker": "bg:#101010 #9eabc0 bold",
+        "plan.heading.h1": "bg:#101010 #f0d4e0 bold",
+        "plan.heading.h2": "bg:#101010 #e1e1e1 bold",
+        "plan.heading.h3": "bg:#101010 #cfcfcf bold",
+        "plan.quote.marker": "bg:#101010 #777777",
+        "plan.quote": "bg:#101010 #aaaaaa italic",
+        "plan.rule": "bg:#101010 #3d3d3d",
+        "plan.code": "bg:#191919 #d6d6d6",
+        "plan.code.fence": "bg:#191919 #888888",
+        "plan.code.inline": "bg:#1d1d1d #cbd6e3",
+        "plan.link": "bg:#101010 #a7bfda underline",
+        "plan.strong": "bg:#101010 #eeeeee bold",
+        "plan.checkbox.pending": "bg:#101010 #d0b47d",
+        "plan.checkbox.done": "bg:#101010 #9bc18a",
         "task.agent": "#6c6c6c",
         "task.agent.running": "#a8a8a8",
         "task.agent.selected": "#e0b0c4",
-        "agent.border": "#3a3a3a",
         "report": "#a8a8a8",
         "report.active": "#b0b0b0",
         "report.selected": "#b0b0b0",
@@ -223,7 +281,6 @@ def _chrome_groknight() -> dict[str, str]:
         "todo.badge.open": "bg:#141414 #b8a078",
         "todo.pane": "bg:#141414 #c8c8c8",
         "todo.pane.title": "bg:#141414 #b8a078",
-        "todo.pane.border": "bg:#141414 #2e2e2e",
         "todo.item.pending": "bg:#141414 #6c6c6c",
         "todo.item.progress": "bg:#141414 #b8a078",
         "todo.item.done": "bg:#141414 #8fad7a",
@@ -232,7 +289,6 @@ def _chrome_groknight() -> dict[str, str]:
         "fleet.badge.open": "bg:#141414 #a8a8a8",
         "fleet.pane": "bg:#141414 #c8c8c8",
         "fleet.pane.title": "bg:#141414 #a8a8a8",
-        "fleet.pane.border": "bg:#141414 #2e2e2e",
         "fleet.pane.meta": "bg:#141414 #6c6c6c",
         "fleet.item": "bg:#141414 #6c6c6c",
         "fleet.item.running": "bg:#141414 #a8a8a8",
@@ -254,11 +310,9 @@ def _chrome_groknight() -> dict[str, str]:
         "ask.option.selected": "bg:#222222 #b8a078 bold",
         "ask.option.desc": "bg:#1a1a1a #6c6c6c",
         "ask.hint": "bg:#1a1a1a #6c6c6c",
-        "modal.border.left": "bg:#141414 #2e2e2e",
-        "modal.border.right": "bg:#141414 #2e2e2e",
-        "modal.border.dim": "bg:#141414 #2a2a2a",
         "detail.input": "bg:#111111 #d6d6d6",
         "detail.input.prompt": "bg:#111111 #b8a078",
+        "detail.input.placeholder": "bg:#111111 #6c6c6c",
         "auth.item": "bg:#141414 #6c6c6c",
         "auth.item.selected": "bg:#141414 #c0c0c0",
         "auth.item.active": "bg:#141414 #b8a078",
@@ -281,64 +335,85 @@ def _chrome_groknight() -> dict[str, str]:
 
 
 def _chrome_fresh() -> dict[str, str]:
-    """GrokBuild black chrome — pure neutral base, soft text, quiet accents."""
-    # Shared tokens (must match _DETAIL_FRESH canvas/body).
-    bg = "#0c0c0c"
-    bg_lift = "#161616"
-    bg_active = "#121212"
-    text = "#d4d4d4"
-    muted = "#737373"
-    dim = "#555555"
-    line = "#2e2e2e"
-    # Soft pink brand — a step brighter in detail/chrome for legibility.
-    brand = "#e0b0c4"
-    brand_dim = "#c498b0"
-    # Neutral steel for "live" state — replaces loud cyan.
-    accent = "#a8a8a8"
-    warn = "#c97b84"
-    ok = "#8fad7a"
-    gold = "#b8a078"
-    info = "#8a9bb3"
+    """Neutral high-contrast chrome backed by the shared fresh palette."""
+    bg = _FRESH_CANVAS
+    surface = _FRESH_SURFACE
+    active = _FRESH_SURFACE_ACTIVE
+    selected = _FRESH_SURFACE_SELECTED
+    text = _FRESH_TEXT
+    body = _FRESH_BODY
+    secondary = _FRESH_SECONDARY
+    muted = _FRESH_MUTED
+    dim = _FRESH_DIM
+    line = _FRESH_LINE
+    brand = _FRESH_ACCENT
+    link = _FRESH_LINK
+    warn = _FRESH_ERROR
+    ok = _FRESH_OK
+    gold = _FRESH_GOLD
+    info = _FRESH_INFO
     return {
-        "root": f"bg:{bg} {text}",
-        "header": f"bg:{bg} {muted}",
-        "brand": brand,
-        "brand.edge.pink": brand_dim,
+        "root": f"bg:{bg} {body}",
+        "header": f"bg:{bg} {secondary}",
+        "brand": f"{brand} bold",
         "header.rule.dim": line,
         "meta": muted,
         "separator": line,
-        # Pseudo-card surfaces (whole-row bg fill).
-        "task.card": f"bg:{bg} {text}",
-        "task.card.active": f"bg:{bg_active} {text}",
-        "task.card.selected": f"bg:{bg_lift} {text}",
-        "task.card.border": f"bg:{bg} {line}",
-        "task.card.border.active": f"bg:{bg_active} {dim}",
-        "task.card.border.selected": f"bg:{bg_lift} {brand_dim}",
-        "task.marker.active": accent,
+        "task.card": f"bg:{bg} {body}",
+        "task.card.active": f"bg:{active} {body}",
+        "task.card.selected": f"bg:{selected} {text}",
+        "task.marker.active": secondary,
         "task.marker.selected": brand,
         "task.marker.idle": dim,
-        "task.title": f"bg:{bg} {text}",
-        "task.title.active": f"bg:{bg_active} {text}",
-        "task.title.selected": f"bg:{bg_lift} {text}",
+        "task.title": f"bg:{bg} {body}",
+        "task.title.active": f"bg:{active} {text}",
+        "task.title.selected": f"bg:{selected} {text} bold",
         "task.status": muted,
         "task.status.running": brand,
-        "task.status.reporting": accent,
+        "task.status.reporting": secondary,
         "task.status.completed": muted,
         "task.status.failed": warn,
+        "task.plan.approve": f"bg:{selected} {ok} bold",
+        "plan.surface": f"bg:{surface} {body}",
+        "plan.chrome": f"bg:{surface} {body}",
+        "plan.body": f"bg:{surface} {body}",
+        "plan.meta": f"bg:{surface} {muted}",
+        "plan.empty": f"bg:{surface} {secondary} italic",
+        "plan.status.draft": f"bg:{surface} {gold} bold",
+        "plan.status.review": f"bg:{surface} {brand} bold",
+        "plan.status.actions": f"bg:{surface} {secondary}",
+        "plan.status.approved": f"bg:{surface} {ok} bold",
+        "plan.status.abandoned": f"bg:{surface} {muted}",
+        "plan.action.approve": f"bg:#1b2a1e {ok} bold",
+        "plan.action.revise": f"bg:#2b251a {gold} bold",
+        "plan.action.abandon": f"bg:#2d1c20 {warn} bold",
+        "plan.marker": f"bg:{surface} {brand} bold",
+        "plan.heading.h1": f"bg:{surface} {text} bold",
+        "plan.heading.h2": f"bg:{surface} {text} bold",
+        "plan.heading.h3": f"bg:{surface} {body} bold",
+        "plan.quote.marker": f"bg:{surface} {dim}",
+        "plan.quote": f"bg:{surface} {secondary} italic",
+        "plan.rule": f"bg:{surface} {line}",
+        "plan.code": f"bg:{_FRESH_CODE} {body}",
+        "plan.code.fence": f"bg:{_FRESH_CODE} {muted}",
+        "plan.code.inline": f"bg:{_FRESH_CODE} {body}",
+        "plan.link": f"bg:{surface} {link} underline",
+        "plan.strong": f"bg:{surface} {text} bold",
+        "plan.checkbox.pending": f"bg:{surface} {gold}",
+        "plan.checkbox.done": f"bg:{surface} {ok}",
         "task.agent": muted,
-        "task.agent.running": accent,
+        "task.agent.running": secondary,
         "task.agent.selected": brand,
-        "agent.border": dim,
-        "report": f"bg:{bg} {muted}",
-        "report.active": f"bg:{bg_active} {muted}",
-        "report.selected": f"bg:{bg_lift} {muted}",
-        "report.stream": f"bg:{bg_active} {text}",
-        "report.stream.selected": f"bg:{bg_lift} {text}",
-        "input": f"bg:{bg_lift} {text}",
-        "input.placeholder": f"bg:{bg_lift} {dim}",
-        "prompt": f"bg:{bg_lift} {gold}",
+        "report": f"bg:{bg} {secondary}",
+        "report.active": f"bg:{active} {secondary}",
+        "report.selected": f"bg:{selected} {secondary}",
+        "report.stream": f"bg:{active} {body}",
+        "report.stream.selected": f"bg:{selected} {body}",
+        "input": f"bg:{surface} {text}",
+        "input.placeholder": f"bg:{surface} {muted}",
+        "prompt": f"bg:{surface} {brand}",
         "prompt.border": f"bg:{bg} {line}",
-        "prompt.border.focus": f"bg:{bg} {brand_dim}",
+        "prompt.border.focus": f"bg:{bg} {secondary}",
         "prompt.caption": f"bg:{bg} {muted}",
         "turn.status": f"bg:{bg} {brand}",
         "turn.elapsed": f"bg:{bg} {muted}",
@@ -349,62 +424,58 @@ def _chrome_fresh() -> dict[str, str]:
         "feedback.warning": f"bg:{bg} {warn}",
         "todo.badge": f"bg:{bg} {muted}",
         "todo.badge.open": f"bg:{bg} {gold}",
-        "todo.pane": f"bg:{bg} {text}",
-        "todo.pane.title": f"bg:{bg} {muted}",
-        "todo.pane.border": f"bg:{bg} {line}",
-        "todo.item.pending": f"bg:{bg} {muted}",
-        "todo.item.progress": f"bg:{bg} {gold}",
-        "todo.item.done": f"bg:{bg} {ok}",
-        "todo.item.cancelled": f"bg:{bg} {dim}",
+        "todo.pane": f"bg:{surface} {body}",
+        "todo.pane.title": f"bg:{surface} {text} bold",
+        "todo.item.pending": f"bg:{surface} {secondary}",
+        "todo.item.progress": f"bg:{surface} {gold}",
+        "todo.item.done": f"bg:{surface} {ok}",
+        "todo.item.cancelled": f"bg:{surface} {muted}",
         "fleet.badge": f"bg:{bg} {muted}",
-        "fleet.badge.open": f"bg:{bg} {accent}",
-        "fleet.pane": f"bg:{bg} {text}",
-        "fleet.pane.title": f"bg:{bg} {muted}",
-        "fleet.pane.border": f"bg:{bg} {line}",
-        "fleet.pane.meta": f"bg:{bg} {muted}",
-        "fleet.item": f"bg:{bg} {muted}",
-        "fleet.item.running": f"bg:{bg} {accent}",
-        "fleet.item.selected": f"bg:{bg} {brand}",
-        "shortcut.key": f"bg:{bg} {text}",
+        "fleet.badge.open": f"bg:{bg} {secondary}",
+        "fleet.pane": f"bg:{surface} {body}",
+        "fleet.pane.title": f"bg:{surface} {text} bold",
+        "fleet.pane.meta": f"bg:{surface} {muted}",
+        "fleet.item": f"bg:{surface} {secondary}",
+        "fleet.item.running": f"bg:{surface} {body}",
+        "fleet.item.selected": f"bg:{selected} {text} bold",
+        "shortcut.key": f"bg:{bg} {secondary} bold",
         "shortcut.label": f"bg:{bg} {muted}",
         "shortcut.separator": f"bg:{bg} {line}",
         "shortcut.pending": f"bg:{bg} {gold}",
-        "agent-window": f"bg:{bg} {text}",
-        "agent-window.header": f"bg:{bg} {brand}",
-        "agent-window.close": f"bg:{bg_lift} {warn}",
-        "agent-window.hint": f"bg:{bg} {muted}",
-        "ask.dialog": f"bg:{bg_lift} {text}",
-        "ask.border": f"bg:{bg_lift} {gold}",
-        "ask.header": f"bg:{bg_lift} {gold}",
-        "ask.question": f"bg:{bg_lift} {text}",
-        "ask.meta": f"bg:{bg_lift} {muted}",
-        "ask.option": f"bg:{bg_lift} {text}",
-        "ask.option.selected": f"bg:{bg} {gold}",
-        "ask.option.desc": f"bg:{bg_lift} {muted}",
-        "ask.hint": f"bg:{bg_lift} {muted}",
-        "modal.border.left": f"bg:{bg} {line}",
-        "modal.border.right": f"bg:{bg} {line}",
-        "modal.border.dim": f"bg:{bg} {line}",
-        "detail.input": f"bg:{bg_lift} {text}",
-        "detail.input.prompt": f"bg:{bg_lift} {gold}",
-        "auth.item": f"bg:{bg} {muted}",
-        "auth.item.selected": f"bg:{bg} {accent}",
-        "auth.item.active": f"bg:{bg} {gold}",
-        "auth.item.logged": f"bg:{bg} {text}",
-        "auth.item.muted": f"bg:{bg} {dim}",
-        "auth.hint": f"bg:{bg} {muted}",
-        "auth.note": f"bg:{bg} {muted}",
-        "hud.title": f"fg:{brand} bg:#000000",
-        "hud.ok": f"fg:{ok} bg:#000000",
-        "hud.warn": f"fg:{warn} bg:#000000",
-        "hud.cyan": f"fg:{info} bg:#000000",
-        "hud.dim": f"fg:{dim} bg:#000000",
-        "hud.bg": "bg:#000000",
-        "scrollbar.background": f"bg:#000000 {line}",
-        "scrollbar.start": f"bg:#000000 {line}",
-        "scrollbar.button": f"bg:{dim} {muted}",
-        "scrollbar.end": f"bg:{dim} {muted}",
-        "scrollbar.arrow": f"bg:#000000 {line}",
+        "agent-window": f"bg:{surface} {body}",
+        "agent-window.header": f"bg:{surface} {text} bold",
+        "agent-window.close": f"bg:{surface} {muted}",
+        "agent-window.hint": f"bg:{surface} {muted}",
+        "ask.dialog": f"bg:{surface} {body}",
+        "ask.border": f"bg:{surface} {line}",
+        "ask.header": f"bg:{surface} {text} bold",
+        "ask.question": f"bg:{surface} {text}",
+        "ask.meta": f"bg:{surface} {muted}",
+        "ask.option": f"bg:{surface} {body}",
+        "ask.option.selected": f"bg:{selected} {text} bold",
+        "ask.option.desc": f"bg:{surface} {secondary}",
+        "ask.hint": f"bg:{surface} {muted}",
+        "detail.input": f"bg:{selected} {text}",
+        "detail.input.prompt": f"bg:{selected} {brand}",
+        "detail.input.placeholder": f"bg:{selected} {muted}",
+        "auth.item": f"bg:{surface} {secondary}",
+        "auth.item.selected": f"bg:{selected} {text} bold",
+        "auth.item.active": f"bg:{surface} {gold}",
+        "auth.item.logged": f"bg:{surface} {body}",
+        "auth.item.muted": f"bg:{surface} {muted}",
+        "auth.hint": f"bg:{surface} {muted}",
+        "auth.note": f"bg:{surface} {secondary}",
+        "hud.title": f"fg:{text} bg:{surface}",
+        "hud.ok": f"fg:{ok} bg:{surface}",
+        "hud.warn": f"fg:{warn} bg:{surface}",
+        "hud.cyan": f"fg:{info} bg:{surface}",
+        "hud.dim": f"fg:{muted} bg:{surface}",
+        "hud.bg": f"bg:{surface}",
+        "scrollbar.background": f"bg:{surface} {line}",
+        "scrollbar.start": f"bg:{surface} {line}",
+        "scrollbar.button": f"bg:{dim} {secondary}",
+        "scrollbar.end": f"bg:{dim} {secondary}",
+        "scrollbar.arrow": f"bg:{surface} {line}",
     }
 
 

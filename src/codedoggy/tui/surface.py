@@ -60,32 +60,34 @@ def ready_to_sample(session: Any) -> bool:
 
 
 def session_mode_label(session: Any) -> str:
-    """Session mode chip: plan wins over goal when both flags conflict.
+    """Session mode chip (Chinese, compact). Plan wins over goal when both conflict.
 
-    Grok modes are exclusive; prefer live plan_phase, then goal, then mode enum.
+    Grok modes are exclusive; prefer live plan_phase / awaiting approval, then goal.
     """
     kernel = getattr(getattr(session, "extensions", None), "kernel", None)
     mode_state = getattr(kernel, "session_mode_state", None)
     if mode_state is not None:
+        if getattr(mode_state, "awaiting_plan_approval", False):
+            return "待批"
         phase = str(getattr(mode_state, "plan_phase", "") or "")
         if phase == "pending":
-            return "plan…"
+            return "规划…"
         if phase == "exit_pending":
-            return "plan↓"
+            return "收束"
         if phase == "active" or getattr(mode_state, "is_plan", lambda: False)():
-            return "plan"
+            return "规划中"
         if getattr(mode_state, "is_goal", lambda: False)():
-            return "goal"
+            return "目标"
     raw_mode = getattr(getattr(mode_state, "mode", None), "value", None)
     return {
-        "normal": "auto",
-        "goal": "goal",
-        "plan": "plan",
-    }.get(str(raw_mode or "normal"), str(raw_mode or "auto"))
+        "normal": "自动",
+        "goal": "目标",
+        "plan": "规划中",
+    }.get(str(raw_mode or "normal"), str(raw_mode or "自动"))
 
 
 def model_and_mode_text(session: Any) -> str:
-    """Prompt caption: compact ``model · high · auto|plan`` (no redundant words).
+    """Prompt caption: compact ``model · high · 规划中|自动`` (no redundant words).
 
     Unconfigured sessions show only ``未选择模型`` — never a fake local default.
     """

@@ -19,27 +19,33 @@ from codedoggy.tools.kinds import ToolKind
 
 logger = logging.getLogger(__name__)
 
-# Grok plan_mode.rs reminder templates (static English, no MiniJinja).
+# Plan-mode turn reminders (product policy: soft plan-first, normal dialogue OK).
 PLAN_REMINDER_FULL = (
-    "Plan mode is active. Do not make any edits or writes to the system.\n\n"
-    "You should build your plan by writing to or editing the plan file. "
-    "Note that this is the only file you are allowed to edit.\n\n"
-    "Your turn should only end with either ask_user_question to clarify "
-    "requirements or exit_plan_mode to present your plan to the user."
+    "Plan mode is active. Do not make any edits or writes to the system "
+    "except for the plan file.\n\n"
+    "You may talk with the user normally — explore, explain, and refine the "
+    "approach in conversation. Write or update the plan file when the approach "
+    "is taking shape (that file is the only workspace write allowed).\n\n"
+    "ask_user_question is optional (only for structured multi-choice). "
+    "When the plan is ready for the user to approve, call exit_plan_mode. "
+    "Do not implement until the plan is approved."
 )
 PLAN_REMINDER_SPARSE = (
     "Plan mode is still active. Do not make any edits or writes to the system "
-    "except for the plan file."
+    "except for the plan file. You may continue the conversation normally; "
+    "call exit_plan_mode when the plan is ready for approval."
 )
 PLAN_REMINDER_REENTRY = (
     "## Returning to Plan Mode\n\n"
     "You are entering plan mode again after having previously exited it. "
     "A plan file may already exist from your previous planning session.\n\n"
-    "Your turn should only end with either ask_user_question to clarify "
-    "requirements or exit_plan_mode to present your plan to the user."
+    "Talk with the user normally; update the plan file as needed. "
+    "ask_user_question is optional. Call exit_plan_mode when ready for approval. "
+    "Do not implement until approved."
 )
 PLAN_REMINDER_EXIT = (
-    "You have exited plan mode. You can now make edits, run tools, and take actions."
+    "You have exited plan mode (auto mode). You can now make edits, run tools, "
+    "and take actions. If the user approved a plan, implement it."
 )
 
 

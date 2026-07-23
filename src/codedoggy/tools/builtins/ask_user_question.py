@@ -30,11 +30,14 @@ from codedoggy.tools.runtime import (
     ToolId,
 )
 
-# ── Grok description_template (mod.rs ToolMetadata) ──────────────────────
+# ── description (optional structured questions — not required for plan mode) ─
 
 _DESC = """\
-Ask the user one or more multiple-choice questions.
+Optional: ask the user one or more multiple-choice questions when structured \
+choices help more than ordinary chat.
 
+- Prefer normal conversation when free-form dialogue is enough.
+- Not required to be in plan mode; never use this as the only way to talk.
 - Every question automatically gets an "Other" choice where the user can type their own answer.
 - Put your recommended option first and append "(Recommended)" to its label.
 """

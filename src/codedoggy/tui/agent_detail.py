@@ -17,7 +17,6 @@ from prompt_toolkit.formatted_text import StyleAndTextTuples
 from prompt_toolkit.utils import get_cwidth
 
 from codedoggy.tui.open_path import (
-    is_image_path,
     link_label_for_path,
     paths_from_detail_record,
     tool_paths_from_arguments,
@@ -55,16 +54,15 @@ DETAIL_FILTER_LABELS: dict[DetailFilter, str] = {
     "plan": "计划",
 }
 
-# Collapsed thinking preview only (expanded shows the full reasoning).
-THINKING_PREVIEW_LINES = 3
 # Expanded tool body paint caps. Prefer change hunks over full-file dumps —
 # the TUI is a review surface, not an editor. Click header to collapse.
-EXPANDED_DIFF_PREVIEW_LINES = 48  # edit hunks (already change-only)
+# Hard caps prevent expand/Ctrl-misclick from flooding the terminal paint.
+EXPANDED_DIFF_PREVIEW_LINES = 40  # edit hunks (already change-only)
 EXPANDED_CODE_PREVIEW_LINES = 12  # reads / shell dumps (not whole files)
 # Soft wrap guide for thinking (no longer a hard clip — panel width wins).
 MAX_THOUGHTS_WIDTH = 120
 # Paint-time caps for tool dumps (not thinking — thinking stays full).
-MAX_BLOCK_CHARS = 12_000
+MAX_BLOCK_CHARS = 4_000
 # Extreme safety only for multi-MB reasoning blobs; normal thoughts are full.
 MAX_THINKING_CHARS = 200_000
 # Read-result preview: head/tail only (full path is openable via link).
@@ -115,10 +113,10 @@ class AgentDetailSnapshot:
     records: tuple[DetailRecord, ...] = ()
 
 
-def block_collapse_key(record_id: str, block_index: int) -> str:
-    """Stable key for fold state in the TUI."""
+def record_collapse_key(record_id: str) -> str:
+    """Stable record-owned fold key for a complete tool row."""
 
-    return f"{record_id}:{block_index}"
+    return f"record:{record_id}"
 
 
 def _cap_display_text(text: str, *, max_chars: int = MAX_BLOCK_CHARS) -> str:
@@ -131,29 +129,16 @@ def _cap_display_text(text: str, *, max_chars: int = MAX_BLOCK_CHARS) -> str:
 
 
 def default_collapsed_keys(records: Iterable[DetailRecord]) -> frozenset[str]:
-    """GrokBuild default: tool arg/result bodies start collapsed (one-line tools).
+    """Default fold set: tool bodies start collapsed.
 
-    Thinking stays expanded. Matches Grok ``DisplayMode::Collapsed`` for tools.
+    A tool owns one fold state for its complete body; individual result blocks
+    never create a second, conflicting source of truth.
     """
 
     keys: set[str] = set()
     for record in records:
-        for index, block in enumerate(record.blocks):
-            if block.kind == "thinking" or block.label == THINKING_LABEL:
-                continue
-            if block.label in {"调用参数", "返回结果", CHANGE_LABEL}:
-                keys.add(block_collapse_key(record.id, index))
-    return frozenset(keys)
-
-
-def thinking_collapse_keys(records: Iterable[DetailRecord]) -> frozenset[str]:
-    """All fold keys belonging to thinking blocks."""
-
-    keys: set[str] = set()
-    for record in records:
-        for index, block in enumerate(record.blocks):
-            if block.kind == "thinking" or block.label == THINKING_LABEL:
-                keys.add(block_collapse_key(record.id, index))
+        if record.actor.strip().upper() == "TOOL" and record.blocks:
+            keys.add(record_collapse_key(record.id))
     return frozenset(keys)
 
 
@@ -332,9 +317,8 @@ def filter_detail_records(
 ) -> tuple[DetailRecord, ...]:
     """Return records for one UI tab without discarding stored detail.
 
-    Message tab keeps thinking/reasoning by default (expanded paint) so the
-    user can read the model’s process alongside the answer. Tools stay on
-    the 工具 tab.
+    Message tab includes thinking records as direct readable prose. Tools stay
+    on the 工具 tab.
     """
 
     active = active_filter if active_filter in DETAIL_FILTERS else "message"
@@ -406,20 +390,16 @@ def render_detail_header(
 
 
 def _section_break(width: int) -> StyleAndTextTuples:
-    """Reading rhythm between records: air + short soft rule + air.
+    """Compact reading rhythm between records.
 
-    Inspired by Linear/Notion/Medium: space carries hierarchy; the rule is a
-    quiet hairline, not a full-width terminal box rail.
+    One breathing line and a short left-aligned hairline keep adjacent records
+    distinct without turning a tool-heavy transcript into a field of gaps.
     """
-    rule_w = min(20, max(4, width // 4))
-    rule_w = min(rule_w, max(1, width))
-    rule = "─" * rule_w
-    pad = max(0, (width - get_cwidth(rule)) // 2)
-    line = ((" " * pad) + rule)[:width]
+    rule_w = min(12, max(4, width - 2))
+    line = ("  " + ("─" * rule_w))[:width]
     return [
         ("", "\n"),
         ("class:detail.separator", line + "\n"),
-        ("", "\n"),
     ]
 
 
@@ -430,14 +410,17 @@ def render_detail_body(
     active_filter: DetailFilter = "message",
     path_mouse: Callable[[str], Any] | None = None,
     collapsed_keys: Collection[str] | None = None,
-    fold_mouse: Callable[[str], Any] | None = None,
+    fold_mouse: Callable[..., Any] | None = None,
 ) -> StyleAndTextTuples:
     """Render every selected record without summarizing or truncating bodies.
 
     ``path_mouse(path)`` optional: returns a prompt_toolkit mouse handler so
     tool/file paths open in the OS viewer on click.
 
-    ``collapsed_keys`` / ``fold_mouse`` optional: fold tool arg/result blocks.
+    ``collapsed_keys`` / ``fold_mouse`` optional: fold complete tool records.
+    Thinking records render directly as readable body text.
+    ``fold_mouse(key, open_path=None)`` — plain click folds; Ctrl+click opens
+    ``open_path`` when set (never expands on Ctrl).
     """
 
     width = max(12, width)
@@ -447,7 +430,7 @@ def render_detail_body(
         return [("class:detail.meta", "\n  当前分类没有记录。\n")]
     fragments: StyleAndTextTuples = []
     for index, record in enumerate(records):
-        if index:
+        if index and active_filter != "tool":
             fragments.extend(_section_break(width))
         fragments.extend(
             _render_record(
@@ -458,18 +441,18 @@ def render_detail_body(
                 path_mouse=path_mouse,
             )
         )
-        if path_mouse is not None:
+        # Tool rows own their primary file action in the header. Repeating a
+        # separate "打开" row below every collapsed tool created most of the
+        # visual noise in file-heavy plan sessions.
+        if path_mouse is not None and record.actor.strip().upper() != "TOOL":
             for file_path in paths_from_detail_record(record):
                 short = link_label_for_path(file_path)
-                if is_image_path(file_path):
-                    label = f"  查看图片 · {short}"
-                else:
-                    label = f"  打开 · {short}"
-                label = _truncate_display(label, width)
+                label = _truncate_display(short, max(1, width - 4))
                 handler = path_mouse(file_path)
                 if handler is not None:
                     fragments.append(("", "\n"))
-                    fragments.append(("class:detail.link.hint", label, handler))
+                    fragments.append(("class:detail.meta", "  ↗ "))
+                    fragments.append(("class:detail.link", label, handler))
                     fragments.append(("", "\n"))
     return fragments
 
@@ -519,90 +502,103 @@ def _render_record(
     width: int,
     *,
     collapsed_keys: set[str],
-    fold_mouse: Callable[[str], Any] | None,
+    fold_mouse: Callable[..., Any] | None,
     path_mouse: Callable[[str], Any] | None = None,
 ) -> StyleAndTextTuples:
     """Render one transcript row.
 
     Tools (GrokBuild Collapsed default): single muted line
     ``◆ Read path`` / ``◆ Ran cmd`` — arg/result bodies stay folded unless
-    the user expands. Thinking / prose keep their own layout.
+    the user expands. Thinking renders directly without a redundant header.
+
+    Ctrl+click on a path-bearing tool header opens the file (OS) and must
+    never expand the body (expand can flood the terminal).
     """
     actor = record.actor or "AGENT"
     title = (record.title or "").strip()
     fragments: StyleAndTextTuples = []
+    open_paths = paths_from_detail_record(record)
+    first_open = open_paths[0] if open_paths else None
 
-    # ── Tool: Grok one-line collapsed header ─────────────────────────
+    # ── Tool: one record, one fold state ─────────────────────────────
     if actor.strip().upper() == "TOOL":
         bullet, bstyle = _tool_status_bullet(record.status)
-        # Whole header is a hit target: toggle all tool bodies for this record.
-        tool_keys = [
-            block_collapse_key(record.id, i)
-            for i, b in enumerate(record.blocks)
-            if b.label in {"调用参数", "返回结果", CHANGE_LABEL}
-        ]
-        # Unlabeled bodies (legacy/tests): always paint, no fold chrome.
-        if not tool_keys:
-            head = _truncate_display(f"  {bullet} {title}", width)
-            fragments.append((bstyle, head + "\n"))
-            for block in record.blocks:
-                if block.kind in {"code", "diff", "command", "output", "metadata"}:
-                    fragments.extend(_render_structured_block(block, width))
-                else:
-                    fragments.extend(_render_text_block(block.text, width))
-            return fragments
-        all_collapsed = all(k in collapsed_keys for k in tool_keys)
-        # Stable fold key for the record (prefer 返回结果, else first body).
-        prefer = next(
-            (
-                block_collapse_key(record.id, i)
-                for i, b in enumerate(record.blocks)
-                if b.label in {CHANGE_LABEL, "返回结果"}
-            ),
-            tool_keys[0],
-        )
-        fold_handler = fold_mouse(prefer) if fold_mouse is not None else None
-        # Grok: diamond bullet always; › only when collapsed (expandable_indicator).
-        if all_collapsed:
-            head = _truncate_display(f"  {bullet} › {title}", width)
-        else:
-            head = _truncate_display(f"  {bullet} {title}", width)
-        # Entire header toggles fold — open-file lives on the dedicated link
-        # row below (avoids path clicks eating collapse / double "打开" chrome).
-        if fold_handler is not None:
-            fragments.append(
-                (
-                    "class:detail.fold.active" if not all_collapsed else bstyle,
-                    head + "\n",
-                    fold_handler,
-                )
+        has_body = bool(record.blocks)
+        if not has_body:
+            handler = (
+                path_mouse(first_open)
+                if first_open is not None and path_mouse is not None
+                else None
             )
-        else:
-            fragments.append((bstyle, head + "\n"))
-        # Bodies only when expanded.
-        if all_collapsed:
+            if handler is not None:
+                prefix = f"  {bullet} "
+                title_width = max(1, width - get_cwidth(prefix))
+                fragments.append((bstyle, prefix))
+                fragments.append(
+                    (
+                        "class:detail.tool.link",
+                        _truncate_display(title, title_width) + "\n",
+                        handler,
+                    )
+                )
+            else:
+                head = _truncate_display(f"  {bullet} {title}", width)
+                fragments.append((bstyle, head + "\n"))
             return fragments
-        for block_index, block in enumerate(record.blocks):
-            key = block_collapse_key(record.id, block_index)
-            if key in collapsed_keys:
-                continue
+
+        fold_key = record_collapse_key(record.id)
+        is_collapsed = fold_key in collapsed_keys
+        if fold_mouse is not None:
+            try:
+                fold_handler = fold_mouse(fold_key, first_open)
+            except TypeError:
+                fold_handler = fold_mouse(fold_key)
+        else:
+            fold_handler = None
+
+        chevron = "▸" if is_collapsed else "▾"
+        prefix = f"  {chevron} {bullet} "
+        title_width = max(1, width - get_cwidth(prefix))
+        shown_title = _truncate_display(title, title_width)
+        header_style = (
+            "class:detail.fold.collapsed"
+            if is_collapsed
+            else "class:detail.fold.expanded"
+        )
+        if record.status.strip().lower() in {"error", "failed"}:
+            header_style = bstyle
+        if fold_handler is not None:
+            title_style = header_style
+            if first_open:
+                if record.status.strip().lower() in {"error", "failed"}:
+                    title_style = "class:detail.error.link"
+                elif is_collapsed:
+                    title_style = "class:detail.fold.collapsed.link"
+                else:
+                    title_style = "class:detail.fold.expanded.link"
+            fragments.append((header_style, prefix, fold_handler))
+            fragments.append((title_style, shown_title + "\n", fold_handler))
+        else:
+            head = _truncate_display(f"{prefix}{title}", width)
+            fragments.append((header_style, head + "\n"))
+        if is_collapsed:
+            return fragments
+
+        for block in record.blocks:
             if block.label:
-                # Per-block header also collapses the whole tool (TUI: easy
-                # click target after scrolling into a long code dump).
                 line_count = max(
                     1, block.text.count("\n") + (1 if block.text else 0)
                 )
+                section_label = {
+                    "调用参数": "输入",
+                    "返回结果": "结果",
+                    CHANGE_LABEL: CHANGE_LABEL,
+                }.get(block.label, block.label)
                 label_text = _truncate_display(
-                    f"    · {block.label} · {line_count} 行 · 点击收起", width
+                    f"    {section_label} · {line_count} 行", width
                 )
-                if fold_handler is not None:
-                    fragments.append(
-                        ("class:detail.fold.active", label_text + "\n", fold_handler)
-                    )
-                else:
-                    fragments.append(("class:detail.meta", label_text + "\n"))
+                fragments.append(("class:detail.tool.section", label_text + "\n"))
             if block.kind in {"code", "diff", "command", "output", "metadata"}:
-                # Diffs are change-only; code/output stay short previews.
                 paint_cap = (
                     EXPANDED_DIFF_PREVIEW_LINES
                     if block.kind == "diff"
@@ -613,11 +609,19 @@ def _render_record(
                         block,
                         width,
                         max_lines=paint_cap,
-                        fold_handler=fold_handler,
+                        show_meta=not bool(block.label),
                     )
                 )
             else:
                 fragments.extend(_render_text_block(block.text, width))
+        if fold_handler is not None:
+            fragments.append(
+                (
+                    "class:detail.fold.footer",
+                    _truncate_display("  ▴ 收起工具详情", width) + "\n",
+                    fold_handler,
+                )
+            )
         return fragments
 
     # ── Non-tool (user / think / assistant) ──────────────────────────
@@ -652,74 +656,22 @@ def _render_record(
         fragments.append((actor_style, f"  {byline}"))
         fragments.append(("", "\n"))
         fragments.append(("", "\n"))
-    for block_index, block in enumerate(record.blocks):
-        key = block_collapse_key(record.id, block_index)
+    for block in record.blocks:
         is_thinking = block.kind == "thinking" or block.label == THINKING_LABEL
-        foldable = is_thinking or (
-            bool(block.label)
-            and block.label in {"调用参数", "返回结果", CHANGE_LABEL}
-        )
-        is_collapsed = foldable and key in collapsed_keys
-        if block.label or is_thinking:
-            if foldable:
-                label = block.label or THINKING_LABEL
-                # Thinking: short calm header (Grok header_bright=false spirit).
-                if is_thinking:
-                    label = "思考"
-                line_count = max(
-                    1, block.text.count("\n") + (1 if block.text else 0)
-                )
-                if fold_mouse is None and not is_collapsed:
-                    if is_thinking:
-                        label_text = f"  {label}"
-                        style = "class:detail.thinking.header"
-                    else:
-                        label_text = f"  {label}"
-                        style = "class:detail.meta"
-                    fragments.append((style, _truncate_display(label_text, width)))
-                    fragments.append(("", "\n"))
-                else:
-                    marker = "›" if is_collapsed else "·"
-                    if is_thinking:
-                        # Default expanded: quiet "思考"; collapsed shows line count.
-                        if is_collapsed:
-                            label_text = f"  {marker} {label} · {line_count} 行"
-                        else:
-                            label_text = f"  {label}"
-                        style = "class:detail.thinking.header"
-                    else:
-                        label_text = f"  {marker} {label}"
-                        if is_collapsed:
-                            preview = _first_line_preview(
-                                block.text, max(8, width - 28)
-                            )
-                            label_text = f"  {marker} {label} · {line_count} 行"
-                            if preview:
-                                label_text += f" · {preview}"
-                        style = "class:detail.fold.active"
-                    label_text = _truncate_display(label_text, width)
-                    if fold_mouse is not None:
-                        fragments.append((style, label_text, fold_mouse(key)))
-                    else:
-                        fragments.append((style, label_text))
-                    fragments.append(("", "\n"))
-            elif block.label:
-                fragments.append(("class:detail.meta", f"  {block.label}\n"))
-        if is_collapsed:
-            if is_thinking:
-                fragments.extend(
-                    _render_thinking_block(
-                        block,
-                        width,
-                        max_lines=THINKING_PREVIEW_LINES,
-                        truncated=True,
-                    )
-                )
-            continue
         if is_thinking:
             fragments.extend(_render_thinking_block(block, width))
-        elif block.kind in {"code", "diff", "command", "output", "metadata"}:
-            fragments.extend(_render_structured_block(block, width))
+            continue
+        if block.label:
+            fragments.append(("class:detail.meta", f"  {block.label}\n"))
+        if block.kind in {"code", "diff", "command", "output", "metadata"}:
+            paint_cap = (
+                EXPANDED_DIFF_PREVIEW_LINES
+                if block.kind == "diff"
+                else EXPANDED_CODE_PREVIEW_LINES
+            )
+            fragments.extend(
+                _render_structured_block(block, width, max_lines=paint_cap)
+            )
         else:
             fragments.extend(_render_text_block(block.text, width))
     return fragments
@@ -728,35 +680,19 @@ def _render_record(
 def _render_thinking_block(
     block: DetailBlock,
     width: int,
-    *,
-    max_lines: int | None = None,
-    truncated: bool = False,
 ) -> StyleAndTextTuples:
-    """Thinking body with a soft left rail.
-
-    Expanded (default): full text, wrapped to the detail panel width.
-    Collapsed: first THINKING_PREVIEW_LINES only + “另有 N 行”.
-    """
+    """Thinking body with a soft left rail, rendered directly and in full."""
 
     # Use the full panel — do not hard-clip to MAX_THOUGHTS_WIDTH.
     width = max(12, width)
     body_width = max(1, width - 6)
     lines = block.text.splitlines() or [""]
-    total = len(lines)
-    show = lines if max_lines is None else lines[: max(0, max_lines)]
     fragments: StyleAndTextTuples = []
-    for raw in show:
+    for raw in lines:
         for piece in _wrap_display(raw, body_width):
             fragments.append(("class:detail.thinking.rail", "  │ "))
             fragments.append(("class:detail.thinking.body", piece))
             fragments.append(("", "\n"))
-    if truncated and total > len(show):
-        more = total - len(show)
-        fragments.append(("class:detail.thinking.rail", "  │ "))
-        fragments.append(
-            ("class:detail.thinking.meta", f"… 另有 {more} 行 · 点击展开")
-        )
-        fragments.append(("", "\n"))
     return fragments
 
 
@@ -852,12 +788,12 @@ def _render_structured_block(
     width: int,
     *,
     max_lines: int | None = None,
-    fold_handler: Callable[[Any], Any] | None = None,
+    show_meta: bool = True,
 ) -> StyleAndTextTuples:
     """Grok-like rail + gutter + soft-wrap body (no heavy box blob).
 
     ``max_lines`` caps paint for TUI (tool expand is not a full editor).
-    When truncated, a clickable "… 另有 N 行 · 点击收起" footer is shown.
+    When truncated, a quiet footer reports the undisplayed line count.
     """
 
     width = max(12, width)
@@ -886,11 +822,14 @@ def _render_structured_block(
         "output": "out",
         "metadata": "args",
     }.get(block.kind, block.kind)
-    if truncated:
-        meta = f"  · {kind_label} · 前 {max_lines}/{line_count} 行"
-    else:
-        meta = f"  · {kind_label} · {line_count} lines"
-    fragments.append(("class:detail.code.meta", _truncate_display(meta, width) + "\n"))
+    if show_meta:
+        if truncated:
+            meta = f"  · {kind_label} · 前 {max_lines}/{line_count} 行"
+        else:
+            meta = f"  · {kind_label} · {line_count} lines"
+        fragments.append(
+            ("class:detail.code.meta", _truncate_display(meta, width) + "\n")
+        )
 
     if paint_block.kind == "command":
         fragments.extend(_render_command_block(paint_block, width))
@@ -914,11 +853,8 @@ def _render_structured_block(
 
     if truncated:
         more = line_count - int(max_lines or 0)
-        foot = _truncate_display(f"  … 另有 {more} 行 · 点击收起", width)
-        if fold_handler is not None:
-            fragments.append(("class:detail.fold.active", foot + "\n", fold_handler))
-        else:
-            fragments.append(("class:detail.meta", foot + "\n"))
+        foot = _truncate_display(f"  … 另有 {more} 行未显示", width)
+        fragments.append(("class:detail.meta", foot + "\n"))
     return fragments
 
 
@@ -1437,13 +1373,6 @@ def _highlight_mixed(line: str) -> StyleAndTextTuples:
     return fragments or [("class:detail.code.plain", line)]
 
 
-def _first_line_preview(text: str, width: int) -> str:
-    first = (text.splitlines() or [""])[0].strip()
-    if not first:
-        return ""
-    return _truncate_display(first, max(1, width))
-
-
 def _tool_headline(name: str, arguments: Any) -> str:
     """GrokBuild-style one-line tool header (Read / Ran / Edited / …)."""
     n = (name or "tool").strip()
@@ -1883,18 +1812,16 @@ __all__ = [
     "DETAIL_FILTER_LABELS",
     "MAX_THOUGHTS_WIDTH",
     "THINKING_LABEL",
-    "THINKING_PREVIEW_LINES",
     "AgentDetailSnapshot",
     "DetailBlock",
     "DetailFilter",
     "DetailRecord",
-    "block_collapse_key",
     "default_collapsed_keys",
     "filter_detail_records",
     "render_agent_detail",
     "render_detail_body",
     "render_detail_header",
+    "record_collapse_key",
     "snapshot_from_messages",
     "strip_system_reminders",
-    "thinking_collapse_keys",
 ]

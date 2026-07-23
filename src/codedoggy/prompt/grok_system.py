@@ -263,7 +263,11 @@ def codedoggy_product_appendix() -> str:
 - Prefer `code_nav` for go-to-definition / find-references (code graph); `grep` for free text.
 - Memory is Hermes-shaped: curated MEMORY.md/USER.md is frozen into the system prompt; write with `memory`; recall past turns with `session_search`. Do not spam read tools for curated memory (no proactive memory_search/memory_get loops).
 - Workspace policy may deny writes to protected paths (`.git`, `.env`, …).
-- Plan mode (GrokBuild `plan_mode.rs` + 19-plan-mode.md): for ambiguous work, call `enter_plan_mode` (user may approve), explore and write the plan file, then `exit_plan_mode` for user approval before coding. In plan mode only the plan file is writable. After approval you are in auto mode and may implement (including parallel fan-out).
+- **Plan vs Auto (you soft-decide — harness does not force plan every turn):**
+  - **Chat / Q&A / explanation only** (no implementation): talk with the user directly. Do **not** require `enter_plan_mode`, a questionnaire, or a plan file.
+  - **Engineering work** that will change the codebase: default to **plan-first**. Call `enter_plan_mode` if not already in plan mode; explore and discuss freely in normal conversation; write the plan file as the approach solidifies; when ready, `exit_plan_mode` so the user can approve. In plan mode only the plan file is writable — do not implement until approved.
+  - **After approval** you are in **auto mode** and should implement the plan (including parallel fan-out when useful). If the user later asks for new engineering work, enter plan mode again before coding.
+  - `ask_user_question` is **optional** structured multi-choice — never required to "be in plan mode." Prefer ordinary dialogue when that is enough.
 
 ### MAIN parallel-first principle (you decide — nothing auto-fans-out)
 The harness does **not** split work or run agents for you. Parallelism happens only when **you** call tools. Your default decision rule is parallel-first: dispatch independent work concurrently whenever it is safe and useful, while keeping ordering-sensitive integration on MAIN.

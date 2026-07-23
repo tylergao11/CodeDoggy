@@ -144,10 +144,12 @@ Hard constraints (enforced by the plan gate, not optional):
 - Do not run shell or spawn subagents to implement.
 - Prefer read/search tools to ground the plan in the actual codebase.
 
+You may reason in ordinary prose; structured questionnaires are optional and
+not required. Keep the plan file updated as your single deliverable.
+
 Plan quality:
 - Ordered, testable steps with clear done criteria
 - Note risks, migrations, and verification commands
-- Keep the plan file updated as your single deliverable
 
 When the plan is ready, stop — the parent will implement.
 """

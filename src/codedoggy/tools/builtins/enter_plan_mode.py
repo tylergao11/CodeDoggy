@@ -41,9 +41,15 @@ from codedoggy.tools.runtime import (
     ToolId,
 )
 
-# Grok description_template (ToolMetadata) — exact
 _DESC = """\
-Use this tool when a task has ambiguity about the right approach or when the user asks you to write a plan. This tool enables a read-only plan mode where you explore the codebase and create an implementation plan for the user.
+Enter plan mode before engineering work that will change the codebase.
+
+Default for implementation tasks: explore and discuss with the user, write the \
+plan file, then call exit_plan_mode for approval before coding. In plan mode \
+only the plan file is writable.
+
+You may converse normally in plan mode — do not treat this as a questionnaire. \
+Skip this tool for pure chat or Q&A that needs no implementation.
 """
 
 

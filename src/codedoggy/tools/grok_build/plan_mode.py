@@ -27,10 +27,11 @@ from typing import Any
 # resources.rs
 PLAN_FILE_RELATIVE_PATH = ".grok/plan.md"
 
-# EnterPlanModeOutput::Entered.message (exact)
+# EnterPlanModeOutput::Entered.message
 ENTERED_MESSAGE = (
-    "You have entered plan mode. You should now focus on exploring the codebase "
-    "and creating an implementation plan."
+    "You have entered plan mode. Explore the codebase, talk with the user "
+    "normally, and create an implementation plan. Do not implement until the "
+    "plan is approved."
 )
 
 # ExitPlanModeOutput messages (exact)
@@ -197,10 +198,12 @@ def format_enter_plan_prompt(
         "In plan mode, you should:\n"
         f"1. Thoroughly explore the codebase to understand existing patterns{task_hint}\n"
         "2. Identify similar features, codebase architecture, and understand trade-offs\n"
-        f"3. Use {ask} if you need to clarify the approach\n"
+        "3. Talk with the user in ordinary conversation; "
+        f"optionally use {ask} only for structured multi-choice when that helps\n"
         "4. Design a concrete implementation strategy\n"
         "5. Write your plan to the plan file above\n"
-        f"6. When ready, use {exit_name} to present your plan to the user."
+        f"6. When ready, use {exit_name} so the user can approve — then implement "
+        "in auto mode after approval."
     )
 
 
