@@ -201,6 +201,9 @@ _DOG_FACE = "∪･ω･∪"
 _DOG_EAR = "∪"
 _INPUT_MAX_LINES = 8
 _DETAIL_INPUT_MAX_LINES = 6
+_MAIN_INPUT_PREFIX_COLS = 6  # "  │" + three interior cells
+_MAIN_INPUT_RIGHT_COLS = 3  # two interior cells + "│"
+_MAIN_INPUT_SCROLLBAR_COLS = 1
 _DOUBLE_CLICK_S = 0.45  # task/plan card double-click window
 # High-res mice fire many SCROLL events per physical notch — require several
 # same-direction ticks before moving one card, then a short cooldown.
@@ -664,7 +667,9 @@ class CodeDoggyTUI:
             # PT default is False: only the chrome (top/side/bottom) had our
             # focus mouse handlers, so clicks in the empty middle did nothing.
             focus_on_click=True,
-            prompt=self._render_prompt_prefix,
+            # A Window line prefix is repainted for every logical and wrapped
+            # visual line. A TextArea ``prompt`` only covers the first line.
+            get_line_prefix=self._render_prompt_line_prefix,
             style="class:input",
             accept_handler=self._accept_prompt,
             history=self._prompt_history,
@@ -833,7 +838,7 @@ class CodeDoggyTUI:
         )
         prompt_right = Window(
             FormattedTextControl(self._render_prompt_right),
-            width=3,
+            width=_MAIN_INPUT_RIGHT_COLS,
             # Match multi-line input height (no fixed height=1).
             style="class:root",
             dont_extend_width=True,
@@ -2865,11 +2870,24 @@ class CodeDoggyTUI:
                 out.append((style, text, h))
         return out
 
-    def _render_prompt_prefix(self) -> StyleAndTextTuples:
+    def _render_prompt_line_prefix(
+        self,
+        line_number: int,
+        wrap_count: int,
+    ) -> StyleAndTextTuples:
+        """Left rail and indent for every logical and soft-wrapped input row."""
         border = self._prompt_border_class()
-        # Rounded well + simple caret (no dog motif — less visual noise).
+        first_visual_row = line_number == 0 and wrap_count == 0
+        interior: StyleAndTextTuples
+        if first_visual_row:
+            interior = [
+                ("class:input", " "),
+                ("class:prompt", "› "),
+            ]
+        else:
+            interior = [("class:input", "   ")]
         return self._with_input_focus_mouse(
-            [(border, "  │ "), ("class:prompt", "› ")]
+            [(border, "  │"), *interior]
         )
 
     def _render_prompt_top(self) -> StyleAndTextTuples:
@@ -2892,14 +2910,18 @@ class CodeDoggyTUI:
                 1,
                 min(
                     _INPUT_MAX_LINES,
-                    self._estimate_buffer_display_lines(self._input.buffer.text),
+                    self._estimate_buffer_display_lines(
+                        self._input.buffer.text,
+                        available_cols=self._main_input_text_width(),
+                    ),
                 ),
             )
         except Exception:  # noqa: BLE001
             rows = 1
         fragments: StyleAndTextTuples = []
         for i in range(rows):
-            fragments.append((border, "│  "))
+            fragments.append(("class:input", "  "))
+            fragments.append((border, "│"))
             if i + 1 < rows:
                 fragments.append(("", "\n"))
         return self._with_input_focus_mouse(fragments)
@@ -2914,7 +2936,9 @@ class CodeDoggyTUI:
     def _main_input_height(self) -> Dimension:
         try:
             preferred = self._estimate_buffer_display_lines(
-                self._input.buffer.text, max_lines=_INPUT_MAX_LINES
+                self._input.buffer.text,
+                available_cols=self._main_input_text_width(),
+                max_lines=_INPUT_MAX_LINES,
             )
         except Exception:  # noqa: BLE001
             preferred = 1
@@ -2936,13 +2960,18 @@ class CodeDoggyTUI:
         text: str | None,
         *,
         prefix_cols: int = 8,
+        available_cols: int | None = None,
         max_lines: int | None = None,
     ) -> int:
         """Count soft-wrapped display rows for dynamic TextArea height."""
         cap = max_lines if max_lines is not None else _INPUT_MAX_LINES
         raw = text or ""
-        # Input sits left of a 3-col right rail; leave a little slack.
-        avail = max(8, _content_width() - prefix_cols - 6)
+        if available_cols is None:
+            # Detail input uses a different surface; retain its conservative
+            # budget unless the caller supplies an exact viewport contract.
+            avail = max(8, _content_width() - prefix_cols - 6)
+        else:
+            avail = max(8, int(available_cols))
         total = 0
         parts = raw.split("\n") if raw else [""]
         for part in parts:
@@ -2952,6 +2981,17 @@ class CodeDoggyTUI:
             else:
                 total += max(1, (w + avail - 1) // avail)
         return max(1, min(cap, total))
+
+    @staticmethod
+    def _main_input_text_width() -> int:
+        """Exact text columns inside composer prefix, scrollbar and right rail."""
+        return max(
+            8,
+            _content_width()
+            - _MAIN_INPUT_PREFIX_COLS
+            - _MAIN_INPUT_SCROLLBAR_COLS
+            - _MAIN_INPUT_RIGHT_COLS,
+        )
 
     def _render_prompt_bottom(self) -> StyleAndTextTuples:
         width = max(16, _content_width())
