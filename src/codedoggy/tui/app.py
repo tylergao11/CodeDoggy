@@ -7599,9 +7599,9 @@ _DOGGY_COUPLE_ART = (
     "....................................................",
 )
 
-# Void matches TUI root black (#0c0c0c) — no gray plate behind the couple.
+# ``.`` is intentionally absent: empty pixels inherit the active Window/theme
+# background instead of painting a second canvas color behind the portrait.
 _DOGGY_ART_PALETTE = {
-    ".": "#0c0c0c",
     "C": "#00bac5",
     "M": "#ee4b8d",
     "c": "#0b6670",
@@ -7855,17 +7855,16 @@ def _half_block(
     bottom: str,
     palette: dict[str, str],
 ) -> tuple[str, str]:
-    background = palette.get(".", "#000000")
-    top_color = palette.get(top, background)
-    bottom_color = palette.get(bottom, background)
     if top == bottom == ".":
-        return f"bg:{background}", " "
+        return "", " "
+    top_color = palette.get(top, "#000000")
+    bottom_color = palette.get(bottom, "#000000")
     if top == bottom:
-        return f"fg:{top_color} bg:{background}", "█"
+        return f"fg:{top_color}", "█"
     if top == ".":
-        return f"fg:{bottom_color} bg:{background}", "▄"
+        return f"fg:{bottom_color}", "▄"
     if bottom == ".":
-        return f"fg:{top_color} bg:{background}", "▀"
+        return f"fg:{top_color}", "▀"
     return f"fg:{top_color} bg:{bottom_color}", "▀"
 
 
