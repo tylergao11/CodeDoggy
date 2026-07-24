@@ -17,6 +17,7 @@ from codedoggy.orchestration.tool_pipeline import (
     prepare_tool_batch,
 )
 from codedoggy.orchestration.types import PrecheckVerdict, ToolLoopOutcome
+from codedoggy.attachments import ImageAttachment
 from codedoggy.turn.executor import parse_tool_arguments
 from codedoggy.turn.hooks import HookContext, LoopHooks, NoopHooks
 from codedoggy.turn.sampler import Sampler
@@ -36,6 +37,7 @@ logger = logging.getLogger(__name__)
 def run_agent_loop(
     *,
     user_text: str,
+    user_attachments: tuple[ImageAttachment, ...] = (),
     sampler: Sampler,
     tools: FinalizedToolset,
     cwd: Path | str,
@@ -123,6 +125,7 @@ def run_agent_loop(
     messages = seed_messages(
         system_prompt=system_prompt,
         user_text=user_text,
+        user_attachments=user_attachments,
         prior_messages=prior_messages,
     )
     # Hermes seam: strip leaked fences from prior live; inject only at sample time
@@ -973,29 +976,48 @@ def _drain_interjections_into_messages(
     buf = extra.get("interjection_buffer")
     if buf is None:
         return 0
-    texts: list[str] = []
-    drain_fmt = getattr(buf, "drain_formatted", None)
-    if callable(drain_fmt):
+    entries: list[Any] = []
+    drain = getattr(buf, "drain", None)
+    if callable(drain):
         try:
-            texts = list(drain_fmt() or [])
+            entries = list(drain() or [])
         except Exception:  # noqa: BLE001
-            logger.debug("drain_formatted failed", exc_info=True)
-            texts = []
-    if not texts:
-        drain = getattr(buf, "drain", None)
-        if callable(drain):
-            try:
-                from codedoggy.orchestration.interjection import drain_formatted
+            logger.debug("drain interjections failed", exc_info=True)
+            return 0
 
-                texts = drain_formatted(list(drain() or []))
+    if not entries:
+        drain_fmt = getattr(buf, "drain_formatted", None)
+        if callable(drain_fmt):
+            try:
+                entries = list(drain_fmt() or [])
             except Exception:  # noqa: BLE001
-                logger.debug("drain interjections failed", exc_info=True)
+                logger.debug("drain_formatted failed", exc_info=True)
                 return 0
+
+    from codedoggy.orchestration.interjection import format_interjection
+
     n = 0
-    for text_i in texts:
+    for entry in entries:
+        if isinstance(entry, str):
+            text_i = entry
+            attachments: tuple[ImageAttachment, ...] = ()
+        else:
+            raw_text = getattr(entry, "text", None)
+            text_i = format_interjection(
+                str(raw_text if raw_text is not None else entry)
+            )
+            attachments = tuple(
+                image
+                for image in (getattr(entry, "images", None) or [])
+                if isinstance(image, ImageAttachment)
+            )
         if not text_i or not str(text_i).strip():
             continue
-        um = Message(role=Role.USER, content=str(text_i))
+        um = Message(
+            role=Role.USER,
+            content=str(text_i),
+            attachments=attachments,
+        )
         messages.append(um)
         _archive(on_archive_message, um)
         n += 1

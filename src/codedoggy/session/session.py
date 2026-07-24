@@ -17,6 +17,7 @@ from codedoggy.session.types import (
     TurnResult,
     TurnStatus,
 )
+from codedoggy.attachments import ImageAttachment
 
 logger = logging.getLogger(__name__)
 
@@ -149,12 +150,22 @@ class Session:
 
             runner.system_prompt = rebuild_system_prompt(sp, g)  # type: ignore[attr-defined]
 
-    def interject(self, text: str, *, prompt_id: str | None = None) -> None:
+    def interject(
+        self,
+        text: str,
+        *,
+        prompt_id: str | None = None,
+        attachments: tuple[ImageAttachment, ...] = (),
+    ) -> None:
         """Grok mid-turn interjection — drained before next sample."""
         self._ensure_open()
         kernel = self._kernel or getattr(self._ext, "kernel", None)
         if kernel is not None and hasattr(kernel, "interject"):
-            kernel.interject(text, prompt_id=prompt_id)
+            kernel.interject(
+                text,
+                prompt_id=prompt_id,
+                attachments=attachments,
+            )
             return
         raise SessionError("interjection buffer not available (no orchestration kernel)")
 
@@ -280,6 +291,7 @@ class Session:
         text = f"{block}\n\n{text}" if text.strip() else block
         return TurnRequest(
             text=text,
+            attachments=request.attachments,
             prompt_id=request.prompt_id,
             metadata=dict(request.metadata or {}),
         )
@@ -316,6 +328,7 @@ class Session:
             text = reminder
         return TurnRequest(
             text=text,
+            attachments=request.attachments,
             prompt_id=request.prompt_id,
             metadata=dict(request.metadata or {}),
         )
@@ -512,6 +525,7 @@ class Session:
         *,
         prompt_id: str | None = None,
         metadata: dict[str, Any] | None = None,
+        attachments: tuple[ImageAttachment, ...] = (),
     ) -> TurnResult:
         """Run one user prompt through the bound turn runner.
 
@@ -533,7 +547,11 @@ class Session:
                 # Grok: mid-turn → interjection only (drained before next sample).
                 # Do NOT also push PromptQueue (would double-run after turn).
                 try:
-                    self.interject(text, prompt_id=prompt_id)
+                    self.interject(
+                        text,
+                        prompt_id=prompt_id,
+                        attachments=attachments,
+                    )
                 except SessionError as e:
                     raise SessionBusyError("a turn is already running") from e
                 logger.info(
@@ -553,6 +571,7 @@ class Session:
 
             request = TurnRequest(
                 text=text,
+                attachments=tuple(attachments),
                 prompt_id=prompt_id,
                 metadata=metadata or {},
             )

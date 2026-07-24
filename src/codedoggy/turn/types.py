@@ -7,6 +7,7 @@ from enum import Enum
 from typing import Any
 
 from codedoggy.tools.kinds import ToolKind
+from codedoggy.attachments import ImageAttachment
 
 
 class Role(str, Enum):
@@ -37,7 +38,8 @@ class Message:
     """One transcript message (OpenAI-style roles)."""
 
     role: Role
-    content: str | None = None
+    content: str | list[dict[str, Any]] | None = None
+    attachments: tuple[ImageAttachment, ...] = ()
     tool_calls: list[ToolCall] | None = None
     tool_call_id: str | None = None
     name: str | None = None

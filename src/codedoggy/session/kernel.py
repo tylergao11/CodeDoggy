@@ -16,6 +16,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from codedoggy.attachments import (
+    ImageAttachment,
+    attachments_from_provider_data,
+)
 from codedoggy.turn.types import Message, Role, ToolCall
 
 logger = logging.getLogger(__name__)
@@ -460,7 +464,13 @@ class RuntimeKernel:
         self.refresh_tool_extra()
         self.persist_plan_mode_state()
 
-    def interject(self, text: str, *, prompt_id: str | None = None) -> None:
+    def interject(
+        self,
+        text: str,
+        *,
+        prompt_id: str | None = None,
+        attachments: tuple[ImageAttachment, ...] = (),
+    ) -> None:
         """Push a mid-turn user message (Grok pending_interjections).
 
         Drained at next safe point in the turn loop (not mid-stream invent).
@@ -472,7 +482,11 @@ class RuntimeKernel:
             buf = InterjectionBuffer()
             self.interjection_buffer = buf
             self.refresh_tool_extra()
-        buf.push(text, prompt_id=prompt_id)
+        buf.push(
+            text,
+            prompt_id=prompt_id,
+            images=list(attachments),
+        )
 
     def enqueue_prompt(
         self,
@@ -841,16 +855,19 @@ def _row_to_message(row: dict[str, Any]) -> Message:
                     ),
                 )
             )
+    raw_provider_data = (
+        dict(row["provider_data"])
+        if isinstance(row.get("provider_data"), dict)
+        else None
+    )
+    provider_data, attachments = attachments_from_provider_data(raw_provider_data)
     return Message(
         role=role,
         content=row.get("content"),
+        attachments=attachments,
         name=row.get("tool_name") or row.get("name"),
         tool_call_id=row.get("tool_call_id"),
         tool_calls=tool_calls,
         reasoning_content=row.get("reasoning_content"),
-        provider_data=(
-            dict(row["provider_data"])
-            if isinstance(row.get("provider_data"), dict)
-            else None
-        ),
+        provider_data=provider_data,
     )

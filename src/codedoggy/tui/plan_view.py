@@ -9,6 +9,8 @@ from prompt_toolkit.document import Document
 from prompt_toolkit.formatted_text import StyleAndTextTuples
 from prompt_toolkit.lexers import Lexer
 
+from codedoggy.tui.syntax import highlight_code_line
+
 
 _FENCE_RE = re.compile(r"^(\s*)(```|~~~)(.*)$")
 _HEADING_RE = re.compile(r"^(\s*)(#{1,6})(\s+)(.*)$")
@@ -53,7 +55,7 @@ def _render_plan_line(line: str, *, in_fence: bool) -> StyleAndTextTuples:
             ("class:plan.code.fence", fence.group(3)),
         ]
     if in_fence:
-        return [("class:plan.code", line)]
+        return highlight_code_line(line, style_prefix="plan.code")
 
     heading = _HEADING_RE.match(line)
     if heading:

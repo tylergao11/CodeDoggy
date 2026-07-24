@@ -1,12 +1,14 @@
-"""Prompt-toolkit boss cockpit: tasks first, Agent detail on demand."""
+"""Prompt-toolkit reading stream with inline tools and plan approval."""
 
 from __future__ import annotations
 
+import hashlib
 import re
 import shutil
 import sys
 import threading
 import time
+import webbrowser
 from collections.abc import Callable
 from itertools import groupby
 from pathlib import Path
@@ -14,8 +16,10 @@ from typing import Any
 
 from prompt_toolkit.application import Application
 from prompt_toolkit.application.current import get_app
+from prompt_toolkit.clipboard import ClipboardData
 from prompt_toolkit.filters import Condition, has_selection
 from prompt_toolkit.formatted_text import StyleAndTextTuples
+from prompt_toolkit.formatted_text.utils import split_lines
 from prompt_toolkit.history import FileHistory, InMemoryHistory
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.layout import (
@@ -49,26 +53,30 @@ from codedoggy.tui.clipboard_image import (
     get_system_clipboard_text,
     insert_image_chip,
     save_clipboard_image,
+    set_system_clipboard_text,
 )
 from codedoggy.tui.agent_detail import (
-    DETAIL_FILTERS,
-    DETAIL_FILTER_LABELS,
     AgentDetailSnapshot,
-    DetailFilter,
-    render_detail_body,
+    DetailRecord,
     snapshot_from_messages,
 )
 from codedoggy.tui.open_path import (
     VIEW_IMAGE_LABEL,
+    extract_image_chip_paths,
+    is_openable_file_path,
     open_local_path,
     path_under_cursor,
+    resolve_openable_path,
+    strip_image_chips,
 )
 from codedoggy.tui.plan_view import PlanMarkdownLexer
+from codedoggy.tui.syntax import highlight_code_line
 from codedoggy.tui.theme import build_style
 from codedoggy.tui.activity import LiveActivityBoard
 from codedoggy.tui.login_wizard import AuthWizard, WizardStep, run_browser_login
 from codedoggy.tui.model import TaskLedger, TaskView
 from codedoggy.tui import surface as session_surface
+from codedoggy.attachments import AttachmentError, ImageAttachment
 from codedoggy.turn.types import Message, Role
 
 
@@ -83,9 +91,6 @@ STATUS_TEXT = {
     "max_turns": "需继续",
 }
 
-# Soft cap for live card prose (not the product 2-line finished summary).
-# Prevents pathological multi-MB streams from freezing the task list paint.
-_STREAM_PREVIEW_LIMIT = 100_000
 _STREAM_REFRESH_INTERVAL_S = 0.04
 
 
@@ -125,23 +130,31 @@ def _append_stream_preview(
     state: dict[str, Any],
     piece: Any,
 ) -> tuple[str, bool]:
-    """Append stream text for the in-progress task card (near-full, soft-capped).
+    """Append one model delta to the full live conversation text.
 
-    In-progress cards show multi-line prose without the finished 2-line summary
-    clip. Only a large soft tail cap remains to avoid multi-MB paint freezes.
+    ``preview`` is the whole turn for the homepage. ``draft`` is only the
+    current, not-yet-archived assistant message for the live detail view.
     """
     chunk = str(piece or "")
     chunks.append(chunk)
     preview = f"{state.get('preview', '')}{chunk}"
-    if len(preview) > _STREAM_PREVIEW_LIMIT:
-        preview = preview[-_STREAM_PREVIEW_LIMIT:]
     state["preview"] = preview
+    state["draft"] = f"{state.get('draft', '')}{chunk}"
     now = time.monotonic()
     last_emit = float(state.get("last_emit", 0.0) or 0.0)
     should_emit = last_emit == 0.0 or now - last_emit >= _STREAM_REFRESH_INTERVAL_S
     if should_emit:
         state["last_emit"] = now
     return preview, should_emit
+
+
+def _message_role_value(message: Any) -> str:
+    role = (
+        message.get("role")
+        if isinstance(message, dict)
+        else getattr(message, "role", None)
+    )
+    return str(getattr(role, "value", role) or "").strip().lower()
 
 
 def _live_messages_signature(messages: list[Any]) -> tuple[Any, ...]:
@@ -201,14 +214,10 @@ _DOG_FACE = "∪･ω･∪"
 _DOG_EAR = "∪"
 _INPUT_MAX_LINES = 8
 _DETAIL_INPUT_MAX_LINES = 6
-_MAIN_INPUT_PREFIX_COLS = 6  # "  │" + three interior cells
-_MAIN_INPUT_RIGHT_COLS = 3  # two interior cells + "│"
+_MAIN_INPUT_PREFIX_COLS = 4  # "  › "
+_MAIN_INPUT_RIGHT_COLS = 1  # one quiet breathing column
 _MAIN_INPUT_SCROLLBAR_COLS = 1
-_DOUBLE_CLICK_S = 0.45  # task/plan card double-click window
-# High-res mice fire many SCROLL events per physical notch — require several
-# same-direction ticks before moving one card, then a short cooldown.
-_WHEEL_TASK_NOTCHES = 2
-_WHEEL_TASK_COOLDOWN_S = 0.14
+_DOUBLE_CLICK_S = 0.45  # compact todo/fleet badge double-click window
 # Windows Terminal steals Ctrl+V; we edge-detect the chord and paste images ourselves.
 _WIN32_CTRL_V_DEBOUNCE_S = 0.35
 
@@ -468,7 +477,58 @@ class InteractiveScrollbarMargin(Margin):
 
 
 class ScrollableWindow(Window):
-    """Window whose right InteractiveScrollbarMargin receives real mouse events."""
+    """Window with stable wheel routing and interactive scrollbar support."""
+
+    def __init__(
+        self,
+        *args: Any,
+        wheel_handler: Callable[[int], None] | None = None,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self._wheel_handler = wheel_handler
+
+    def _install_wheel_handlers(
+        self,
+        mouse_handlers: Any,
+        *,
+        xpos: int,
+        ypos: int,
+        width: int,
+        height: int,
+    ) -> None:
+        """Route wheel events once at window level; preserve all click handlers."""
+        if self._wheel_handler is None or width <= 0 or height <= 0:
+            return
+
+        originals: list[list[Callable[[MouseEvent], object]]] = []
+        for screen_y in range(ypos, ypos + height):
+            row = mouse_handlers.mouse_handlers[screen_y]
+            originals.append([row[x] for x in range(xpos, xpos + width)])
+
+        def wheel_or_delegate(event: MouseEvent) -> object:
+            if event.event_type is MouseEventType.SCROLL_UP:
+                self._wheel_handler(-3)
+                return None
+            if event.event_type is MouseEventType.SCROLL_DOWN:
+                self._wheel_handler(3)
+                return None
+            local_y = int(event.position.y) - ypos
+            local_x = int(event.position.x) - xpos
+            if (
+                0 <= local_y < len(originals)
+                and 0 <= local_x < len(originals[local_y])
+            ):
+                return originals[local_y][local_x](event)
+            return NotImplemented
+
+        mouse_handlers.set_mouse_handler_for_range(
+            x_min=xpos,
+            x_max=xpos + width,
+            y_min=ypos,
+            y_max=ypos + height,
+            handler=wheel_or_delegate,
+        )
 
     def write_to_screen(
         self,
@@ -492,8 +552,6 @@ class ScrollableWindow(Window):
             return
         right_widths = [self._get_margin_width(m) for m in self.right_margins]
         total_right = sum(right_widths)
-        if total_right <= 0:
-            return
         # Prefer the clamped rect Window actually painted into.
         painted = getattr(screen, "visible_windows_to_write_positions", {}).get(self)
         wp = painted if painted is not None else write_position
@@ -501,6 +559,15 @@ class ScrollableWindow(Window):
         ypos = int(wp.ypos)
         width = int(wp.width)
         height = int(wp.height)
+        self._install_wheel_handlers(
+            mouse_handlers,
+            xpos=xpos,
+            ypos=ypos,
+            width=width,
+            height=height,
+        )
+        if total_right <= 0:
+            return
         bar_x = xpos + width - total_right
         for margin, mw in zip(self.right_margins, right_widths):
             if mw > 0 and isinstance(margin, InteractiveScrollbarMargin):
@@ -516,7 +583,7 @@ class ScrollableWindow(Window):
             bar_x += mw
 
 
-# Default ``fresh``; override with CODEDOGGY_THEME=groknight|dark|quiet|cute.
+# One visual truth: obsidian canvas and role-based reading colors.
 CODEDOGGY_DARK = build_style()
 
 
@@ -541,25 +608,19 @@ class CodeDoggyTUI:
         # killed this one (GrokBuild: cancel must not bleed into the next prompt).
         self._cancelling_task_id: str | None = None
         self._cancel_grace_until: float = 0.0
-        # Tasks we already auto-opened detail for (avoid re-open every paint).
-        self._auto_opened_plan_tasks: set[str] = set()
         self._task_refs: list[str] = []
-        # -1 = no intentional selection (never treat 0 as "default first card").
+        # -1 = no intentional selection (never default to the first task).
         self._selected_task = -1
-        # False until user picks a card / keyboard-nav / follow-latest.
+        # False until the user selects a task or follows the live tail.
         # Prevents "move/click blank → yellow first task" (selection must be intentional).
         self._task_selection_active = False
-        self._selected_agent_by_task: dict[str, int] = {}
         self._selected_line = 0
         self._task_line_count = 1  # clamp cursor y — PT crashes if y >= line_count
         self._pinned_task_for_line: int | None = None  # re-pin only on task change
-        # Legacy wheel-to-card damping state (homepage wheel no longer switches).
-        self._wheel_task_accum = 0
-        self._wheel_task_last_move_at = 0.0
-        # Active-task interject flash for homepage card: task_id -> (until, preview)
+        # Active-task interject flash: task_id -> (until, preview)
         self._interject_flash: dict[str, tuple[float, str]] = {}
         self._modal_open = False
-        self._modal_kind: str = "agent"  # agent | auth | ask
+        self._modal_kind: str = "plan"  # plan | auth | ask
         self._modal_ref: tuple[str, str] | None = None
         # ask_user_question host (Grok AskUser) — blocks worker, UI inside modal.
         self._ask_event = threading.Event()
@@ -572,17 +633,15 @@ class CodeDoggyTUI:
         self._ask_other_editing = False
         self._ask_active = False
         self._detail_messages: dict[tuple[str, str], list[Any]] = {}
-        self._detail_filter: DetailFilter = "message"
-        self._detail_collapsed: set[str] = set()
-        self._detail_collapse_seeded_for: tuple[str, str] | None = None
-        self._detail_known_fold_keys: set[str] = set()
+        # Transient projection of the one assistant message currently streaming.
+        # It is cleared when that exact generation is archived into
+        # ``_detail_messages``; it never becomes a second persisted transcript.
+        self._detail_live_drafts: dict[
+            tuple[str, str], tuple[int, str]
+        ] = {}
         self._detail_cursor_line = 0
         self._detail_line_count = 1  # clamp detail cursor y — same class as task crash
         self._detail_scroll_syncing = False
-        # Cache full detail body paint — plan-mode memory tools explode message
-        # volume; re-render every 100ms freezes the UI into an "infinite loop".
-        self._detail_body_cache: StyleAndTextTuples | None = None
-        self._detail_body_cache_key: tuple[Any, ...] | None = None
         self._detail_scroll_handler: Callable[[MouseEvent], object] | None = None
         self._redraw_pending = False
         self._closing = False
@@ -590,11 +649,9 @@ class CodeDoggyTUI:
         self._quit_armed_until = 0.0
         self._feedback_text = ""
         self._feedback_kind = "info"
-        # Plan mode host hooks (task-card driven; keyboard a/s/q + Enter/Esc).
-        self._plan_ui: str | None = None  # None | "consent" | "review"
+        # Plan approval host state. The page itself is shown only while the
+        # canonical task state is ``awaiting_approval``.
         self._plan_ui_task_id: str | None = None
-        self._plan_consent_event = threading.Event()
-        self._plan_consent_ok = False
         self._plan_exit_event = threading.Event()
         self._plan_exit_outcome = "approved"
         self._plan_exit_feedback = ""
@@ -613,9 +670,16 @@ class CodeDoggyTUI:
         self._merge_confirm_ref: tuple[str, str] | None = None  # (task_id, agent_id)
         self._merge_confirm_until = 0.0
         self._merged_worktrees: set[str] = set()  # agent ids landed this session
-        # Task card: DOWN+UP same card selects; double-click / Ctrl+left opens.
+        # Reading stream: DOWN+UP on the same task region selects it.
         self._task_mouse_down_index: int | None = None
-        self._task_card_last_click: tuple[int, float] | None = None
+        # FormattedTextControl mouse links consume the terminal's native drag
+        # selection. Keep a native-feeling drag overlay: mouse-down only arms
+        # it, movement starts it, mouse-up freezes it, Ctrl+C copies it.
+        self._task_copy_pending: tuple[int, int] | None = None
+        self._task_copy_dragging = False
+        self._task_copy_anchor: tuple[int, int] | None = None
+        self._task_copy_cursor: tuple[int, int] | None = None
+        self._task_copy_text = ""
         self._todo_badge_last_click: float | None = None
         self._subagent_task: dict[str, str] = {}
         self._subagent_baselines: dict[str, set[str]] = {}
@@ -628,6 +692,7 @@ class CodeDoggyTUI:
         # Login finished while a turn was running — apply after idle.
         self._pending_reload: dict[str, Any] | None = None
         self._pending_prompt: str | None = None
+        self._pending_image_attachments: tuple[ImageAttachment, ...] = ()
         # One-shot startup brand (concept art). Dismissed forever on first task;
         # not "empty ledger" — finished tasks never bring the splash back.
         self._startup_brand = not bool(
@@ -636,10 +701,17 @@ class CodeDoggyTUI:
         # before_render throttle + splash cache (ESC/modal close snappiness)
         self._last_sync_runtime_at = 0.0
         self._doggy_empty_cache: tuple[tuple[Any, ...], StyleAndTextTuples] | None = None
-        # Full task-list fragment cache: skip card rebuild when content unchanged.
+        # Full reading-stream cache: skip rebuilding unchanged transcript rows.
         self._task_paint_cache: tuple[Any, ...] | None = None
-        # Scroll-to-latest only — does NOT auto-select a card (that caused
-        # "blank → first/latest always selected" when follow defaulted True).
+        # Conversation bodies start open. Collapsing only hides chat prose;
+        # task title/status/agents remain visible as the task-oriented layer.
+        self._collapsed_task_chats: set[str] = set()
+        # Structural anchors inside the one continuous reading stream.
+        self._task_anchor_lines: dict[str, int] = {}
+        self._agent_anchor_lines: dict[tuple[str, str], int] = {}
+        self._latest_task_tail_line = 0
+        # Scroll-to-latest does not invent selection; it only follows the newest
+        # visible conversation until the user scrolls upward.
         self._follow_latest_task = False
         # Live tool/activity lines from on_live_message (effect layer, not truth).
         self._activity = LiveActivityBoard()
@@ -651,6 +723,12 @@ class CodeDoggyTUI:
         self._last_pasted_path: str | None = None
         self._win32_ctrl_v_down = False
         self._win32_ctrl_v_last_at = 0.0
+        # A tool preview is a projection of one canonical transcript record.
+        # Transient: Ctrl+move. Pinned: Ctrl+click. It is never a detail page.
+        self._tool_hover_ref: tuple[str, str, str] | None = None
+        self._tool_preview_ref: tuple[str, str, str] | None = None
+        self._tool_preview_pinned = False
+        self._tool_preview_buffer_key: tuple[Any, ...] | None = None
 
         self._task_control = FormattedTextControl(
             text=self._render_tasks,
@@ -658,12 +736,14 @@ class CodeDoggyTUI:
             show_cursor=False,
             get_cursor_position=self._task_cursor_position,
         )
-        self._task_window = Window(
+        self._wire_task_text_selection_control()
+        self._task_window = ScrollableWindow(
             content=self._task_control,
             wrap_lines=False,  # line y == content row; wrap broke scroll/cursor map
-            # Wheel does not switch cards (let Window scroll the list if needed).
-            # Cursor pin + ScrollOffsets keep the selected card in view.
-            scroll_offsets=ScrollOffsets(top=1, bottom=3),
+            # This window owns wheel state. A hidden cursor must not pull a
+            # manually selected viewport back during the next paint.
+            wheel_handler=self._scroll_tasks,
+            scroll_offsets=ScrollOffsets(top=0, bottom=0),
             style="class:root",
             dont_extend_height=False,
         )
@@ -754,22 +834,8 @@ class CodeDoggyTUI:
                         style="class:detail.input.placeholder",
                     ),
                     Condition(
-                        lambda: self._modal_kind == "agent"
+                        lambda: self._modal_kind == "plan"
                         and self._task_awaiting_plan_approval()
-                        and (
-                            not getattr(self, "_detail_input", None)
-                            or not self._detail_input.text
-                        )
-                    ),
-                ),
-                ConditionalProcessor(
-                    AfterInput(
-                        "任务进行中可在这里补一句…",
-                        style="class:detail.input.placeholder",
-                    ),
-                    Condition(
-                        lambda: self._modal_kind == "agent"
-                        and not self._task_awaiting_plan_approval()
                         and (
                             not getattr(self, "_detail_input", None)
                             or not self._detail_input.text
@@ -811,8 +877,19 @@ class CodeDoggyTUI:
         self._detail_input.buffer.on_text_changed += (
             lambda _buf: self._invalidate_safe()
         )
+        self._tool_preview_body = TextArea(
+            height=Dimension(weight=1, min=4),
+            multiline=True,
+            wrap_lines=True,
+            scrollbar=True,
+            read_only=True,
+            focus_on_click=True,
+            style="class:tool.preview.body",
+        )
         self._wire_buffer_ctrl_click(self._input)
         self._wire_buffer_ctrl_click(self._detail_input)
+        self._wire_buffer_outside_tool_preview(self._input)
+        self._wire_buffer_outside_tool_preview(self._detail_input)
 
         header = Window(
             FormattedTextControl(self._render_header),
@@ -864,7 +941,7 @@ class CodeDoggyTUI:
                 height=1,
                 style="class:root",
             ),
-            # A detail surface owns its own context-sensitive footer. Keeping the
+            # A replacement page owns its own context-sensitive footer. Keeping the
             # global shortcut row underneath duplicates controls and creates two
             # competing visual bottoms.
             filter=Condition(lambda: not self._modal_open),
@@ -928,16 +1005,22 @@ class CodeDoggyTUI:
         modal_panel = HSplit(
             [
                 modal_header,
-                Window(
-                    FormattedTextControl(self._render_modal_filters),
-                    height=1,
-                    style="class:agent-window",
+                ConditionalContainer(
+                    Window(
+                        FormattedTextControl(self._render_modal_filters),
+                        height=1,
+                        style="class:agent-window",
+                    ),
+                    filter=Condition(lambda: self._modal_kind == "auth"),
                 ),
-                Window(height=1, char="─", style="class:separator"),
+                ConditionalContainer(
+                    Window(height=1, char="─", style="class:separator"),
+                    filter=Condition(lambda: self._modal_kind == "auth"),
+                ),
                 # Message/tool: FormattedText. Plan: selectable TextArea (no MD flood).
                 ConditionalContainer(
                     self._detail_window,
-                    filter=Condition(lambda: not self._plan_body_visible()),
+                    filter=Condition(lambda: self._modal_kind == "auth"),
                 ),
                 ConditionalContainer(
                     plan_panel,
@@ -1054,35 +1137,43 @@ class CodeDoggyTUI:
                 lambda: bool(self._ask_active and self._modal_kind == "ask")
             ),
         )
-        # Floating "jump to bottom" chip — NOT inside the scrollable detail
-        # body (that would scroll away). Own Float sits above the modal.
-        self._detail_jump_fab = ConditionalContainer(
-            Window(
-                FormattedTextControl(
-                    self._render_detail_jump_fab,
-                    focusable=False,
-                    show_cursor=False,
-                ),
-                height=1,
-                width=Dimension.exact(10),
-                style="class:detail.jump.fab",
-                dont_extend_width=True,
-                dont_extend_height=True,
+        tool_preview = ConditionalContainer(
+            HSplit(
+                [
+                    Window(
+                        FormattedTextControl(self._render_tool_preview_header),
+                        height=2,
+                        style="class:tool.preview.header",
+                    ),
+                    Window(
+                        height=1,
+                        char="─",
+                        style="class:tool.preview.rule",
+                    ),
+                    self._tool_preview_body,
+                    Window(
+                        FormattedTextControl(self._render_tool_preview_footer),
+                        height=1,
+                        style="class:tool.preview.footer",
+                    ),
+                ],
+                style="class:tool.preview",
             ),
-            filter=Condition(self._detail_jump_fab_visible),
+            filter=Condition(self._tool_preview_visible),
         )
         root = FloatContainer(
             content=body,
             floats=[
-                # FAB: fixed on the viewport over agent detail (scroll-independent).
+                # Tool inspection stays over the reading stream. It is
+                # transient on Ctrl+move and becomes selectable on Ctrl+click.
                 Float(
-                    bottom=4,
-                    right=5,
-                    width=10,
-                    height=1,
-                    content=self._detail_jump_fab,
-                    transparent=True,
-                    z_index=15,
+                    top=3,
+                    bottom=6,
+                    left=6,
+                    right=6,
+                    content=tool_preview,
+                    transparent=False,
+                    z_index=30,
                 ),
                 # Questionnaire: compact bordered float (not full-screen).
                 Float(
@@ -1229,6 +1320,7 @@ class CodeDoggyTUI:
             task = self.ledger.create(str(getattr(request, "text", "") or ""))
             task_id = task.id
             main_id = f"{task_id}:main"
+            detail_key = (task_id, main_id)
             messages: list[Any] = []
             streamed: list[str] = []
             stream_state: dict[str, Any] = {}
@@ -1239,8 +1331,15 @@ class CodeDoggyTUI:
             def on_live_message(message: Any) -> None:
                 if not callback_state["active"] or self._closing:
                     return
+                archived_generation: int | None = None
+                if _message_role_value(message) == "assistant":
+                    archived_generation = int(
+                        stream_state.get("draft_generation", 0) or 0
+                    )
+                    stream_state["draft"] = ""
+                    stream_state["draft_generation"] = archived_generation + 1
                 # Track tools for status chips only — never paint tool noise on
-                # the task-card cover (cover shows message prose; tools live in detail).
+                # the lightweight agent summary; tools remain canonical messages.
                 self._activity.observe(task_id, main_id, message)
                 if (
                     callable(prior_live)
@@ -1253,6 +1352,10 @@ class CodeDoggyTUI:
                     if not callback_state["active"] or self._closing:
                         return
                     messages.append(message)
+                    if archived_generation is not None:
+                        self._clear_detail_live_draft(
+                            detail_key, archived_generation
+                        )
                     self._request_redraw()
 
                 self._call_in_ui_thread(apply)
@@ -1273,6 +1376,11 @@ class CodeDoggyTUI:
                         label="MAIN",
                         status="running",
                         output=preview,
+                    )
+                    self._set_detail_live_draft(
+                        detail_key,
+                        int(stream_state.get("draft_generation", 0) or 0),
+                        str(stream_state.get("draft", "") or ""),
                     )
                 if not callback_state["active"] or self._closing:
                     return False
@@ -1302,12 +1410,14 @@ class CodeDoggyTUI:
                     self._active_task_id = task_id
                     self._task_started_at = time.monotonic()
                 # Do not steal focus / selection after a turn starts — stay on input.
-                self._detail_messages[(task_id, main_id)] = messages
+                self._detail_messages[detail_key] = messages
                 self._activity.clear_task(task_id)
                 self._subagent_baselines[task_id] = {
                     item.subagent_id for item in self._subagents()
                 }
                 self._dismiss_startup_brand()
+                self._follow_latest_task = True
+                self._pinned_task_for_line = None
                 self._set_feedback("后台任务已进入 MAIN", "info")
                 self._invalidate_safe()
 
@@ -1375,13 +1485,11 @@ class CodeDoggyTUI:
                 if self._active_task_id == task_id:
                     self._active_task_id = previous_active
                     self._task_started_at = previous_started
-            # Terminal state is on the task card — only surface failures.
+            # Terminal state is already visible in the task header.
             if status != "completed":
                 self._set_feedback("后台任务未完成", "warning")
             else:
                 self._clear_feedback()
-            if status != "cancelled":
-                self._open_plan_detail_on_finish(task_id, status=status)
             self._invalidate_safe()
 
         self._call_in_ui_thread(apply_end)
@@ -1482,7 +1590,7 @@ class CodeDoggyTUI:
             self._detail_messages[detail_key] = msgs
             self._subagent_live_signatures[detail_key] = _live_messages_signature(msgs)
 
-        # Track tools for detail; card/cover prose stays message-only.
+        # Tool and prose updates share the same canonical live message list.
         if message is not None:
             self._activity.observe(task_id, sub_id, message)
         elif live:
@@ -1510,7 +1618,6 @@ class CodeDoggyTUI:
         keys = KeyBindings()
         modal = Condition(lambda: self._modal_open)
         auth_modal = Condition(lambda: self._modal_open and self._modal_kind == "auth")
-        agent_modal = Condition(lambda: self._modal_open and self._modal_kind == "agent")
         ask_modal = Condition(
             lambda: bool(self._ask_active and self._modal_kind == "ask")
         )
@@ -1519,24 +1626,11 @@ class CodeDoggyTUI:
             and not self._ask_active
             and get_app().layout.has_focus(self._task_window)
         )
-        # Scroll detail with ↑↓ whenever agent modal is open and the interject
-        # box is not focused (do not require detail_window focus — title/filter
-        # clicks used to leave keys dead).
-        detail_focused = Condition(
-            lambda: self._modal_open
-            and self._modal_kind == "agent"
-            and not get_app().layout.has_focus(self._detail_input)
-        )
         auth_list_focused = Condition(
             lambda: self._modal_open
             and self._modal_kind == "auth"
             and self._auth_wizard.step != WizardStep.PASTE
             and get_app().layout.has_focus(self._detail_window)
-        )
-        auth_paste = Condition(
-            lambda: self._modal_open
-            and self._modal_kind == "auth"
-            and self._auth_wizard.step == WizardStep.PASTE
         )
         # Main prompt or detail interject (not auth token paste).
         prompt_paste = Condition(
@@ -1544,7 +1638,7 @@ class CodeDoggyTUI:
                 get_app().layout.has_focus(self._input)
                 or (
                     self._modal_open
-                    and self._modal_kind == "agent"
+                    and self._modal_kind == "plan"
                     and get_app().layout.has_focus(self._detail_input)
                 )
             )
@@ -1620,7 +1714,7 @@ class CodeDoggyTUI:
         def _ctrl_space_tasks(_: Any) -> None:
             self._tab_task_cycle()
 
-        # Todo list open: ↑↓ scroll the plan checklist (not task cards).
+        # Todo list open: ↑↓ scroll the checklist, not the transcript.
         todo_pane_nav = Condition(
             lambda: self._todo_pane_open
             and not self._fleet_pane_open
@@ -1683,51 +1777,6 @@ class CodeDoggyTUI:
         def _fleet_merge(_: Any) -> None:
             self._merge_fleet_cursor()
 
-        # Detail modal: m merges open agent's worktree (double-tap confirm).
-        detail_merge_ok = Condition(
-            lambda: self._modal_open
-            and self._modal_kind == "agent"
-            and self._modal_ref is not None
-            and not get_app().layout.has_focus(self._detail_input)
-        )
-
-        @keys.add("m", filter=detail_merge_ok, eager=True)
-        def _detail_merge(_: Any) -> None:
-            if self._modal_ref is None:
-                return
-            tid, aid = self._modal_ref
-            agent = self.ledger.get_agent(tid, aid)
-            label = (agent.label if agent else None) or aid
-            status = (agent.status if agent else "") or ""
-            self._request_or_confirm_merge(tid, aid, label, status=status)
-
-        # Agent detail: Tab closes → tasks (via tab_tasks_ok). Detail input
-        # focus stays via click / Space patterns elsewhere.
-
-        @keys.add("up", filter=detail_focused, eager=True)
-        def _detail_up(_: Any) -> None:
-            self._move_detail_cursor(-1)
-
-        @keys.add("down", filter=detail_focused, eager=True)
-        def _detail_down(_: Any) -> None:
-            self._move_detail_cursor(1)
-
-        @keys.add("pageup", filter=detail_focused, eager=True)
-        def _detail_page_up(_: Any) -> None:
-            self._move_detail_cursor(-max(4, _terminal_height() - 10))
-
-        @keys.add("pagedown", filter=detail_focused, eager=True)
-        def _detail_page_down(_: Any) -> None:
-            self._move_detail_cursor(max(4, _terminal_height() - 10))
-
-        @keys.add("home", filter=detail_focused, eager=True)
-        def _detail_home(_: Any) -> None:
-            self._scroll_detail_to_line(0)
-
-        @keys.add("end", filter=detail_focused, eager=True)
-        def _detail_end(_: Any) -> None:
-            self._scroll_detail_to_bottom()
-
         @keys.add("up", filter=auth_list_focused)
         @keys.add("k", filter=auth_list_focused)
         def _auth_up(_: Any) -> None:
@@ -1751,49 +1800,44 @@ class CodeDoggyTUI:
                 self._auth_wizard.set_cursor(index)
                 self._dispatch_wizard_action(self._auth_wizard.activate())
 
-        @keys.add("left", filter=detail_focused)
-        def _detail_filter_prev(_: Any) -> None:
-            self._cycle_detail_filter(-1)
-
-        @keys.add("right", filter=detail_focused)
-        def _detail_filter_next(_: Any) -> None:
-            self._cycle_detail_filter(1)
-
         @keys.add("enter", filter=tasks_focused)
         def _open_selected(_: Any) -> None:
             self._open_selected_task()
 
+        task_text_selected = Condition(
+            lambda: bool(self._task_copy_text) and not self._ask_active
+        )
+
+        @keys.add(
+            "c-c",
+            filter=~modal & ~has_selection & task_text_selected,
+            eager=True,
+        )
+        def _copy_selected_task_text(_: Any) -> None:
+            self._copy_task_text_to_clipboard(self._task_copy_text)
+
         @keys.add("up", filter=tasks_focused)
-        def _previous_task(_: Any) -> None:
-            self._move_task(-1)
+        def _scroll_transcript_up(_: Any) -> None:
+            self._scroll_tasks(-1)
 
         @keys.add("down", filter=tasks_focused)
-        def _next_task(_: Any) -> None:
-            self._move_task(1)
-
-        @keys.add("left", filter=tasks_focused)
-        def _previous_task_agent(_: Any) -> None:
-            self._move_task_agent(-1)
-
-        @keys.add("right", filter=tasks_focused)
-        def _next_task_agent(_: Any) -> None:
-            self._move_task_agent(1)
+        def _scroll_transcript_down(_: Any) -> None:
+            self._scroll_tasks(1)
 
         @keys.add("space", filter=tasks_focused)
         def _focus_prompt(event: Any) -> None:
             event.app.layout.focus(self._input)
-            # Keep _task_selection_active so Tab returns to the same card
+            # Keep _task_selection_active so Tab returns to the same task
             # (chrome dims while input is focused, but selection is sticky).
             event.app.invalidate()
 
         @keys.add("pageup", filter=tasks_focused)
         def _tasks_page_up(_: Any) -> None:
-            # Jump several cards (not document lines).
-            self._move_task(-max(2, _terminal_height() // 12))
+            self._scroll_tasks(-max(4, _terminal_height() - 10))
 
         @keys.add("pagedown", filter=tasks_focused)
         def _tasks_page_down(_: Any) -> None:
-            self._move_task(max(2, _terminal_height() // 12))
+            self._scroll_tasks(max(4, _terminal_height() - 10))
 
         @keys.add("c-l", filter=~modal)
         def _open_auth(_: Any) -> None:
@@ -1831,6 +1875,10 @@ class CodeDoggyTUI:
 
         @keys.add("escape", eager=True)
         def _escape(event: Any) -> None:
+            if self._tool_preview_ref is not None:
+                self._tool_hover_ref = None
+                self._close_tool_preview(restore_focus=True)
+                return
             # Esc = cancel running task only (not leave UI layers — use Tab).
             # eager=True: do not wait for ambiguous CSI sequences after Esc
             # when we only need a plain cancel (avoids "delayed" multi-cancel).
@@ -1864,15 +1912,10 @@ class CodeDoggyTUI:
         def _quit(_: Any) -> None:
             self._request_quit()
 
-        # Plan approval (detail plan tab, or resume chrome). Enter-plan consent removed.
+        # Approval keys exist only on the visible, canonical approval page.
         plan_review = Condition(
-            lambda: self._plan_ui == "review"
-            or (
-                self._modal_open
-                and self._modal_kind == "agent"
-                and self._detail_filter == "plan"
-                and self._task_awaiting_plan_approval()
-            )
+            lambda: self._plan_body_visible()
+            and not self.app.layout.has_focus(self._detail_input)
         )
         plan_tab = Condition(self._plan_body_visible)
 
@@ -2001,10 +2044,34 @@ class CodeDoggyTUI:
             "info",
         )
 
+    def _image_attachments_for_prompt(
+        self,
+        prompt: str,
+    ) -> tuple[ImageAttachment, ...]:
+        """Resolve the image chips still present when the prompt is submitted."""
+        cwd = getattr(self.session, "cwd", None) or Path.cwd()
+        attachments: list[ImageAttachment] = []
+        seen: set[str] = set()
+        for raw_path in extract_image_chip_paths(prompt):
+            resolved = resolve_openable_path(raw_path, cwd=cwd)
+            if resolved is None:
+                raise AttachmentError(f"file not found: {raw_path}")
+            key = str(resolved).lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            attachments.append(ImageAttachment.from_path(resolved))
+        return tuple(attachments)
+
     def _accept_prompt(self, buffer: Any) -> bool:
         prompt = buffer.text.strip()
         if not prompt:
             buffer.text = ""
+            return True
+        try:
+            image_attachments = self._image_attachments_for_prompt(prompt)
+        except AttachmentError as exc:
+            self._set_feedback(f"图片无法发送 · {exc}", "warning")
             return True
         # Persist into ↑/↓ history before clearing (prompt_toolkit stores on accept
         # only when working_index is at the end — we also append explicitly).
@@ -2026,21 +2093,26 @@ class CodeDoggyTUI:
                 self._input.text = prompt
                 self.app.invalidate()
                 return True
-            self.session.interject(prompt, prompt_id=tid)
+            self.session.interject(
+                strip_image_chips(prompt),
+                prompt_id=tid,
+                attachments=image_attachments,
+            )
             if tid:
                 self._note_interject(tid, prompt)
-            # Interject flash lives on the task card — no toast.
+            # Interject flash lives in the active task header.
             self.app.invalidate()
             return True
         if not self._ensure_auth_ready():
             self._pending_prompt = prompt
+            self._pending_image_attachments = image_attachments
             self._open_auth_wizard()
             # Keep text in the box so the user can edit; send resumes after login.
             self._input.text = prompt
             preview = _truncate_display(prompt.replace("\n", " "), 36)
             self._set_feedback(f"先登录 · 将发送：{preview}", "warning")
             return True
-        self._start_task(prompt)
+        self._start_task(prompt, image_attachments=image_attachments)
         return True
 
     def _accept_detail_prompt(self, buffer: Any) -> bool:
@@ -2053,6 +2125,10 @@ class CodeDoggyTUI:
         if self._modal_kind == "ask":
             # Other free-text is confirmed via same path as option Enter.
             self._ask_confirm_current()
+            return True
+        if self._modal_kind == "plan":
+            if buffer.text.strip():
+                self._resolve_plan_exit("revise")
             return True
 
         prompt = buffer.text.strip()
@@ -2090,7 +2166,7 @@ class CodeDoggyTUI:
         return True
 
     def _note_interject(self, task_id: str, text: str) -> None:
-        """Homepage card pulse: show 插入中 until flash expires."""
+        """Show the homepage 插入中 pulse until it expires."""
         preview = _truncate_display(
             " ".join((text or "").split()) or "…", 42
         )
@@ -2121,11 +2197,16 @@ class CodeDoggyTUI:
             return None
         return preview
 
-    def _start_task(self, prompt: str) -> None:
+    def _start_task(
+        self,
+        prompt: str,
+        *,
+        image_attachments: tuple[ImageAttachment, ...] = (),
+    ) -> None:
         self._dismiss_startup_brand()
         self._bind_subagent_listener()
         task = self.ledger.create(prompt)
-        # Keep keyboard on the prompt — do not auto-open detail on send.
+        # Keep keyboard on the composer; the answer streams above it.
         self._active_task_id = task.id
         # New task is not mid-cancel; keep _cancel_grace_until so a lagged Esc
         # from the previous cancel cannot instantly kill this turn.
@@ -2133,19 +2214,25 @@ class CodeDoggyTUI:
         self._detail_messages[(task.id, f"{task.id}:main")] = []
         self._activity.clear_task(task.id)
         self._task_started_at = time.monotonic()
+        self._follow_latest_task = True
+        self._pinned_task_for_line = None
         self._subagent_baselines[task.id] = {
             item.subagent_id for item in self._subagents()
         }
         self._clear_feedback()
         worker = threading.Thread(
             target=self._run_task,
-            args=(task.id, prompt),
+            args=(
+                task.id,
+                strip_image_chips(prompt) if image_attachments else prompt,
+                image_attachments,
+            ),
             name=f"codedoggy-{task.id}",
             daemon=True,
         )
         self._worker = worker
         worker.start()
-        # Do not yank focus off a card/modal the user already moved to.
+        # Do not yank focus away from a task or modal the user selected.
         try:
             layout = self.app.layout
             if self._modal_open:
@@ -2169,7 +2256,12 @@ class CodeDoggyTUI:
     def _showing_startup_brand(self) -> bool:
         return self._startup_brand and not self.ledger.snapshots()
 
-    def _run_task(self, task_id: str, prompt: str) -> None:
+    def _run_task(
+        self,
+        task_id: str,
+        prompt: str,
+        image_attachments: tuple[ImageAttachment, ...] = (),
+    ) -> None:
         runner = getattr(self.session.extensions, "turn_runner", None)
         legacy_runner_events = bool(
             runner is not None
@@ -2189,6 +2281,13 @@ class CodeDoggyTUI:
         def on_live_message(message: Any) -> None:
             if not callback_state["active"] or self._closing:
                 return
+            archived_generation: int | None = None
+            if _message_role_value(message) == "assistant":
+                archived_generation = int(
+                    stream_state.get("draft_generation", 0) or 0
+                )
+                stream_state["draft"] = ""
+                stream_state["draft_generation"] = archived_generation + 1
             # Tools stay on the activity board / detail 工具 tab — not the cover.
             self._activity.observe(task_id, main_agent_id, message)
             if (
@@ -2203,6 +2302,10 @@ class CodeDoggyTUI:
                     return
                 # UI-thread only: shared list is also read by modal paint.
                 turn_messages.append(message)
+                if archived_generation is not None:
+                    self._clear_detail_live_draft(
+                        detail_key, archived_generation
+                    )
                 self._request_redraw()
 
             self._call_in_ui_thread(apply)
@@ -2224,6 +2327,11 @@ class CodeDoggyTUI:
                     status="running",
                     output=preview,
                 )
+                self._set_detail_live_draft(
+                    detail_key,
+                    int(stream_state.get("draft_generation", 0) or 0),
+                    str(stream_state.get("draft", "") or ""),
+                )
             if should_emit and callback_state["active"] and not self._closing:
                 self._request_redraw()
             return callback_state["active"] and not self._closing
@@ -2235,6 +2343,7 @@ class CodeDoggyTUI:
             result = self.session.handle_prompt(
                 prompt,
                 prompt_id=task_id,
+                attachments=image_attachments,
                 metadata={
                     "tui_task_id": task_id,
                     "stream_sample": True,
@@ -2273,8 +2382,6 @@ class CodeDoggyTUI:
             failed_children = [
                 agent for agent in children if agent.status in {"failed", "cancelled"}
             ]
-            open_detail = False
-            finish_status = status
             if open_children:
                 # MAIN turn ended but children still run — not failure / not done.
                 # _sync_runtime finishes the task when children become terminal.
@@ -2284,28 +2391,19 @@ class CodeDoggyTUI:
             elif failed_children:
                 self.ledger.finish_task(task_id, "failed")
                 feedback = ("子 Agent 未全部成功", "warning")
-                open_detail = True
-                finish_status = "failed"
             elif status == "completed":
                 self.ledger.finish_task(task_id, "completed")
-                # Card already shows 已完成 + duration — no toast.
+                # Task header already shows completion + duration.
                 feedback = None
-                open_detail = True
-                finish_status = "completed"
             else:
                 self.ledger.finish_task(task_id, status)
                 feedback = (_friendly_failure_toast(result.error or output), "warning")
-                # Cancelled by Esc: leave list; other terminal outcomes open detail.
-                open_detail = status != "cancelled"
-                finish_status = status
 
             def apply_success() -> None:
                 if feedback is None:
                     self._clear_feedback()
                 else:
                     self._set_feedback(feedback[0], feedback[1])
-                if open_detail:
-                    self._open_plan_detail_on_finish(task_id, status=finish_status)
 
             self._call_in_ui_thread(apply_success)
         except Exception as exc:  # noqa: BLE001
@@ -2329,18 +2427,14 @@ class CodeDoggyTUI:
                 for a in ([] if task is None else task.agents[1:])
                 if a.status in {"pending", "running"}
             ]
-            open_detail_fail = False
             if open_kids:
                 self.ledger.set_task_status(task_id, "running")
                 self.ledger.set_task_phase(task_id, "parallel")
             else:
                 self.ledger.finish_task(task_id, "failed")
-                open_detail_fail = True
 
             def apply_fail() -> None:
                 self._set_feedback(friendly, "warning")
-                if open_detail_fail:
-                    self._open_plan_detail_on_finish(task_id, status="failed")
 
             self._call_in_ui_thread(apply_fail)
         finally:
@@ -2363,6 +2457,31 @@ class CodeDoggyTUI:
 
     def _before_render(self) -> None:
         """prompt_toolkit before_render hook — keep off the hot path when idle."""
+        # Windows mouse events do not fire when only the Ctrl key changes.
+        # Poll the real key state so both orders work:
+        # Ctrl→move and move→Ctrl. Pinned previews ignore key release.
+        if sys.platform == "win32" and not self._tool_preview_pinned:
+            control_held = _mouse_control_held()
+            if control_held and self._tool_hover_ref is not None:
+                if self._tool_preview_ref != self._tool_hover_ref:
+                    self._show_tool_preview(
+                        self._tool_hover_ref,
+                        pinned=False,
+                    )
+            elif self._tool_preview_ref is not None:
+                self._close_tool_preview(restore_focus=False)
+        if self._tool_preview_ref is not None:
+            try:
+                self._sync_tool_preview_buffer()
+            except Exception:  # noqa: BLE001
+                self._close_tool_preview(restore_focus=False)
+        # The approval page is a state surface, not a plan archive.
+        if (
+            self._modal_open
+            and self._modal_kind == "plan"
+            and not self._task_awaiting_plan_approval()
+        ):
+            self._leave_plan_approval()
         # Refresh selectable plan buffer when disk mtime changes (no FormattedText).
         if self._plan_body_visible():
             try:
@@ -2375,7 +2494,7 @@ class CodeDoggyTUI:
         except Exception:  # noqa: BLE001
             pass
         # Goal mode is exclusive of plan approval chrome.
-        self._clear_plan_ui_if_goal()
+        self._clear_plan_approval_if_goal()
         # Interactive detail scrollbar only touches vertical_scroll;
         # re-anchor the detail cursor so get_cursor_position cannot snap back.
         self._sync_detail_scroll_from_window()
@@ -2386,6 +2505,7 @@ class CodeDoggyTUI:
         # paste the chip ourselves (text paste still comes from the terminal).
         self._poll_win32_ctrl_v_image_paste()
         self._sync_runtime()
+        self._sync_task_follow_scroll()
 
     def _prompt_buffer_for_paste(self) -> Any | None:
         """Active prompt buffer (main or detail interject), or None."""
@@ -2395,7 +2515,7 @@ class CodeDoggyTUI:
                 return self._input.buffer
             if (
                 self._modal_open
-                and self._modal_kind == "agent"
+                and self._modal_kind == "plan"
                 and layout.has_focus(self._detail_input)
             ):
                 return self._detail_input.buffer
@@ -2444,28 +2564,32 @@ class CodeDoggyTUI:
         self._insert_image_chip(buffer, saved, cwd=cwd)
         self._invalidate_safe()
 
-    def _clear_plan_ui_if_goal(self) -> None:
-        """If session entered Goal, drop plan approval chrome."""
-        if not self._plan_ui:
+    def _clear_plan_approval_if_goal(self) -> None:
+        """Goal mode is exclusive: close and abandon a pending approval."""
+        if not (
+            self._plan_exit_waiting
+            or (self._modal_open and self._modal_kind == "plan")
+        ):
             return
         kernel = getattr(self.session.extensions, "kernel", None)
         state = getattr(kernel, "session_mode_state", None) if kernel else None
         if state is None or not getattr(state, "is_goal", lambda: False)():
             return
-        self._plan_ui = None
+        self._plan_exit_outcome = "abandoned"
         self._plan_exit_waiting = False
+        if self._modal_open and self._modal_kind == "plan":
+            self._leave_plan_approval()
         try:
             self._plan_exit_event.set()
         except Exception:  # noqa: BLE001
             pass
 
     def _sync_task_plan_with_session(self) -> None:
-        """Mirror session Plan onto the active task card.
+        """Mirror session Plan state onto the active task boundary.
 
         - Session plan active → task plan_state at least ``planning``
         - Session awaiting approval → ``awaiting_approval``
-        - Session left plan / task terminal → clear draft chrome so cards do not
-          stick on「计划起草中」after the turn finished talking
+        - Session left plan / task terminal → clear stale planning state
         Does not stomp execution phases once past planning/plan_review.
         """
         tid = self._active_task_id
@@ -2476,7 +2600,7 @@ class CodeDoggyTUI:
             return
         # Terminal tasks: drop draft/review chrome (finish_task also clears).
         if task.phase in {"done", "failed", "cancelled"}:
-            if task.plan_state in {"planning", "consent", "awaiting_approval"}:
+            if task.plan_state in {"planning", "awaiting_approval"}:
                 self.ledger.set_plan_state(tid, "none")
             return
         kernel = getattr(self.session.extensions, "kernel", None)
@@ -2494,14 +2618,14 @@ class CodeDoggyTUI:
             getattr(state, "is_plan", lambda: False)()
             or getattr(state, "is_plan_ui", lambda: False)()
         ):
-            if task.plan_state in {"none", "", "consent"}:
+            if task.plan_state in {"none", ""}:
                 self.ledger.set_plan_state(
                     tid, "planning", plan_file=plan_file or None
                 )
             return
         # Session no longer in plan UI: clear stale draft chrome if we already
         # moved into real work (or never needed plan chrome).
-        if task.plan_state in {"planning", "consent"} and task.phase not in {
+        if task.plan_state == "planning" and task.phase not in {
             "planning",
             "plan_review",
         }:
@@ -2518,9 +2642,9 @@ class CodeDoggyTUI:
     def _sync_runtime(self) -> None:
         now = time.monotonic()
         running = self._is_running()
-        # Agent detail open: throttle hard — full subagent + plan sync every
+        # Approval page open: throttle hard — full subagent + plan sync every
         # paint was freezing the UI when memory tools flooded the transcript.
-        if self._modal_open and self._modal_kind == "agent":
+        if self._modal_open and self._modal_kind == "plan":
             if (now - self._last_sync_runtime_at) < 0.45:
                 return
         elif not running and (now - self._last_sync_runtime_at) < 0.35:
@@ -2599,7 +2723,7 @@ class CodeDoggyTUI:
                                 description=description,
                             )
 
-        # Keep task card plan_state aligned with session Plan mode / open todos.
+        # Keep task plan_state aligned with the canonical session mode.
         self._sync_task_plan_with_session()
 
         for task in self.ledger.snapshots():
@@ -2628,8 +2752,6 @@ class CodeDoggyTUI:
                     )
                     end_status = "failed" if failed else "completed"
                     self.ledger.finish_task(task.id, end_status)
-                    # Children just became terminal — open detail like MAIN finish.
-                    self._open_plan_detail_on_finish(task.id, status=end_status)
             else:
                 self.ledger.set_task_phase(task.id, "dispatching")
 
@@ -2849,6 +2971,17 @@ class CodeDoggyTUI:
         """
 
         def handler(event: MouseEvent) -> object:
+            if event.event_type is MouseEventType.SCROLL_UP:
+                self._scroll_tasks(-3)
+                return None
+            if event.event_type is MouseEventType.SCROLL_DOWN:
+                self._scroll_tasks(3)
+                return None
+            if event.event_type is MouseEventType.MOUSE_MOVE:
+                self._tool_hover_ref = None
+                if not self._tool_preview_pinned:
+                    self._close_tool_preview(restore_focus=False)
+                return NotImplemented
             if event.event_type not in {
                 MouseEventType.MOUSE_DOWN,
                 MouseEventType.MOUSE_UP,
@@ -2856,6 +2989,7 @@ class CodeDoggyTUI:
                 return NotImplemented
             if self._modal_open or self._ask_active:
                 return None
+            self._close_tool_preview(restore_focus=False)
             try:
                 self.app.layout.focus(self._input)
             except Exception:  # noqa: BLE001
@@ -2884,35 +3018,24 @@ class CodeDoggyTUI:
         line_number: int,
         wrap_count: int,
     ) -> StyleAndTextTuples:
-        """Left rail and indent for every logical and soft-wrapped input row."""
-        border = self._prompt_border_class()
+        """Compact composer marker for every logical and wrapped input row."""
         first_visual_row = line_number == 0 and wrap_count == 0
-        interior: StyleAndTextTuples
         if first_visual_row:
-            interior = [
-                ("class:input", " "),
-                ("class:prompt", "› "),
-            ]
-        else:
-            interior = [("class:input", "   ")]
-        return self._with_input_focus_mouse(
-            [(border, "  │"), *interior]
-        )
+            return self._with_input_focus_mouse(
+                [("class:input", "  "), ("class:prompt", "› ")]
+            )
+        return self._with_input_focus_mouse([("class:input", "    ")])
 
     def _render_prompt_top(self) -> StyleAndTextTuples:
         width = max(16, _content_width())
         border = self._prompt_border_class()
-        rail_width = width - 4
-        # The composer is the one persistent component that benefits from a
-        # boundary. Keep it structural: no title plate interrupting the rail.
+        rule_width = max(1, width - 2)
         return self._with_input_focus_mouse(
-            [(border, "  ╭" + "─" * rail_width + "╮")]
+            [(border, "  " + "━" * rule_width)]
         )
 
     def _render_prompt_right(self) -> StyleAndTextTuples:
-        # One │ per visual input row so the frame grows with wrap height.
-        # Must use the same border class as top/bottom — never a hard-coded cyan.
-        border = self._prompt_border_class()
+        # One breathing cell per visual row. No right-hand frame.
         rows = 1
         try:
             rows = max(
@@ -2929,8 +3052,7 @@ class CodeDoggyTUI:
             rows = 1
         fragments: StyleAndTextTuples = []
         for i in range(rows):
-            fragments.append(("class:input", "  "))
-            fragments.append((border, "│"))
+            fragments.append(("class:input", " "))
             if i + 1 < rows:
                 fragments.append(("", "\n"))
         return self._with_input_focus_mouse(fragments)
@@ -3005,18 +3127,13 @@ class CodeDoggyTUI:
     def _render_prompt_bottom(self) -> StyleAndTextTuples:
         width = max(16, _content_width())
         caption_text = _truncate_display(
-            session_surface.model_and_mode_text(self.session), width - 10
+            session_surface.model_and_mode_text(self.session), width - 4
         )
-        caption = f" {caption_text} "
-        fill = max(1, width - 4 - get_cwidth(caption))
-        border = self._prompt_border_class()
-        # Full solid focus border — match selected task-card chrome (no dim mid-rail).
+        caption = f"  {caption_text}"
+        fill = max(0, width - get_cwidth(caption))
         return self._with_input_focus_mouse(
             [
-                (border, "  ╰"),
-                (border, "─" * fill),
-                ("class:prompt.caption", caption),
-                (border, "╯"),
+                ("class:prompt.caption", " " * fill + caption),
             ]
         )
 
@@ -3048,6 +3165,14 @@ class CodeDoggyTUI:
                 ("↑↓", "选择", "noop", False),
                 ("Enter", "确认", "noop", False),
                 ("Tab", "返回", "auth_back", False),
+                ("Ctrl+Q", "退出", "quit", True),
+            ]
+        elif self._modal_open and self._modal_kind == "plan":
+            items = [
+                ("a", "批准", "noop", False),
+                ("s", "修改", "noop", False),
+                ("q", "放弃", "noop", False),
+                ("Tab", "返回正文", "tasks", False),
                 ("Ctrl+Q", "退出", "quit", True),
             ]
         elif self._modal_open:
@@ -3091,10 +3216,11 @@ class CodeDoggyTUI:
                     items.insert(0, ("Esc", "取消任务", "cancel", False))
                 items.append(("Ctrl+Q", "退出", "quit", True))
             else:
-                # Task list: Space → input; Tab → enter; Esc → cancel running task.
+                # Reading stream: no detail layer; Tab/Space return to composer.
                 items = [
                     ("Space", "输入", "input", False),
-                    ("Tab", "进入", "open", False),
+                    ("Tab", "输入", "input", False),
+                    ("Ctrl+移入", "工具预览", "noop", False),
                 ]
                 if self._is_running():
                     items.insert(0, ("Esc", "取消任务", "cancel", False))
@@ -3167,12 +3293,6 @@ class CodeDoggyTUI:
                 self._open_auth_wizard()
             elif action == "tasks":
                 self._tab_task_cycle()
-            elif action == "next":
-                self._move_task(1)
-                self.app.layout.focus(self._task_window)
-            elif action == "previous":
-                self._move_task(-1)
-                self.app.layout.focus(self._task_window)
             elif action == "open":
                 self._tab_task_cycle()
             elif action == "input":
@@ -3181,8 +3301,7 @@ class CodeDoggyTUI:
                 self.app.layout.focus(self._input)
             self.app.invalidate()
 
-        # Footer chrome must not steal wheel from the focused pane.
-        return self._only_mouse_up(_on_up, scroll_target="none")
+        return self._only_mouse_up(_on_up, scroll_target="tasks")
 
     def _stop_mouse(self, event: MouseEvent) -> object:
         if event.event_type is not MouseEventType.MOUSE_UP:
@@ -3192,17 +3311,23 @@ class CodeDoggyTUI:
 
     def _render_header(self) -> StyleAndTextTuples:
         width = max(1, _content_width())
-        # Plain wordmark: hierarchy comes from weight and whitespace, not a box.
         left = "  DOGGY"
         right = session_surface.budget_text(self.session)
         badge = self._todo_badge_label()
         fleet = self._fleet_badge_label()
         if width < get_cwidth(left):
-            return [("class:brand", _truncate_display(left, width))]
+            shown = _truncate_display(left, width)
+            dog_width = min(3, len(shown))
+            return [
+                ("class:header", shown[:2]),
+                ("class:brand.dog", shown[2 : 2 + dog_width]),
+                ("class:brand", shown[2 + dog_width :]),
+            ]
 
         fragments: StyleAndTextTuples = [
             ("class:header", "  "),
-            ("class:brand", "DOGGY"),
+            ("class:brand.dog", "DOG"),
+            ("class:brand", "GY"),
         ]
         badge_handler = self._todo_badge_mouse() if badge else None
         badge_style = (
@@ -3256,7 +3381,7 @@ class CodeDoggyTUI:
         title_style = "class:hud.title"
         ok_style = "class:hud.ok"
         warn_style = "class:hud.warn"
-        cyan = "class:hud.cyan"
+        accent = "class:hud.accent"
         dim = "class:hud.dim"
         bg = "class:hud.bg"
 
@@ -3278,7 +3403,7 @@ class CodeDoggyTUI:
         fragments.append((status_style, mid1, open_handler))
         fragments.append(
             (
-                cyan if cur_ok else dim,
+                accent if cur_ok else dim,
                 " " * max(0, width - get_cwidth(mid1)),
                 open_handler,
             )
@@ -3299,7 +3424,7 @@ class CodeDoggyTUI:
             else:
                 bits.append(f"✓MCP:{int(mcp.get('ready') or 0)}")
         mid2 = _truncate_display("  " + "  ".join(bits), width)
-        fragments.extend(line(cyan, mid2))
+        fragments.extend(line(accent, mid2))
         fragments.append((bg, "\n", open_handler))
 
         action = "  Enter/单击打开登录向导 · Ctrl+L"
@@ -3311,8 +3436,7 @@ class CodeDoggyTUI:
 
     def _render_header_rule(self) -> StyleAndTextTuples:
         width = max(1, _content_width())
-        # Quiet single-tone rule — no dual pink/cyan end-caps, no neon scan.
-        return [("class:header.rule.dim", "─" * width)]
+        return [("class:header.rule", "─" * width)]
 
     # ── Grok-style todo plan badge + expandable pane ─────────────────
 
@@ -3329,55 +3453,6 @@ class CodeDoggyTUI:
             return bag.get("todo_state")
         return None
 
-    def _todo_state_for_open_agent(self) -> Any | None:
-        """Todo for open modal agent: MAIN → session; child → isolated list."""
-        if self._modal_ref is None:
-            return self._session_todo_state()
-        _task_id, agent_id = self._modal_ref
-        # MAIN agents are ``task_xxx:main``
-        if str(agent_id).endswith(":main") or str(agent_id).upper() == "MAIN":
-            return self._session_todo_state()
-        # Child agent ids are coordinator subagent ids (not always task-prefixed).
-        kernel = getattr(self.session.extensions, "kernel", None)
-        coord = getattr(kernel, "subagent_coordinator", None) if kernel else None
-        if coord is not None and hasattr(coord, "todo_state_for"):
-            try:
-                child = coord.todo_state_for(str(agent_id))
-                if child is not None:
-                    return child
-            except Exception:  # noqa: BLE001
-                pass
-            # Fallback: terminal snapshot metadata
-            try:
-                snap = coord.lookup(str(agent_id)) if hasattr(coord, "lookup") else None
-                if snap is not None:
-                    meta = getattr(snap, "metadata", None) or {}
-                    todos = meta.get("todos")
-                    if isinstance(todos, list) and todos:
-                        from codedoggy.tools.grok_build.todo_logic import (
-                            TodoItem,
-                            TodoState,
-                        )
-
-                        st = TodoState()
-                        for row in todos:
-                            if not isinstance(row, dict):
-                                continue
-                            tid = str(row.get("id") or "")
-                            if not tid:
-                                continue
-                            st.push(
-                                tid,
-                                TodoItem(
-                                    content=str(row.get("content") or tid),
-                                    status=str(row.get("status") or "pending"),
-                                ),
-                            )
-                        return st
-            except Exception:  # noqa: BLE001
-                pass
-        return None
-
     def _todo_counts(self) -> Any:
         from codedoggy.tools.grok_build.todo_logic import count_todos
 
@@ -3386,10 +3461,6 @@ class CodeDoggyTUI:
     def _todo_badge_label(self) -> str | None:
         counts = self._todo_counts()
         return counts.badge_text()
-
-    def _main_todo_chip(self) -> str | None:
-        """Short ``n/m`` for task cards (MAIN session todos only)."""
-        return self._todo_badge_label()
 
     def _incomplete_work_status_hint(self) -> str | None:
         """Compact Chinese hint for open todos / running children (MAIN)."""
@@ -3421,32 +3492,6 @@ class CodeDoggyTUI:
         if not parts:
             return None
         return "未完·" + "·".join(parts)
-
-    def _agent_todo_chip(self, agent_id: str) -> str | None:
-        """Live or terminal todo badge for one agent on the task card."""
-        from codedoggy.tools.grok_build.todo_logic import count_todos
-
-        if str(agent_id).endswith(":main"):
-            return self._main_todo_chip()
-        kernel = getattr(self.session.extensions, "kernel", None)
-        coord = getattr(kernel, "subagent_coordinator", None) if kernel else None
-        if coord is not None and hasattr(coord, "todo_state_for"):
-            try:
-                st = coord.todo_state_for(str(agent_id))
-                badge = count_todos(st).badge_text()
-                if badge:
-                    return badge
-            except Exception:  # noqa: BLE001
-                pass
-            try:
-                snap = coord.lookup(str(agent_id)) if hasattr(coord, "lookup") else None
-                meta = getattr(snap, "metadata", None) or {}
-                b = meta.get("todo_badge")
-                if b:
-                    return str(b)
-            except Exception:  # noqa: BLE001
-                pass
-        return None
 
     _TODO_PANE_VISIBLE = 8  # body rows (not counting chrome)
 
@@ -3523,24 +3568,16 @@ class CodeDoggyTUI:
         return self._only_mouse_up(_on_up, scroll_target="todo")
 
     def _open_active_main_plan_tab(self) -> None:
-        """Focus active/latest task and open MAIN detail on 计划 filter."""
+        """Open approval only when a revision is actually awaiting a decision."""
         self._focus_active_or_latest_task()
         task = self._selected_task_view()
         if task is None:
             self._set_feedback("暂无任务可打开", "warning")
             return
-        main_id = f"{task.id}:main"
-        # Prefer real MAIN agent id if present.
-        for a in task.agents:
-            if str(a.id).endswith(":main") or str(a.label).upper() == "MAIN":
-                main_id = a.id
-                break
-        self._todo_pane_open = True
-        self._todo_scroll = 0
-        self._open_agent(task.id, main_id)
-        self._set_detail_filter("plan")
-        self._clear_feedback()
-        self.app.invalidate()
+        if task.plan_state == "awaiting_approval":
+            self._open_plan_approval(task.id)
+            return
+        self._toggle_todo_pane()
 
     def _todo_pane_mouse(self) -> Callable[[MouseEvent], object]:
         """Wheel scrolls the checklist; click no-ops (use badge to close)."""
@@ -3614,7 +3651,7 @@ class CodeDoggyTUI:
         """Global non-MAIN agents across *all* tasks.
 
         Order: live (running/pending/waiting) first, newest tasks first within
-        each group — a cross-task fleet dashboard, not only the active card.
+        each group — a cross-task fleet dashboard, not only the active task.
         """
         tasks = self.ledger.snapshots()
         if not tasks:
@@ -3632,7 +3669,7 @@ class CodeDoggyTUI:
                     live.append(row)
                 else:
                     idle.append(row)
-        # Fallback: if MAIN filter emptied everything but multi-agent cards exist
+        # Fallback: if MAIN filtering hid every child despite multi-agent tasks
         # (legacy MAIN not tagged), keep non-first agents.
         if not live and not idle:
             for task in reversed(tasks):
@@ -3778,7 +3815,7 @@ class CodeDoggyTUI:
         entries = self._fleet_child_entries()
         if not entries or not 0 <= self._fleet_cursor < len(entries):
             return
-        task_id, _title, agent_index, agent = entries[self._fleet_cursor]
+        task_id, _title, _agent_index, agent = entries[self._fleet_cursor]
         snaps = self.ledger.snapshots()
         for i, t in enumerate(snaps):
             if t.id == task_id:
@@ -3787,7 +3824,6 @@ class CodeDoggyTUI:
                 self._follow_latest_task = i == len(snaps) - 1
                 self._pinned_task_for_line = None
                 break
-        self._selected_agent_by_task[task_id] = agent_index
         self._open_agent(task_id, agent.id)
 
     def _open_pinned_agent(self) -> None:
@@ -3808,10 +3844,6 @@ class CodeDoggyTUI:
                 self._task_selection_active = True
                 self._follow_latest_task = i == len(snaps) - 1
                 self._pinned_task_for_line = None
-                for ai, a in enumerate(t.agents):
-                    if a.id == agent_id:
-                        self._selected_agent_by_task[task_id] = ai
-                        break
                 break
         self._open_agent(task_id, agent_id)
 
@@ -3956,13 +3988,13 @@ class CodeDoggyTUI:
                 return
             self._fleet_cursor = entry_index
             self._ensure_fleet_cursor_visible()
-            task_id, _title, agent_index, agent = entries[entry_index]
+            task_id, _title, _agent_index, agent = entries[entry_index]
             if _mouse_control_held(event):
                 self._toggle_pin_agent(task_id, agent.id, agent.label)
                 return
             # Single click focuses; open on second click within double-click window
             # is handled by selecting then Enter — here open immediately for
-            # discoverability (matches card roster click-to-open).
+            # discoverability: one click jumps to that inline transcript.
             snaps = self.ledger.snapshots()
             for i, t in enumerate(snaps):
                 if t.id == task_id:
@@ -3971,7 +4003,6 @@ class CodeDoggyTUI:
                     self._follow_latest_task = i == len(snaps) - 1
                     self._pinned_task_for_line = None
                     break
-            self._selected_agent_by_task[task_id] = agent_index
             self._open_agent(task_id, agent.id)
 
         return self._only_mouse_up(_on_up, scroll_target="fleet")
@@ -4170,27 +4201,29 @@ class CodeDoggyTUI:
         }
 
     def _render_tasks(self) -> StyleAndTextTuples:
+        """Render every task as one continuous, full-fidelity reading stream.
+
+        Task is structure: a quiet divider and state. Chat is content: exact
+        user text, assistant prose, thinking rails, and canonical tool anchors.
+        There are no cards and no transcript/detail duplication.
+        """
         tasks = self.ledger.snapshots()
         fragments: StyleAndTextTuples = []
         line = 0
-        # Content width (terminal minus edge pad) — painting full terminal width
-        # while the window is inset clips the right border (looks "truncated").
-        # Short lines leave unmapped cells; PT remaps those clicks to (0,0).
         width = max(1, _content_width())
 
-        # Modal float covers this pane — skip expensive splash/task paint while open
-        # so ESC close is not stuck behind a full truecolor doggy recompute.
-        if self._modal_open:
+        # Plan/auth own the page. The questionnaire remains a float over the
+        # live transcript, so only replacement pages suppress this stream.
+        if self._detail_page_visible():
             if self._showing_startup_brand() or not tasks:
                 self._task_refs = []
                 empty: StyleAndTextTuples = [("", "\n")]
                 # Underlay line count only — do not clamp free-scroll _selected_line.
                 self._task_line_count = self._count_fragment_lines(empty)
                 return empty
-            # Agent detail on top: still keep task_refs in sync for selection keys,
-            # but avoid re-walking every card under the float each frame.
+            # Keep task refs in sync for selection keys without repainting the
+            # hidden transcript beneath the replacement page.
             self._task_refs = [task.id for task in tasks]
-            # Modal owns focus — do not advance selection via follow-latest.
             if tasks and self._task_selection_active and self._selected_task >= 0:
                 self._selected_task = max(
                     0, min(int(self._selected_task), len(tasks) - 1)
@@ -4201,7 +4234,6 @@ class CodeDoggyTUI:
             self._task_line_count = self._count_fragment_lines(empty)
             return empty
 
-        # Launch splash only — first task dismisses it for the whole session.
         if self._showing_startup_brand():
             fr = self._render_doggy_empty_cached(width)
             self._set_task_line_count(fr)
@@ -4216,7 +4248,6 @@ class CodeDoggyTUI:
             self._set_task_line_count(fr)
             return fr
 
-        # Cheap path: reuse last card walk when ledger/selection/width are unchanged.
         cache_key = self._task_paint_cache_key(tasks, width)
         cached = self._task_paint_cache
         if cached is not None and cached[0] == cache_key:
@@ -4233,8 +4264,8 @@ class CodeDoggyTUI:
             return fr
 
         self._task_refs = [task.id for task in tasks]
-        # Follow = scroll-to-bottom only. NEVER invent a selection here.
-        # Selection only from click / keyboard / explicit focus helpers.
+        self._task_anchor_lines = {}
+        self._agent_anchor_lines = {}
         if self._task_selection_active:
             if self._selected_task < 0:
                 self._task_selection_active = False
@@ -4244,9 +4275,9 @@ class CodeDoggyTUI:
                 )
         else:
             self._selected_task = -1
-        # Selection chrome only when list is focused (not hover, not follow alone).
         list_focused = self._task_list_has_focus()
         selected_line_start = 0
+        latest_task_tail_line = 0
 
         for task_index, task in enumerate(tasks):
             has_sel = self._task_selection_active and self._selected_task >= 0
@@ -4255,172 +4286,186 @@ class CodeDoggyTUI:
                 and has_sel
                 and task_index == self._selected_task
             )
-            # Anchor only when a real selection exists (user pick / focus helper).
             is_cursor_task = has_sel and task_index == self._selected_task
-            inner_width = width
-            card_start = line
+            task_start = line
+            self._task_anchor_lines[task.id] = task_start
             if is_cursor_task:
-                selected_line_start = card_start
-            card_mouse = self._task_card_mouse(task_index)
-            active = task.phase in {
-                "dispatching",
-                "parallel",
-                "reporting",
-                "planning",
-                "plan_review",
-            } or task.status == "running"
-            # Flat list surface: selection and live state use a quiet background;
-            # whitespace separates records, so no ASCII frame is needed.
-            if selected:
-                face = "class:task.card.selected"
-                title_cls = "class:task.title.selected"
-                report_cls = "class:report.selected"
-                stream_cls = "class:report.stream.selected"
-            elif active:
-                face = "class:task.card.active"
-                title_cls = "class:task.title.active"
-                report_cls = "class:report.active"
-                stream_cls = "class:report.stream"
-            else:
-                face = "class:task.card"
-                title_cls = "class:task.title"
-                report_cls = "class:report"
-                stream_cls = "class:report"
+                selected_line_start = task_start
+            stream_mouse = self._task_section_mouse(task_index)
+            face = "class:task.stream"
 
-            def append_task_line(parts: StyleAndTextTuples) -> None:
-                """Paint one flat record row with a full-width click target."""
+            def append_task_line(
+                parts: StyleAndTextTuples,
+                *,
+                default_mouse: Callable[[MouseEvent], object] = stream_mouse,
+                fill_style: str = face,
+            ) -> None:
+                """Paint a full-width stream row with reliable mouse mapping."""
                 nonlocal line
                 used = 0
+                painted: list[
+                    tuple[str, str, Callable[[MouseEvent], object]]
+                ] = []
                 for part in parts:
-                    # Layer face under semantic color so the whole card has one bg.
                     raw = part[0] or ""
                     style = f"{face} {raw}".strip() if raw else face
                     text = part[1]
                     used += get_cwidth(text)
                     if len(part) >= 3 and part[2] is not None:
-                        fragments.append((style, text, part[2]))
+                        painted.append((style, text, part[2]))
                     else:
-                        fragments.append((style, text, card_mouse))
-                if used < inner_width:
-                    fragments.append(
-                        (face, " " * (inner_width - used), card_mouse)
+                        painted.append((style, text, default_mouse))
+                if used < width:
+                    painted.append(
+                        (
+                            f"{face} {fill_style}".strip(),
+                            " " * (width - used),
+                            default_mouse,
+                        )
                     )
-                fragments.append(("", "\n", card_mouse))
+                fragments.extend(self._paint_task_text_selection(painted, line))
+                fragments.append(("", "\n", default_mouse))
                 line += 1
 
+            label_style = (
+                "class:task.section.selected"
+                if selected
+                else "class:task.section.label"
+            )
             flash = self._interject_preview(task.id)
-            # One quiet status word — no stacked hints / agent counts on the cover.
             status = _compact_task_stage_text(task, interject=flash)
-            if active:
-                elapsed_label = _task_elapsed_label(task)
-                if elapsed_label and width >= 28:
-                    status = f"{status} · {elapsed_label}"
+            elapsed_label = _task_elapsed_label(task)
+            if elapsed_label:
+                status = f"{status} · {elapsed_label}"
             status_style = (
                 "class:task.interject"
                 if flash
                 else _task_status_style(task)
             )
-            # Cover: title (1 line) + status. Marker stays minimal.
-            marker = "›" if selected else ("●" if active else " ")
-            marker_style = (
-                "class:task.marker.selected"
-                if selected
-                else (
-                    "class:task.marker.active"
-                    if active
-                    else "class:task.marker.idle"
-                )
+            chat_collapsed = task.id in self._collapsed_task_chats
+            fold_label = " 展开 " if chat_collapsed else " 收起 "
+            fold_mouse = self._task_chat_toggle_mouse(task.id)
+            task_label = f"  TASK {task_index + 1:02d}"
+            right_parts: StyleAndTextTuples = [
+                (status_style, status),
+                ("class:task.section.meta", "  "),
+                ("class:task.action", fold_label, fold_mouse),
+                ("class:task.section.meta", " "),
+            ]
+            right_width = sum(get_cwidth(part[1]) for part in right_parts)
+            gap = max(1, width - get_cwidth(task_label) - right_width)
+            append_task_line(
+                [
+                    (label_style, task_label),
+                    ("class:task.section.meta", " " * gap),
+                    *right_parts,
+                ]
             )
-            gutter = f" {marker} "
-            gutter_w = get_cwidth(gutter)
-            text_cols = max(1, inner_width - gutter_w)
-            title_lines = _wrap_display_lines(task.title, text_cols, max_lines=1)
-            first = title_lines[0] if title_lines else ""
-            status_w = get_cwidth(status)
-            if status_w + 1 < text_cols and get_cwidth(first) + 1 + status_w <= text_cols:
-                gap = max(1, text_cols - get_cwidth(first) - status_w)
-                append_task_line(
-                    [
-                        (marker_style, gutter),
-                        (title_cls, first),
-                        (status_style, " " * gap + status),
-                    ]
-                )
-            else:
-                append_task_line(
-                    [
-                        (marker_style, gutter),
-                        (title_cls, first),
-                    ]
-                )
-                append_task_line(
-                    [
-                        (face, " " * gutter_w),
-                        (status_style, status),
-                    ]
-                )
 
-            # Cover copy: in-progress = full multi-line prose; finished = 2 lines.
-            summary = _task_list_summary(task, interject=flash)
-            if summary:
-                sum_cols = max(1, inner_width - gutter_w)
-                body_cls = stream_cls if (active or flash) else report_cls
-                # Running tasks keep growing text on the card; terminal cards
-                # collapse to a short abstract so the list stays scannable.
-                sum_max = 2 if _task_is_terminal(task) else None
-                for sum_line in _wrap_display_lines(
-                    summary, sum_cols, max_lines=sum_max
+            if chat_collapsed:
+                for title_line in _wrap_display_lines(
+                    task.title, max(1, width - 6), max_lines=None
                 ):
                     append_task_line(
                         [
-                            (face, " " * gutter_w),
-                            (body_cls, sum_line),
+                            ("class:task.section.meta", "    "),
+                            ("class:task.title", title_line),
                         ]
                     )
+            else:
+                # Exact user prompt — title normalization never replaces chat.
+                prompt_text = (getattr(task, "prompt", "") or task.title).strip()
+                for row in _render_task_chat_rows(
+                    prompt_text,
+                    max(1, width - 4),
+                    link_mouse=self._task_link_mouse,
+                ):
+                    append_task_line(
+                        [("class:task.chat.gutter", "    "), *row]
+                    )
+                append_task_line([])
 
-            # Awaiting plan approval: primary CTA on the card (detail still owns s/q).
-            if task.plan_state == "awaiting_approval" and inner_width >= 12:
-                approve_mouse = self._task_plan_approve_mouse(task.id)
-                label = " 批准 "
-                hint = " 打开详情可修改/放弃"
-                label_w = get_cwidth(label)
-                hint_w = get_cwidth(hint)
-                room = max(0, inner_width - gutter_w - label_w)
-                if room >= hint_w and width >= 36:
+                for agent in task.agents:
+                    self._agent_anchor_lines[(task.id, agent.id)] = line
+                    is_main = (
+                        str(agent.id).endswith(":main")
+                        or str(agent.label).strip().upper() == "MAIN"
+                    )
+                    if not is_main:
+                        agent_status = STATUS_TEXT.get(agent.status, agent.status)
+                        agent_accent = (
+                            "class:task.status.completed"
+                            if agent.status in {"completed", "done"}
+                            else (
+                                "class:task.status.failed"
+                                if agent.status in {"failed", "cancelled"}
+                                else "class:task.status.running"
+                            )
+                        )
+                        append_task_line(
+                            [
+                                ("class:task.chat.gutter", "    "),
+                                (agent_accent, "━━ "),
+                                ("class:task.actor.agent", agent.label or "AGENT"),
+                                ("class:task.section.meta", f" · {agent_status}"),
+                            ]
+                        )
+
+                    snapshot = self._snapshot_for_task_agent(task, agent)
+                    records = () if snapshot is None else snapshot.records
+                    if not records and agent.status in {
+                        "pending",
+                        "running",
+                        "waiting",
+                    }:
+                        append_task_line(
+                            [
+                                ("class:task.chat.gutter", "    "),
+                                ("class:task.status.running", "● "),
+                                ("class:task.chat.muted", "正在思考…"),
+                            ]
+                        )
+                    for record in records:
+                        record_rows = self._task_record_rows(
+                            task,
+                            agent,
+                            record,
+                            max(1, width - 4),
+                            stream_mouse,
+                        )
+                        for record_row, row_mouse, fill_style in record_rows:
+                            append_task_line(
+                                [
+                                    ("class:task.chat.gutter", "    "),
+                                    *record_row,
+                                ],
+                                default_mouse=row_mouse,
+                                fill_style=fill_style,
+                            )
+
+                if task.plan_state == "awaiting_approval":
+                    review_mouse = self._task_plan_review_mouse(task.id)
+                    append_task_line([])
                     append_task_line(
                         [
-                            (face, " " * gutter_w),
-                            ("class:task.plan.approve", label, approve_mouse),
-                            ("class:task.status", hint, card_mouse),
-                        ]
-                    )
-                else:
-                    append_task_line(
-                        [
-                            (face, " " * gutter_w),
-                            ("class:task.plan.approve", label, approve_mouse),
-                        ]
+                            ("class:task.chat.gutter", "    "),
+                            ("class:task.plan.ready", "● PLAN READY"),
+                            ("class:task.section.meta", "  "),
+                            (
+                                "class:task.plan.review",
+                                "审阅唯一待批版本",
+                                review_mouse,
+                            ),
+                        ],
+                        default_mouse=review_mouse,
                     )
 
-            # Parallel agent roster (Grok-style live child rows — only when useful).
-            for agent_frags in self._paint_task_agent_roster(
-                task,
-                task_index=task_index,
-                selected=selected,
-                active=active,
-                face=face,
-                gutter_w=gutter_w,
-                inner_width=inner_width,
-            ):
-                append_task_line(agent_frags)
+            if task_index == len(tasks) - 1:
+                latest_task_tail_line = max(task_start, line - 1)
 
-            # Card list gap — MUST be full-width spaces (not bare \\n).
-            # prompt_toolkit Window remaps clicks on unmapped cells to (0,0),
-            # which is the first task card's mouse handler.
             fragments.extend(self._task_blank_line(width, self._task_gap_mouse()))
             line += 1
 
-        # Pad remaining viewport with void hit-targets — click clears selection.
         void = self._task_void_mouse()
         try:
             win_h = int(getattr(self._task_window.render_info, "window_height", 0) or 0)
@@ -4431,22 +4476,17 @@ class CodeDoggyTUI:
             fragments.extend(self._task_blank_line(width, void))
             line += 1
 
-        # Re-pin cursor when a real selection exists. Live stream reflow can
-        # change card heights (elapsed / summary lines) — always re-align the
-        # cursor to the selected card's current start so ScrollOffsets do not
-        # drift mid-turn while the user is browsing.
-        if self._task_selection_active and self._selected_task >= 0:
+        self._latest_task_tail_line = max(0, latest_task_tail_line)
+        if self._follow_latest_task:
+            self._selected_line = self._latest_task_tail_line
+        elif self._task_selection_active and self._selected_task >= 0:
             pin_task = int(self._selected_task)
-            if (
-                self._pinned_task_for_line != pin_task
-                or int(self._selected_line) != int(selected_line_start)
-            ):
+            if self._pinned_task_for_line != pin_task:
                 self._selected_line = selected_line_start
                 self._pinned_task_for_line = pin_task
         else:
             self._pinned_task_for_line = None
         self._set_task_line_count(fragments)
-        # Recompute key after pin so selected_line matches what we store.
         store_key = self._task_paint_cache_key(tasks, width)
         self._task_paint_cache = (
             store_key,
@@ -4457,100 +4497,131 @@ class CodeDoggyTUI:
         )
         return fragments
 
-    _MAX_CARD_AGENT_ROWS = 4  # Grok-style compact roster; rest collapsed to +N
-
-    def _paint_task_agent_roster(
+    def _snapshot_for_task_agent(
         self,
         task: TaskView,
-        *,
-        task_index: int,
-        selected: bool,
-        active: bool,
-        face: str,
-        gutter_w: int,
-        inner_width: int,
-    ) -> list[StyleAndTextTuples]:
-        """Child agent lines under a task card (click → open that agent).
-
-        Shown when the card is selected, or any child is still running — keeps
-        idle completed stacks compact (no permanent height jiggle).
-        """
-        children = [
-            (i, a)
-            for i, a in enumerate(task.agents)
-            if not str(a.id).endswith(":main") and str(a.label).upper() != "MAIN"
-        ]
-        if not children:
-            # agents[1:] fallback when MAIN is always first
-            if len(task.agents) > 1:
-                children = list(enumerate(task.agents))[1:]
-            else:
-                return []
-        any_live = any(
-            a.status in {"pending", "running", "waiting"} for _i, a in children
+        agent: Any,
+    ) -> AgentDetailSnapshot | None:
+        """Project one canonical message list into records for all UI surfaces."""
+        key = (task.id, str(agent.id))
+        messages = list(self._detail_messages.get(key, []))
+        live_draft = self._detail_live_draft(key)
+        if live_draft is not None and live_draft[1]:
+            messages.append(Message(role=Role.ASSISTANT, content=live_draft[1]))
+        if not messages:
+            fallback = str(
+                getattr(agent, "output", "")
+                or getattr(agent, "description", "")
+                or ""
+            ).strip()
+            if fallback:
+                messages = [Message(role=Role.ASSISTANT, content=fallback)]
+        if not messages:
+            return None
+        return snapshot_from_messages(
+            messages,
+            task_id=task.id,
+            agent_id=str(agent.id),
+            agent_label=str(agent.label or "AGENT"),
+            task_title=task.title,
+            initial_user_text=strip_image_chips(
+                getattr(task, "prompt", "") or task.title
+            ),
+            status=str(agent.status or "running"),
         )
-        if not selected and not any_live:
-            return []
 
-        sel_idx = self._selected_agent_by_task.get(task.id, 0)
-        rows_out: list[StyleAndTextTuples] = []
-        visible = children[: self._MAX_CARD_AGENT_ROWS]
-        for agent_index, agent in visible:
-            live = ""
-            if agent.status in {"pending", "running", "waiting"}:
-                live = self._activity.line(task.id, agent.id)
-            mark = _agent_status_mark(agent.status)
-            focus = selected and agent_index == sel_idx
-            bullet = "›" if focus else "↳"
-            label = (agent.label or "AGENT").strip() or "AGENT"
-            # Prefer short activity over long prose on the roster.
-            tail = ""
-            if live and not _is_tool_activity_line(live):
-                tail = live
-            elif live:
-                tail = live
-            elif (agent.output or "").strip() and agent.status not in {
-                "pending",
-                "running",
-                "waiting",
-            }:
-                tail = " ".join(agent.output.split())[:36]
-            wt = self._agent_worktree_short(agent.id)
-            pin = "★" if self._pinned_agent_ref == (task.id, agent.id) else ""
-            mid = f" {bullet} {pin}{mark} {label}" if pin else f" {bullet} {mark} {label}"
-            if wt:
-                mid += f" · {wt}"
-            if tail:
-                mid += f" · {tail}"
-            text = _truncate_display(mid, max(8, inner_width - gutter_w))
-            style = (
-                "class:task.agent.selected"
-                if focus
-                else (
-                    "class:task.agent.running"
-                    if agent.status in {"pending", "running", "waiting"}
-                    else "class:task.agent"
+    def _task_record_rows(
+        self,
+        task: TaskView,
+        agent: Any,
+        record: DetailRecord,
+        width: int,
+        stream_mouse: Callable[[MouseEvent], object],
+    ) -> list[
+        tuple[
+            StyleAndTextTuples,
+            Callable[[MouseEvent], object],
+            str,
+        ]
+    ]:
+        """Render one transcript record; tool bodies stay in the hover float."""
+        width = max(1, int(width))
+        rows: list[
+            tuple[
+                StyleAndTextTuples,
+                Callable[[MouseEvent], object],
+                str,
+            ]
+        ] = []
+        actor = str(record.actor or "").strip().upper()
+
+        if actor == "TOOL":
+            ref = (task.id, str(agent.id), str(record.id))
+            mouse = self._task_tool_mouse(ref)
+            status = str(record.status or "").lower()
+            if status in {"pending", "running", "waiting"}:
+                mark, mark_style = "●", "class:task.tool.running"
+            elif status in {"failed", "error"}:
+                mark, mark_style = "×", "class:task.tool.failed"
+            else:
+                mark, mark_style = "◇", "class:task.tool.done"
+            prefix = f"{mark} "
+            title_width = max(1, width - get_cwidth(prefix))
+            title_lines = _wrap_display_lines(
+                record.title or "Tool", title_width, max_lines=None
+            )
+            for index, title_line in enumerate(title_lines):
+                if index == 0:
+                    parts: StyleAndTextTuples = [
+                        (mark_style, prefix, mouse),
+                        ("class:task.tool.title", title_line, mouse),
+                    ]
+                else:
+                    parts = [
+                        ("class:task.tool.title", " " * get_cwidth(prefix), mouse),
+                        ("class:task.tool.title", title_line, mouse),
+                    ]
+                rows.append((parts, mouse, "class:task.stream"))
+            return rows
+
+        if actor in {"THINK", "THINKING", "REASONING"}:
+            rows.append(
+                (
+                    [("class:task.actor.thinking", "THINKING")],
+                    stream_mouse,
+                    "class:task.stream",
                 )
             )
-            handler = self._task_agent_mouse(task_index, agent_index)
-            rows_out.append(
-                [
-                    (face, " " * gutter_w),
-                    (style, text, handler),
-                ]
-            )
-        extra = len(children) - len(visible)
-        if extra > 0:
-            more = _truncate_display(
-                f" ↳ … +{extra} agents", max(8, inner_width - gutter_w)
-            )
-            rows_out.append(
-                [
-                    (face, " " * gutter_w),
-                    ("class:task.agent", more, self._task_card_mouse(task_index)),
-                ]
-            )
-        return rows_out
+            body_width = max(1, width - 2)
+            for block in record.blocks:
+                for raw in (block.text or "").splitlines() or [""]:
+                    for piece in _wrap_display_lines(
+                        raw, body_width, max_lines=None
+                    ):
+                        rows.append(
+                            (
+                                [
+                                    ("class:task.thinking.rail", "│ "),
+                                    ("class:task.thinking.body", piece),
+                                ],
+                                stream_mouse,
+                                "class:task.stream",
+                            )
+                        )
+            rows.append(([], stream_mouse, "class:task.stream"))
+            return rows
+
+        # The surrounding task/agent section already owns speaker identity.
+        # Repeating YOU/DOGGY before ordinary prose adds noise without meaning.
+        for block in record.blocks:
+            for md_row in _render_task_chat_rows(
+                block.text,
+                width,
+                link_mouse=self._task_link_mouse,
+            ):
+                rows.append((md_row, stream_mouse, "class:task.stream"))
+        rows.append(([], stream_mouse, "class:task.stream"))
+        return rows
 
     def _agent_worktree_short(self, agent_id: str) -> str:
         """Compact worktree badge for roster / header."""
@@ -4572,88 +4643,49 @@ class CodeDoggyTUI:
             return "wt"
         return ""
 
-    def _task_agent_mouse(
-        self, task_index: int, agent_index: int
-    ) -> Callable[[MouseEvent], object]:
-        """Click child row: select task+agent; open that agent detail."""
-
-        def handler(event: MouseEvent) -> object:
-            if event.event_type in {
-                MouseEventType.SCROLL_UP,
-                MouseEventType.SCROLL_DOWN,
-            }:
-                return NotImplemented
-            if event.event_type is not MouseEventType.MOUSE_UP:
-                return NotImplemented
-            tasks = self.ledger.snapshots()
-            if not 0 <= task_index < len(tasks):
-                return None
-            task = tasks[task_index]
-            if not 0 <= agent_index < len(task.agents):
-                return None
-            self._selected_task = task_index
-            self._task_selection_active = True
-            self._selected_agent_by_task[task.id] = agent_index
-            self._follow_latest_task = task_index == len(tasks) - 1
-            self._pinned_task_for_line = None
-            try:
-                self.app.layout.focus(self._task_window)
-            except Exception:  # noqa: BLE001
-                pass
-            agent = task.agents[agent_index]
-            self._open_agent(task.id, agent.id)
-            return None
-
-        return handler
-
     def _task_paint_cache_key(self, tasks: list[TaskView], width: int) -> tuple[Any, ...]:
         """Stable identity for task-list paint; excludes free-scroll noise."""
         rows: list[tuple[Any, ...]] = []
         for task in tasks:
             agents: list[tuple[Any, ...]] = []
             for agent in task.agents:
-                live = ""
-                if agent.status in {"pending", "running"}:
-                    live = self._activity.line(task.id, agent.id)
+                key = (task.id, str(agent.id))
+                messages = list(self._detail_messages.get(key, []))
+                draft = self._detail_live_draft(key)
+                draft_text = draft[1] if draft is not None else ""
                 agents.append(
                     (
                         agent.id,
                         agent.label,
                         agent.status,
                         agent.output,
-                        live,
-                        self._agent_worktree_short(agent.id),
+                        agent.description,
+                        _live_messages_signature(messages),
+                        (
+                            draft[0] if draft is not None else -1,
+                            len(draft_text),
+                            draft_text[:64],
+                            draft_text[-32:] if draft_text else "",
+                        ),
                     )
                 )
             flash = self._interject_preview(task.id)
-            # Bucket elapsed by whole seconds so running cards refresh the timer.
+            # Bucket elapsed by whole seconds so running task headers refresh.
             el = _task_elapsed_seconds(task)
             el_bucket = int(el) if el is not None else -1
-            # Plan file identity so card excerpt / 批准 row refresh when draft updates.
-            plan_stamp = ""
-            if task.plan_state in {"awaiting_approval", "planning"} and (
-                task.plan_file or ""
-            ).strip():
-                try:
-                    pp = Path(task.plan_file)
-                    if pp.is_file():
-                        st = pp.stat()
-                        plan_stamp = f"{st.st_mtime_ns}:{st.st_size}"
-                except OSError:
-                    plan_stamp = ""
             rows.append(
                 (
                     task.id,
                     task.title,
+                    task.prompt,
                     task.phase,
                     task.status,
                     task.plan_state,
                     task.report,
                     task.reporter,
                     flash or "",
-                    self._selected_agent_by_task.get(task.id, 0),
+                    task.id in self._collapsed_task_chats,
                     el_bucket,
-                    plan_stamp,
                     tuple(agents),
                 )
             )
@@ -4662,6 +4694,8 @@ class CodeDoggyTUI:
             int(self._selected_task),
             bool(self._task_selection_active),
             bool(self._follow_latest_task),
+            self._task_copy_anchor,
+            self._task_copy_cursor,
             self._pinned_task_for_line,
             int(self._selected_line),
             self._task_list_has_focus(),
@@ -4674,10 +4708,10 @@ class CodeDoggyTUI:
     ) -> StyleAndTextTuples:
         """One full-width blank row with a real mouse hit-target on every cell.
 
-        Root cause (blank click → first card): prompt_toolkit ``Window`` mouse
+        Root cause (blank click → first task): prompt_toolkit ``Window`` mouse
         routing builds ``rowcol_to_yx`` only for *painted characters*. A bare
         ``\\n`` line has no cells. Clicks on those screen positions miss the map
-        and fall through to ``Point(x=0, y=0)`` — the first task card. Painting
+        and fall through to ``Point(x=0, y=0)`` — the first task. Painting
         ``width`` spaces attaches the void/gap handler to the whole row.
         """
         w = max(1, int(width))
@@ -4790,121 +4824,63 @@ class CodeDoggyTUI:
             n = max(1, len(self._ask_questions))
             i = min(self._ask_q_index + 1, n)
             return title_row(f"计划提问 {i}/{n}", "ASK")
-        if not self._modal_ref:
-            return title_row("Agent")
-        task_id, agent_id = self._modal_ref
-        agent = self.ledger.get_agent(task_id, agent_id)
-        task = next((item for item in self.ledger.snapshots() if item.id == task_id), None)
-        if agent is None or task is None:
-            return title_row("记录不可用")
-        right = STATUS_TEXT.get(agent.status, agent.status)
-        wt = self._agent_worktree_short(agent.id)
-        if wt:
-            right = f"{wt} · {right}"
-        if agent.status in {"pending", "running"}:
-            spinner = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"[
-                int(time.monotonic() * 8) % 10
-            ]
-            right = f"{spinner} {right}"
-        return title_row(f"{agent.label} · {task.title}", right)
+        if self._modal_kind == "plan":
+            if not self._modal_ref:
+                return title_row("计划审批", "等待决定")
+            task_id, _agent_id = self._modal_ref
+            task = next(
+                (item for item in self.ledger.snapshots() if item.id == task_id),
+                None,
+            )
+            goal = task.title if task is not None else "当前任务"
+            return title_row(f"计划审批 · {goal}", self._plan_revision_label())
+        return title_row("CodeDoggy")
 
     def _render_modal_filters(self) -> StyleAndTextTuples:
-        if self._modal_kind == "auth":
-            text = f"  {self._auth_wizard.subtitle}"
-            return [
-                (
-                    "class:auth.note",
-                    _truncate_display(text, max(12, _terminal_width() - 12)),
-                )
-            ]
-        if self._modal_kind == "ask":
-            multi = " · 多选空格勾选" if self._ask_is_multi() else ""
-            return [
-                (
-                    "class:detail.active",
-                    _truncate_display(
-                        f"  问卷{multi} · ↑↓ · Enter · Tab 退出",
-                        max(12, _terminal_width() - 10),
-                    )
-                    + "\n",
-                )
-            ]
-        width = max(12, _terminal_width() - 10)
-        fragments: StyleAndTextTuples = [("", "  ")]
-        used = 2
-        filters = self._detail_filters_for_open_task()
-        for detail_filter in filters:
-            active = detail_filter == self._detail_filter
-            base_label = DETAIL_FILTER_LABELS.get(detail_filter, detail_filter)
-            label = f" {base_label} "
-            piece_width = get_cwidth(label) + (1 if used > 2 else 0)
-            if used + piece_width > width:
-                break
-            if used > 2:
-                fragments.append(("class:detail.meta", " "))
-            style = "class:detail.tab.active" if active else "class:detail.tab"
-            fragments.append(
-                (style, label, self._detail_filter_mouse(detail_filter))
+        text = f"  {self._auth_wizard.subtitle}"
+        return [
+            (
+                "class:auth.note",
+                _truncate_display(text, max(12, _terminal_width() - 12)),
             )
-            used += piece_width
-        # Sibling agents on this task — click to switch (parallel dashboard lite).
-        if self._modal_ref is not None:
-            task_id, cur_agent = self._modal_ref
-            task = next(
-                (t for t in self.ledger.snapshots() if t.id == task_id), None
-            )
-            if task is not None and len(task.agents) > 1:
-                sep = " · "
-                if used + get_cwidth(sep) < width:
-                    fragments.append(("class:detail.meta", sep))
-                    used += get_cwidth(sep)
-                for agent in task.agents:
-                    mark = _agent_status_mark(agent.status)
-                    short = (agent.label or "A")[:10]
-                    on = agent.id == cur_agent
-                    chip = f" {mark} {short} "
-                    need = get_cwidth(chip) + 1
-                    if used + need > width:
-                        break
-                    if used > 2:
-                        fragments.append(("class:detail.meta", " "))
-                        used += 1
-                    if on:
-                        style = "class:detail.tab.active"
-                    elif agent.status in {"pending", "running", "waiting"}:
-                        style = "class:task.agent.running"
-                    else:
-                        style = "class:detail.tab"
-                    fragments.append(
-                        (style, chip, self._detail_agent_switch_mouse(task_id, agent.id))
-                    )
-                    used += get_cwidth(chip)
-        return fragments
+        ]
 
-    def _detail_messages_signature(
-        self, messages: list[Any]
-    ) -> tuple[Any, ...]:
-        """Cheap fingerprint so we skip full detail re-layout when unchanged."""
-        n = len(messages)
-        if n == 0:
-            return (0, 0, "")
-        last = messages[-1]
-        content = str(getattr(last, "content", None) or "")
-        role = getattr(last, "role", None)
-        role_s = str(getattr(role, "value", role) or "")
-        # Tail sample only — full hash of multi-MB tool dumps freezes paint.
-        return (n, role_s, len(content), content[:64], content[-32:] if content else "")
+    def _set_detail_live_draft(
+        self,
+        key: tuple[str, str],
+        generation: int,
+        text: str,
+    ) -> None:
+        """Publish the current unarchived assistant message to the detail view."""
+        with self._view_lock:
+            if text:
+                self._detail_live_drafts[key] = (int(generation), text)
+            else:
+                self._detail_live_drafts.pop(key, None)
 
-    def _invalidate_detail_body_cache(self) -> None:
-        self._detail_body_cache = None
-        self._detail_body_cache_key = None
+    def _clear_detail_live_draft(
+        self,
+        key: tuple[str, str],
+        generation: int,
+    ) -> None:
+        """Clear only the draft generation that just became a real message."""
+        with self._view_lock:
+            current = self._detail_live_drafts.get(key)
+            if current is not None and current[0] == int(generation):
+                self._detail_live_drafts.pop(key, None)
+
+    def _detail_live_draft(
+        self, key: tuple[str, str]
+    ) -> tuple[int, str] | None:
+        with self._view_lock:
+            return self._detail_live_drafts.get(key)
 
     def _plan_body_visible(self) -> bool:
-        """Plan tab uses selectable TextArea, not FormattedText markdown dump."""
+        """The canonical plan file is visible only on the approval surface."""
         return bool(
             self._modal_open
-            and self._modal_kind == "agent"
-            and self._detail_filter == "plan"
+            and self._modal_kind == "plan"
+            and self._task_awaiting_plan_approval()
         )
 
     def _render_modal_body(self) -> StyleAndTextTuples:
@@ -4912,71 +4888,8 @@ class CodeDoggyTUI:
             return self._render_auth_body()
         if self._modal_kind == "ask":
             return self._render_ask_body()
-        # Plan body is a separate TextArea — never full-file FormattedText here.
-        if self._detail_filter == "plan":
-            return [("", "\n")]
-        snapshot = self._current_detail_snapshot()
-        width = max(12, _terminal_width() - 10)
-        # Cache key: avoid re-walking huge tool transcripts every paint.
-        if self._modal_ref is not None:
-            task_id, agent_id = self._modal_ref
-            msgs = self._detail_messages.get((task_id, agent_id), [])
-            cache_key: tuple[Any, ...] = (
-                self._modal_ref,
-                self._detail_filter,
-                width,
-                self._detail_messages_signature(list(msgs)),
-                self._todo_badge_label(),
-            )
-            if (
-                cache_key == self._detail_body_cache_key
-                and self._detail_body_cache is not None
-            ):
-                return self._detail_body_cache
-        else:
-            cache_key = ()
-
-        if snapshot is None:
-            frags: StyleAndTextTuples = [
-                ("class:detail.header", "  暂无记录\n"),
-                ("class:detail.meta", "  当前 Agent 还没有可展示的内容。\n"),
-            ]
-            frags = self._with_detail_scroll(self._ensure_fragments(frags))
-            self._set_detail_line_count(frags, preferred_cursor=0)
-            if cache_key:
-                self._detail_body_cache_key = cache_key
-                self._detail_body_cache = frags
-            return frags
-        width = max(12, _terminal_width() - 10)
-        # Default: tool bodies collapsed; thinking renders directly as prose.
-        from codedoggy.tui.agent_detail import default_collapsed_keys
-
-        defaults = set(default_collapsed_keys(snapshot.records))
-        # First paint for this agent: seed collapsed set.
-        if self._detail_collapse_seeded_for != self._modal_ref:
-            self._detail_collapsed = set(defaults)
-            self._detail_known_fold_keys = set(defaults)
-            self._detail_collapse_seeded_for = self._modal_ref
-        else:
-            # Live tools: fold new keys only; keep the user's expanded rows.
-            for k in defaults:
-                if k not in self._detail_known_fold_keys:
-                    self._detail_collapsed.add(k)
-                    self._detail_known_fold_keys.add(k)
-        fragments = render_detail_body(
-            snapshot,
-            width,
-            active_filter=self._detail_filter,
-            path_mouse=self._image_path_mouse,
-            collapsed_keys=self._detail_collapsed,
-            fold_mouse=self._detail_fold_mouse,
-        )
-        fragments = self._with_detail_scroll(self._ensure_fragments(fragments))
-        self._set_detail_line_count(fragments)
-        if cache_key:
-            self._detail_body_cache_key = cache_key
-            self._detail_body_cache = fragments
-        return fragments
+        # Plan text is owned by the separate selectable plan TextArea.
+        return [("", "\n")]
 
     def _with_detail_scroll(
         self, fragments: StyleAndTextTuples
@@ -5050,39 +4963,6 @@ class CodeDoggyTUI:
         self._set_detail_line_count(fragments, preferred_cursor=preferred)
         return fragments
 
-    def _current_detail_snapshot(self) -> AgentDetailSnapshot | None:
-        if self._modal_ref is None:
-            return None
-        task_id, agent_id = self._modal_ref
-        task = next((item for item in self.ledger.snapshots() if item.id == task_id), None)
-        agent = self.ledger.get_agent(task_id, agent_id)
-        if task is None or agent is None:
-            return None
-        messages = list(self._detail_messages.get((task_id, agent_id), []))
-        # Cap live transcript for paint — plan-mode memory floods freeze open.
-        _DETAIL_MSG_CAP = 120
-        if len(messages) > _DETAIL_MSG_CAP:
-            messages = messages[-_DETAIL_MSG_CAP:]
-        if not messages:
-            is_main = agent_id == f"{task_id}:main"
-            if not is_main and agent.status in {"pending", "running"}:
-                fallback = (
-                    f"进行中 · {agent.label or '子任务'} 仍在跑。"
-                    "结束后会同步完整消息、思考与工具记录；可先看 MAIN 或稍后再进。"
-                )
-            else:
-                fallback = agent.output.strip() or agent.description.strip()
-            if fallback:
-                messages = [Message(role=Role.ASSISTANT, content=fallback)]
-        return snapshot_from_messages(
-            messages,
-            task_id=task_id,
-            agent_id=agent_id,
-            agent_label=agent.label,
-            task_title=task.title,
-            status=agent.status,
-        )
-
     def _render_detail_prompt_prefix(self) -> StyleAndTextTuples:
         if self._modal_kind == "auth":
             text = "  › 凭证  "
@@ -5090,13 +4970,12 @@ class CodeDoggyTUI:
         if self._modal_kind == "ask":
             text = "  › Other  "
             return [("class:detail.input.prompt", text)]
-        # Mid-turn interject while a task is open — plain language, no "MAIN" jargon.
         terminal_width = max(1, _terminal_width())
         budget = max(4, terminal_width - 20)
         if terminal_width < 40:
             text = "  › "
         else:
-            text = "  › 继续说  "
+            text = "  › 修改意见  "
         text = _truncate_display(text, budget)
         return [("class:detail.input.prompt", text)]
 
@@ -5110,165 +4989,17 @@ class CodeDoggyTUI:
                 text = "  ↑↓ 移动 · Space 勾选 · Enter 完成 · Tab 退出"
             else:
                 text = "  ↑↓ 选择 · Enter 确认 · Tab 退出"
-        elif self._task_awaiting_plan_approval() and self._detail_filter == "plan":
-            text = "  a 批准 · s 修改 · q 放弃 · 拖选复制 · Ctrl+O 打开 · Tab 返回"
-        elif self._plan_body_visible():
-            text = "  拖选复制 · Ctrl+O 外部打开 · ←→ 页签 · Tab 返回"
+        elif self._modal_kind == "plan":
+            text = "  a 批准 · s 写修改意见 · q 放弃 · 滚轮浏览 · 拖选复制 · Tab 返回"
         else:
-            wt_hint = ""
-            if self._modal_ref is not None:
-                _tid, aid = self._modal_ref
-                wt = self._agent_worktree_info(aid)
-                if wt.get("is_worktree"):
-                    agent = self.ledger.get_agent(_tid, aid)
-                    st = (agent.status if agent else "") or ""
-                    path = str(wt.get("short_path") or "wt")
-                    if self._agent_worktree_merged(aid):
-                        wt_hint = f" · 已合入 {path}"
-                    elif self._agent_mergeable(aid, st):
-                        armed = (
-                            self._merge_confirm_active()
-                            and self._merge_confirm_ref == (_tid, aid)
-                        )
-                        wt_hint = (
-                            f" · m确认合入 {path}"
-                            if armed
-                            else f" · m合入 {path}"
-                        )
-                    else:
-                        wt_hint = f" · wt {path}"
-                if self._pinned_agent_ref == (_tid, aid):
-                    wt_hint = " · ★钉住" + wt_hint
-            text = (
-                f"  ←→ 页签 · 点上方 Agent 切换 · ↑↓ 滚动 · Tab 返回"
-                f"{wt_hint}"
-            )
+            text = "  Tab 返回"
         line = _truncate_display(text, max(1, _terminal_width() - 12))
         return [("class:agent-window.hint", line)]
 
-    def _detail_filter_mouse(
-        self, detail_filter: DetailFilter
-    ) -> Callable[[MouseEvent], object]:
-        return self._only_mouse_up(
-            lambda _e: self._set_detail_filter(detail_filter),
-            scroll_target="detail",
-        )
-
-    def _detail_agent_switch_mouse(
-        self, task_id: str, agent_id: str
-    ) -> Callable[[MouseEvent], object]:
-        """Click agent chip in detail header strip → switch open agent."""
-
-        def _on_up(_event: MouseEvent) -> None:
-            if self._modal_ref and self._modal_ref == (task_id, agent_id):
-                return
-            # Keep filter; re-open same task on another agent.
-            saved_filter = self._detail_filter
-            self._open_agent(task_id, agent_id)
-            if saved_filter in self._detail_filters_for_open_task():
-                self._detail_filter = saved_filter
-            # Sync card selection index for left/right on task list later.
-            for t in self.ledger.snapshots():
-                if t.id != task_id:
-                    continue
-                for i, a in enumerate(t.agents):
-                    if a.id == agent_id:
-                        self._selected_agent_by_task[task_id] = i
-                        break
-                break
-            self.app.invalidate()
-
-        return self._only_mouse_up(_on_up, scroll_target="detail")
-
-    def _detail_fold_mouse(
-        self,
-        collapse_key: str,
-        open_path: str | None = None,
-    ) -> Callable[[MouseEvent], object]:
-        """Tool header click: plain = fold; Ctrl = open file (never expand).
-
-        Ctrl+click on a path-bearing tool row must not dump expanded bodies into
-        the TUI (that was flooding the terminal). Open goes to the OS app only.
-        """
-
-        def _on_up(event: MouseEvent) -> None:
-            if _mouse_control_held(event):
-                path = (open_path or "").strip()
-                if path:
-                    cwd = getattr(self.session, "cwd", None)
-                    ok, message = open_local_path(path, cwd=cwd)
-                    self._set_feedback(message, "success" if ok else "warning")
-                    try:
-                        self.app.invalidate()
-                    except Exception:  # noqa: BLE001
-                        pass
-                # Never toggle fold while Ctrl is held.
-                return
-            self._toggle_detail_fold(collapse_key)
-
-        return self._only_mouse_up(_on_up, scroll_target="detail")
-
-    def _toggle_detail_fold(self, collapse_key: str) -> None:
-        """Expand ↔ collapse one explicit owner key."""
-        if collapse_key in self._detail_collapsed:
-            self._detail_collapsed.remove(collapse_key)
-        else:
-            self._detail_collapsed.add(collapse_key)
-        self._invalidate_detail_body_cache()
-        self.app.invalidate()
-
-    def _set_detail_filter(self, detail_filter: DetailFilter) -> None:
-        if detail_filter not in DETAIL_FILTERS:
-            detail_filter = "message"
-        self._detail_filter = detail_filter
-        self._detail_cursor_line = 0
-        self._invalidate_detail_body_cache()
-        try:
-            self._detail_window.vertical_scroll = 0
-        except Exception:  # noqa: BLE001
-            pass
-        if self._plan_body_visible():
-            self._sync_plan_body_buffer(force=True)
-            try:
-                self.app.layout.focus(self._plan_body)
-            except Exception:  # noqa: BLE001
-                self.app.layout.focus(self._detail_window)
-        else:
-            try:
-                self.app.layout.focus(self._detail_window)
-            except Exception:  # noqa: BLE001
-                pass
-        self.app.invalidate()
-
-    def _cycle_detail_filter(self, delta: int) -> None:
-        filters = self._detail_filters_for_open_task()
-        try:
-            index = filters.index(self._detail_filter)
-        except ValueError:
-            index = 0
-        self._set_detail_filter(filters[(index + delta) % len(filters)])
-
-    def _detail_filters_for_open_task(self) -> tuple[DetailFilter, ...]:
-        show_plan = False
-        if self._modal_ref is not None:
-            task_id, _ = self._modal_ref
-            for t in self.ledger.snapshots():
-                if t.id == task_id and t.plan_state in {
-                    "planning",
-                    "awaiting_approval",
-                    "approved",
-                    "consent",
-                }:
-                    show_plan = True
-                    break
-        if show_plan:
-            return ("message", "tool", "plan")
-        return ("message", "tool")
-
     def _detail_page_visible(self) -> bool:
-        """Whether detail/auth owns the page below the persistent app header."""
+        """Only plan approval and auth can replace the reading stream."""
         return bool(
-            self._modal_open and self._modal_kind in {"agent", "auth"}
+            self._modal_open and self._modal_kind in {"plan", "auth"}
         )
 
     def _detail_input_visible(self) -> bool:
@@ -5279,30 +5010,9 @@ class CodeDoggyTUI:
             return self._auth_wizard.step == WizardStep.PASTE
         if self._modal_kind == "ask":
             return False  # dedicated ask float; Other uses main input
-        if self._modal_kind != "agent":
+        if self._modal_kind != "plan":
             return False
-        # Plan review: keep the box for "s" revision notes.
-        if self._task_awaiting_plan_approval():
-            return True
-        if self._modal_ref is None:
-            return False
-        task_id, agent_id = self._modal_ref
-        agent = self.ledger.get_agent(task_id, agent_id)
-        if agent is not None and agent.status in {"pending", "running", "waiting"}:
-            return True
-        for task in self.ledger.snapshots():
-            if task.id != task_id:
-                continue
-            if task.status == "running" or task.phase in {
-                "dispatching",
-                "parallel",
-                "reporting",
-                "planning",
-                "plan_review",
-            }:
-                return True
-            return False
-        return bool(self._is_running() and self._active_task_id == task_id)
+        return self._task_awaiting_plan_approval()
 
     def _land_focus_if_detail_input_gone(self) -> None:
         """When the interject box disappears mid-turn, land on detail body.
@@ -5310,7 +5020,7 @@ class CodeDoggyTUI:
         ConditionalContainer hide can leave focus on a detached control; stream
         redraws then fight the user. Explicitly move to the detail window.
         """
-        if not self._modal_open or self._modal_kind != "agent":
+        if not self._modal_open or self._modal_kind != "plan":
             return
         if self._detail_input_visible():
             return
@@ -5350,7 +5060,7 @@ class CodeDoggyTUI:
         self._call_in_ui_thread(self.app.invalidate)
 
     def _ask_user_fn(self, questions: list[dict[str, Any]]) -> dict[str, Any]:
-        """Host hook for ask_user_question — park worker; answers via plan-card modal.
+        """Host hook for ask_user_question — park worker; answer in a small float.
 
         Replaces stdin CLI (ask_user_cli) so options render *inside* the TUI
         task/plan modal with ↑↓ selection, not as a stray terminal popup.
@@ -5390,9 +5100,8 @@ class CodeDoggyTUI:
         return result
 
     def _open_ask_modal(self) -> None:
-        """Show dedicated questionnaire float — not the plan/agent card."""
-        # Do not hijack agent detail: close plan/agent shell so ask is a real popup.
-        if self._modal_open and self._modal_kind in {"agent", "auth"}:
+        """Show dedicated questionnaire float outside the approval/auth pages."""
+        if self._modal_open and self._modal_kind in {"plan", "auth"}:
             # Keep ref only as context; close shell so z-order shows ask float alone.
             saved_ref = self._modal_ref
             self._modal_open = False
@@ -5425,7 +5134,7 @@ class CodeDoggyTUI:
         """Dismiss dedicated ask float after answer."""
         if self._modal_kind != "ask" and not self._ask_active:
             return
-        self._modal_kind = "agent"
+        self._modal_kind = "plan"
         self._ask_other_editing = False
         self._detail_input.text = ""
         self._modal_open = False
@@ -5558,37 +5267,6 @@ class CodeDoggyTUI:
             self._ask_multi_picked.add(i)
         self.app.invalidate()
 
-    def _plan_mode_consent_fn(self) -> bool:
-        """Block worker until user Enter/Esc on the turn-status consent strip."""
-        if self._closing:
-            return False
-        task_id = self._active_task_id
-        if task_id is None:
-            sel = self._selected_task_view()
-            task_id = sel.id if sel is not None else None
-        self._plan_ui_task_id = task_id
-        self._plan_consent_ok = False
-        self._plan_consent_event.clear()
-        self._plan_ui = "consent"
-        if task_id:
-            self.ledger.set_plan_state(task_id, "consent")
-        self._call_in_ui_thread(self.app.invalidate)
-        # Wait on worker thread; UI resolves via keys.
-        signaled = self._plan_consent_event.wait(timeout=600)
-        self._plan_ui = None
-        if not signaled:
-            self._plan_consent_ok = False
-            self._call_in_ui_thread(
-                lambda: self._set_feedback("Plan 同意超时 · 已拒绝", "warning")
-            )
-        ok = bool(self._plan_consent_ok)
-        if task_id:
-            self.ledger.set_plan_state(
-                task_id, "planning" if ok else "none"
-            )
-        self._call_in_ui_thread(self.app.invalidate)
-        return ok
-
     def _plan_mode_exit_fn(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
         """Open task plan tab and wait for a / s / q."""
         payload = payload or {}
@@ -5603,7 +5281,6 @@ class CodeDoggyTUI:
         self._plan_exit_outcome = "approved"
         self._plan_exit_feedback = ""
         self._plan_exit_event.clear()
-        self._plan_ui = "review"
         self._plan_exit_waiting = True
         kernel = getattr(self.session.extensions, "kernel", None)
         state = getattr(kernel, "session_mode_state", None) if kernel else None
@@ -5618,12 +5295,8 @@ class CodeDoggyTUI:
             self.ledger.set_plan_state(
                 task_id, "awaiting_approval", plan_file=plan_path or None
             )
-            # Open MAIN agent detail on 计划 tab.
-            main_id = f"{task_id}:main"
             def _open() -> None:
-                self._open_agent(task_id, main_id)
-                self._set_detail_filter("plan")
-                self.app.invalidate()
+                self._open_plan_approval(task_id)
 
             self._call_in_ui_thread(_open)
         else:
@@ -5632,7 +5305,6 @@ class CodeDoggyTUI:
             signaled = self._plan_exit_event.wait(timeout=600)
         finally:
             self._plan_exit_waiting = False
-        self._plan_ui = None
         if state is not None:
             state.awaiting_plan_approval = False
             if kernel is not None and hasattr(kernel, "persist_plan_mode_state"):
@@ -5665,30 +5337,36 @@ class CodeDoggyTUI:
             return {"outcome": "abandoned"}
         return {"outcome": "approved"}
 
-    def _resolve_plan_consent(self, ok: bool) -> None:
-        self._plan_consent_ok = ok
-        self._plan_ui = None
-        self._plan_consent_event.set()
-        self.app.invalidate()
-
     def _resolve_plan_exit(self, outcome: str) -> None:
+        was_plan_page = self._modal_open and self._modal_kind == "plan"
         if outcome == "revise":
-            # Capture optional detail input as revision notes.
+            # Revision is a real decision, not a vague button: collect the
+            # requested change first, then Enter submits it.
             try:
                 text = (self._detail_input.text or "").strip()
             except Exception:  # noqa: BLE001
                 text = ""
+            if not text and was_plan_page:
+                self._set_feedback("写下具体修改意见，按 Enter 提交", "info")
+                try:
+                    self.app.layout.focus(self._detail_input)
+                except Exception:  # noqa: BLE001
+                    pass
+                self.app.invalidate()
+                return
             self._plan_exit_feedback = text or "请修改计划后再次 exit_plan_mode"
             if text:
                 self._detail_input.text = ""
         self._plan_exit_outcome = outcome
-        self._plan_ui = None
         if self._plan_exit_waiting:
             self._plan_exit_event.set()
         else:
             # Resume chrome (restart with awaiting_plan_approval, no parked tool).
             self._apply_plan_exit_resume(outcome)
-        self.app.invalidate()
+        if was_plan_page:
+            self._leave_plan_approval()
+        else:
+            self.app.invalidate()
 
     def _apply_plan_exit_resume(self, outcome: str) -> None:
         """Handle a/s/q after process resume when no exit_fn is waiting."""
@@ -5756,144 +5434,23 @@ class CodeDoggyTUI:
             self.ledger.set_plan_state(
                 task_id, "awaiting_approval", plan_file=plan_path or None
             )
-            main_id = f"{task_id}:main"
             self._plan_ui_task_id = task_id
-            self._plan_ui = "review"
             self._plan_exit_waiting = False  # resume chrome, not blocked tool
             try:
-                self._open_agent(task_id, main_id)
-                self._set_detail_filter("plan")
+                self._open_plan_approval(task_id)
             except Exception:  # noqa: BLE001
                 pass
             self._set_feedback(
-                "恢复：计划待确认 · a 批准 · s 修改 · q 放弃",
+                "恢复：计划待确认 · 请在审批页决定",
                 "warning",
             )
         else:
-            self._plan_ui = "review"
             self._plan_exit_waiting = False
             self._set_feedback(
-                "恢复：计划待确认（无任务卡）· a/s/q 仍可用",
+                "恢复：有待确认计划，但当前没有可归属的任务",
                 "warning",
             )
         self.app.invalidate()
-
-    def _toggle_session_plan_mode(self) -> None:
-        kernel = getattr(self.session.extensions, "kernel", None)
-        if kernel is None:
-            self._set_feedback("当前会话无 plan 模式", "warning")
-            return
-        state = getattr(kernel, "session_mode_state", None)
-        turn_in_flight = bool(self._is_running())
-        phase = str(getattr(state, "plan_phase", "") or "") if state else ""
-        # Off when active / pending / exit_pending UI chrome is on.
-        on = bool(
-            state is not None
-            and (
-                getattr(state, "is_plan_ui", None)()
-                if callable(getattr(state, "is_plan_ui", None))
-                else (
-                    getattr(state, "is_plan", lambda: False)()
-                    or phase in {"pending", "active", "exit_pending"}
-                )
-            )
-        )
-        plan_path: str | None = None
-        try:
-            from codedoggy.tools.grok_build.plan_mode import (
-                probe_or_create_empty_plan_file,
-            )
-
-            resolve = getattr(kernel, "_resolve_plan_file_path", None)
-            if callable(resolve):
-                plan_path = str(resolve(None))
-            else:
-                from codedoggy.orchestration.session_mode import plan_file_for_session
-
-                cwd = Path(
-                    getattr(kernel, "cwd", None)
-                    or getattr(self.session, "cwd", Path.cwd())
-                )
-                sid = str(
-                    getattr(kernel, "session_id", None)
-                    or getattr(self.session, "id", "")
-                    or "default"
-                )
-                plan_path = str(plan_file_for_session(cwd, sid).resolve())
-            probe_or_create_empty_plan_file(Path(plan_path))
-        except Exception:  # noqa: BLE001
-            plan_path = None
-
-        # Goal mode replaces Plan (Grok session modes are exclusive).
-        if (
-            not on
-            and state is not None
-            and getattr(state, "is_goal", lambda: False)()
-        ):
-            try:
-                state.exit_goal(reason="switch_to_plan")
-            except Exception:  # noqa: BLE001
-                try:
-                    state.exit_goal()
-                except Exception:  # noqa: BLE001
-                    pass
-            if hasattr(kernel, "persist_plan_mode_state"):
-                try:
-                    kernel.persist_plan_mode_state()
-                except Exception:  # noqa: BLE001
-                    pass
-            self._set_feedback("已退出 Goal · 切换 Plan", "info")
-
-        if on:
-            if hasattr(kernel, "user_exit_plan_mode"):
-                kernel.user_exit_plan_mode(turn_in_flight=turn_in_flight)
-            elif hasattr(kernel, "exit_plan_mode"):
-                kernel.exit_plan_mode(approved=False)
-            phase_after = str(getattr(state, "plan_phase", "") or "") if state else ""
-            if phase_after == "exit_pending":
-                self._set_feedback("将在本轮结束后退出 Plan", "info")
-            else:
-                self._set_feedback("已切换到 Auto", "info")
-        else:
-            # Idle Tab → Pending (activate on next prompt). Mid-turn Tab → Active
-            # + interjection reminder (Grok mid-turn activate).
-            if turn_in_flight and hasattr(kernel, "enter_plan_mode"):
-                kernel.enter_plan_mode(plan_path)
-                self._inject_mid_turn_plan_reminder()
-                self._set_feedback("已切换到 Plan · 仅可改 plan 文件", "info")
-            elif hasattr(kernel, "enter_plan_mode_pending"):
-                kernel.enter_plan_mode_pending(plan_path)
-                self._set_feedback("Plan 待启动 · 下一条消息进入计划模式", "info")
-            elif hasattr(kernel, "enter_plan_mode"):
-                kernel.enter_plan_mode(plan_path)
-                self._set_feedback("已切换到 Plan · 仅可改 plan 文件", "info")
-        self.app.invalidate()
-
-    def _inject_mid_turn_plan_reminder(self) -> None:
-        """Push a plan-mode activation note into the live turn (interjection)."""
-        from codedoggy.orchestration.session_mode import PLAN_REMINDER_FULL
-
-        text = (
-            f"<system-reminder>\n{PLAN_REMINDER_FULL}\n</system-reminder>"
-        )
-        interject = getattr(self.session, "interject", None)
-        if callable(interject):
-            try:
-                interject(text)
-                return
-            except Exception:  # noqa: BLE001
-                pass
-        # Fallback: enqueue as deferred full prompt if interject unavailable.
-        enqueue = getattr(self.session, "enqueue_prompt", None)
-        if callable(enqueue):
-            try:
-                enqueue(text, prompt_id="plan-mid-turn-activate")
-            except Exception:  # noqa: BLE001
-                pass
-
-    # Soft ceiling for plan TextArea load — not FormattedText markdown budget.
-    # Plain buffer handles large text; still avoid multi-MB freezes.
-    _PLAN_BODY_SOFT_CHARS = 200_000
 
     def _resolve_plan_file_path_for_ui(self) -> str:
         path = ""
@@ -5927,7 +5484,7 @@ class CodeDoggyTUI:
         return path
 
     def _load_plan_file_for_ui(self) -> tuple[str, str, float]:
-        """Return (display_path, text, mtime). Soft-cap only — no MD explode."""
+        """Return the exact approval file text and its disk identity."""
         path = self._resolve_plan_file_path_for_ui()
         text = ""
         mtime = 0.0
@@ -5939,75 +5496,59 @@ class CodeDoggyTUI:
             if p.is_file():
                 mtime = float(p.stat().st_mtime)
                 text = p.read_text(encoding="utf-8", errors="replace")
-                if len(text) > self._PLAN_BODY_SOFT_CHARS:
-                    text = (
-                        text[: self._PLAN_BODY_SOFT_CHARS]
-                        + "\n\n…(计划过长，已截断加载 · 请用编辑器打开全文)\n"
-                    )
         except Exception:  # noqa: BLE001
             text = ""
         return path, text, mtime
 
-    def _task_plan_state_for_ui(self) -> str:
-        if self._modal_ref is None:
-            return ""
-        tid, _ = self._modal_ref
-        for t in self.ledger.snapshots():
-            if t.id == tid:
-                return str(t.plan_state or "")
-        return ""
+    def _plan_revision_label(self) -> str:
+        """Content-derived revision id for the exact plan being approved."""
+        text = ""
+        try:
+            text = self._plan_body.buffer.text or ""
+        except Exception:  # noqa: BLE001
+            pass
+        if not text:
+            _path, text, _mtime = self._load_plan_file_for_ui()
+        if not text:
+            return "REV EMPTY"
+        digest = hashlib.sha256(text.encode("utf-8")).hexdigest()[:8].upper()
+        return f"REV {digest}"
 
     def _render_plan_chrome(self) -> StyleAndTextTuples:
-        """Short status strip above the selectable plan TextArea — never the body."""
+        """Approval controls around one exact, content-addressed plan revision."""
         if self._plan_body_visible():
             self._sync_plan_body_buffer(force=False)
         width = max(12, _terminal_width() - 10)
         path = self._plan_body_path or self._resolve_plan_file_path_for_ui()
-        plan_state = self._task_plan_state_for_ui()
-        frags: StyleAndTextTuples = []
-        if self._task_awaiting_plan_approval() or plan_state == "awaiting_approval":
-            frags.append(("class:plan.status.review", "  ● 计划待你确认\n"))
-            frags.extend(
-                [
-                    ("class:plan.chrome", "  "),
-                    (
-                        "class:plan.action.approve",
-                        " a 批准开工 ",
-                        self._plan_action_mouse("approved"),
-                    ),
-                    ("class:plan.chrome", "  "),
-                    (
-                        "class:plan.action.revise",
-                        " s 修改计划 ",
-                        self._plan_action_mouse("revise"),
-                    ),
-                    ("class:plan.chrome", "  "),
-                    (
-                        "class:plan.action.abandon",
-                        " q 放弃 ",
-                        self._plan_action_mouse("abandoned"),
-                    ),
-                    ("", "\n"),
-                ]
-            )
-        elif plan_state == "planning":
-            frags.append(
-                ("class:plan.status.draft", "  ● 正在起草 · 可继续对话完善方案\n")
-            )
-        elif plan_state == "approved":
-            frags.append(
-                ("class:plan.status.approved", "  ✓ 已批准 · 实现中可对照本方案\n")
-            )
-        elif plan_state == "abandoned":
-            frags.append(
-                ("class:plan.status.abandoned", "  – 已放弃此方案\n")
-            )
+        frags: StyleAndTextTuples = [
+            ("class:plan.status.review", "  ● DECISION REQUIRED"),
+            ("class:plan.meta", f"  ·  {self._plan_revision_label()}\n"),
+            ("class:plan.chrome", "  "),
+            (
+                "class:plan.action.approve",
+                " a  批准开工 ",
+                self._plan_action_mouse("approved"),
+            ),
+            ("class:plan.chrome", "  "),
+            (
+                "class:plan.action.revise",
+                " s  要求修改 ",
+                self._plan_action_mouse("revise"),
+            ),
+            ("class:plan.chrome", "  "),
+            (
+                "class:plan.action.abandon",
+                " q  放弃 ",
+                self._plan_action_mouse("abandoned"),
+            ),
+            ("", "\n"),
+        ]
         short_name = Path(path).name if path else "plan.md"
         frags.append(
             (
                 "class:plan.meta",
                 _truncate_display(
-                    f"  {short_name} · Markdown · 可拖选复制 · Ctrl+O 外部打开\n",
+                    f"  {short_name} · 下方就是唯一待批原文，无摘要、日志或历史版本\n",
                     width,
                 ),
             )
@@ -6031,7 +5572,11 @@ class CodeDoggyTUI:
         path, text, mtime = self._load_plan_file_for_ui()
         self._plan_body_path = path
         key = (path, mtime, len(text))
-        if not force and key == self._plan_body_sync_key:
+        if (
+            not force
+            and key == self._plan_body_sync_key
+            and self._plan_body.buffer.text == text
+        ):
             return
         buf = self._plan_body.buffer
         # Keep selection/cursor when content is identical.
@@ -6068,14 +5613,6 @@ class CodeDoggyTUI:
         ok, message = open_local_path(path, cwd=cwd)
         self._set_feedback(message, "success" if ok else "warning")
 
-    def _plan_consent_mouse(
-        self, ok: bool
-    ) -> Callable[[MouseEvent], object]:
-        return self._only_mouse_up(
-            lambda _e: self._resolve_plan_consent(ok),
-            scroll_target="none",
-        )
-
     def _plan_action_mouse(
         self, outcome: str
     ) -> Callable[[MouseEvent], object]:
@@ -6083,113 +5620,6 @@ class CodeDoggyTUI:
             lambda _e: self._resolve_plan_exit(outcome),
             scroll_target="detail",
         )
-
-    def _move_detail_cursor(self, delta: int) -> None:
-        max_y = max(0, int(self._detail_line_count) - 1)
-        self._detail_cursor_line = min(
-            max(0, int(self._detail_cursor_line) + delta),
-            max_y,
-        )
-        # Keep Window scroll aligned with the cursor anchor.
-        try:
-            win = self._detail_window
-            info = getattr(win, "render_info", None)
-            if info is not None:
-                height = max(1, int(info.window_height))
-                max_scroll = max(0, int(info.content_height) - height)
-                y = int(self._detail_cursor_line)
-                if y < int(win.vertical_scroll):
-                    win.vertical_scroll = y
-                elif y >= int(win.vertical_scroll) + height:
-                    win.vertical_scroll = min(max_scroll, y - height + 1)
-            else:
-                # No render_info yet: still move the scroll hint with the cursor.
-                win.vertical_scroll = max(
-                    0, int(self._detail_cursor_line)
-                )
-        except Exception:  # noqa: BLE001
-            pass
-        self.app.invalidate()
-
-    def _scroll_detail_to_line(self, line: int) -> None:
-        """Jump detail viewport + cursor anchor to an absolute line."""
-        max_y = max(0, int(self._detail_line_count) - 1)
-        y = max(0, min(int(line), max_y))
-        self._detail_cursor_line = y
-        try:
-            win = self._detail_window
-            info = getattr(win, "render_info", None)
-            if info is not None:
-                height = max(1, int(info.window_height))
-                max_scroll = max(0, int(info.content_height) - height)
-                win.vertical_scroll = max(0, min(max_scroll, y))
-            else:
-                win.vertical_scroll = y
-        except Exception:  # noqa: BLE001
-            pass
-        self.app.invalidate()
-
-    def _scroll_detail_to_bottom(self) -> None:
-        """Pin detail to the last lines (End key / floating FAB)."""
-        max_y = max(0, int(self._detail_line_count) - 1)
-        self._detail_cursor_line = max_y
-        try:
-            win = self._detail_window
-            info = getattr(win, "render_info", None)
-            if info is not None:
-                height = max(1, int(info.window_height))
-                max_scroll = max(0, int(info.content_height) - height)
-                win.vertical_scroll = max_scroll
-            else:
-                win.vertical_scroll = max_y
-        except Exception:  # noqa: BLE001
-            pass
-        self.app.invalidate()
-
-    def _detail_jump_fab_visible(self) -> bool:
-        """True when agent detail is open and the viewport is not at the end.
-
-        The FAB is a separate Float — it must not live in scrollback content.
-        """
-        if self._closing:
-            return False
-        if not (self._modal_open and self._modal_kind == "agent"):
-            return False
-        # Short transcripts: nothing to jump past.
-        if int(self._detail_line_count) <= 8:
-            return False
-        win = self._detail_window
-        info = getattr(win, "render_info", None)
-        if info is None:
-            # First paint after open: assume long content may need a jump.
-            return True
-        try:
-            height = max(1, int(info.window_height))
-            content_h = max(0, int(info.content_height))
-            max_scroll = max(0, content_h - height)
-            if max_scroll <= 0:
-                return False
-            # Hide when already at / near the bottom (1-line slack).
-            return int(getattr(win, "vertical_scroll", 0) or 0) < max_scroll - 1
-        except Exception:  # noqa: BLE001
-            return True
-
-    def _render_detail_jump_fab(self) -> StyleAndTextTuples:
-        """Viewport-fixed chip: click → scroll detail to bottom."""
-        # Fixed 10 cells to match Float width (pad with spaces for hit target).
-        label = " ↓ 到底 "
-        pad = max(0, 10 - get_cwidth(label))
-        text = label + (" " * pad)
-        handler = self._detail_jump_fab_mouse()
-        return [("class:detail.jump.fab", text, handler)]
-
-    def _detail_jump_fab_mouse(self) -> Callable[[MouseEvent], object]:
-        """Click jumps to bottom; wheel still scrolls the detail pane."""
-
-        def _on_up(_event: MouseEvent) -> None:
-            self._scroll_detail_to_bottom()
-
-        return self._only_mouse_up(_on_up, scroll_target="detail")
 
     def _on_detail_scrollbar(self, scroll: int) -> None:
         """Keep detail cursor anchor on the scrollbar-driven viewport top."""
@@ -6205,8 +5635,8 @@ class CodeDoggyTUI:
         """Fragment mouse handlers must not swallow wheel incorrectly.
 
         Returning None for non-UP events marks the event handled. Wheel over
-        homepage task cards is not used to switch selection; wheel over
-        modal/detail scrolls that pane. No pre-click / hover chrome.
+        homepage task sections scroll the reading stream; modal/auth scrolls
+        its own body. No pre-click chrome.
         """
 
         def handler(event: MouseEvent) -> object:
@@ -6236,9 +5666,8 @@ class CodeDoggyTUI:
                         self._scroll_todo_pane(-1 if step < 0 else 1)
                         return None
                     if target == "tasks" and not self._modal_open:
-                        # Homepage wheel no longer switches cards — leave event
-                        # for the Window so the list can scroll if needed.
-                        return NotImplemented
+                        self._scroll_tasks(step)
+                        return None
                     if target == "detail" and (
                         self._modal_open or self._ask_active
                     ):
@@ -6252,8 +5681,63 @@ class CodeDoggyTUI:
 
         return handler
 
+    def _scroll_tasks(self, delta_lines: int) -> None:
+        """Scroll homepage conversation rows and pause/resume live following."""
+        if self._modal_open:
+            return
+        win = self._task_window
+        info = getattr(win, "render_info", None)
+        # Window state is updated immediately by each wheel event; render_info
+        # can lag one paint behind during a fast wheel gesture.
+        current = int(getattr(win, "vertical_scroll", 0) or 0)
+        if info is not None:
+            height = max(1, int(info.window_height))
+            content_max = max(0, int(info.content_height) - height)
+            useful_max = max(0, int(self._latest_task_tail_line) - height + 1)
+            max_scroll = min(content_max, useful_max)
+        else:
+            max_scroll = max(
+                0,
+                int(self._latest_task_tail_line),
+                current + max(0, int(delta_lines)),
+            )
+        new_scroll = max(
+            0, min(max_scroll, current + int(delta_lines))
+        )
+        win.vertical_scroll = new_scroll
+        # Scrolling upward always means "let me read"; never let the next live
+        # paint reclaim the viewport. Following resumes only after a deliberate
+        # downward move reaches the real tail.
+        at_latest = int(delta_lines) > 0 and new_scroll >= max_scroll
+        self._follow_latest_task = at_latest
+        if at_latest:
+            self._selected_line = max(0, int(self._latest_task_tail_line))
+        else:
+            self._selected_line = new_scroll
+        if self._task_selection_active and self._selected_task >= 0:
+            # Manual scroll owns the cursor anchor until task selection changes.
+            self._pinned_task_for_line = int(self._selected_task)
+        self._task_paint_cache = None
+        self.app.invalidate()
+
+    def _sync_task_follow_scroll(self) -> None:
+        """Keep the newest homepage conversation tail visible while it streams."""
+        if self._modal_open or not self._follow_latest_task:
+            return
+        tail = max(0, int(self._latest_task_tail_line))
+        self._selected_line = tail
+        win = self._task_window
+        info = getattr(win, "render_info", None)
+        if info is None:
+            return
+        height = max(1, int(info.window_height))
+        content_max = max(0, int(info.content_height) - height)
+        target = min(content_max, max(0, tail - height + 1))
+        if int(getattr(win, "vertical_scroll", 0) or 0) != target:
+            win.vertical_scroll = target
+
     def _scroll_detail(self, delta_lines: int) -> None:
-        """Scroll agent/auth detail pane without touching task list state."""
+        """Scroll the auth/modal body without touching the transcript."""
         win = self._detail_window
         info = getattr(win, "render_info", None)
         if info is not None:
@@ -6308,77 +5792,33 @@ class CodeDoggyTUI:
         self._selected_task = max(0, min(int(self._selected_task), len(tasks) - 1))
         return tasks[self._selected_task]
 
-    def _selected_agent_index(self, task: TaskView) -> int:
-        if not task.agents:
-            self._selected_agent_by_task[task.id] = 0
-            return 0
-        index = self._selected_agent_by_task.get(task.id, 0) % len(task.agents)
-        self._selected_agent_by_task[task.id] = index
-        return index
-
     def _tab_task_cycle(self) -> None:
-        """Tab cycle: restore selection / open detail / exit detail.
-
-        1. Inside agent detail → close and return to that card
-        2. On a selected task card (list focused) → open that task's detail
-        3. From the prompt with a sticky selection → return to that same card
-           (do **not** jump to latest — that fought user browse mid-run)
-        4. Outside / no selection → select + focus the newest task
-        """
+        """Tab switches only between reading stream and composer."""
         if self._ask_active or (
             self._modal_open and self._modal_kind == "ask"
         ):
             return
         if self._modal_open and self._modal_kind == "auth":
             return
-        # Inside task detail → leave (back to task list).
-        if self._modal_open and self._modal_kind == "agent":
-            saved_ref = self._modal_ref
-            self._close_modal()
-            # Keep the card that was open selected (do not jump elsewhere).
-            if saved_ref is not None:
-                tid = saved_ref[0]
-                snaps = self.ledger.snapshots()
-                for i, t in enumerate(snaps):
-                    if t.id == tid:
-                        self._selected_task = i
-                        self._task_selection_active = True
-                        self._follow_latest_task = i == len(snaps) - 1
-                        self._pinned_task_for_line = None
-                        break
-            try:
-                self.app.layout.focus(self._task_window)
-            except Exception:  # noqa: BLE001
-                pass
-            self.app.invalidate()
+        if self._modal_open and self._modal_kind == "plan":
+            self._leave_plan_approval()
             return
-        input_focused = False
-        tasks_focused = False
         try:
             input_focused = bool(self.app.layout.has_focus(self._input))
             tasks_focused = bool(self.app.layout.has_focus(self._task_window))
         except Exception:  # noqa: BLE001
             input_focused = False
             tasks_focused = False
-        has_selection = (
-            self._task_selection_active and self._selected_task >= 0
-        )
-        # From the prompt: restore the user's sticky card selection first.
-        if input_focused and has_selection:
+        if tasks_focused:
             try:
-                self.app.layout.focus(self._task_window)
+                self.app.layout.focus(self._input)
             except Exception:  # noqa: BLE001
                 pass
-            self._pinned_task_for_line = None
             self.app.invalidate()
             return
-        # List focused on a selected card → open detail.
-        if tasks_focused and has_selection:
-            self._open_selected_task()
-            self.app.invalidate()
-            return
-        # No sticky selection (or focus elsewhere): land on newest card.
-        if self._focus_latest_task():
+        if not self._task_selection_active or self._selected_task < 0:
+            self._focus_latest_task()
+        if input_focused or self.ledger.snapshots():
             try:
                 self.app.layout.focus(self._task_window)
             except Exception:  # noqa: BLE001
@@ -6394,219 +5834,120 @@ class CodeDoggyTUI:
         self._selected_task = len(tasks) - 1
         self._task_selection_active = True
         self._follow_latest_task = True
-        # Force re-pin of cursor line onto the latest card on next paint.
+        # Force re-pin of the cursor line onto the newest task on next paint.
         self._pinned_task_for_line = None
         self._render_tasks()
         self.app.invalidate()
         return bool(self._task_refs)
 
-    def _user_wants_latest_focus(self) -> bool:
-        """True when the user is watching the bottom of the task list.
-
-        Used so new/finished tasks re-select the latest card only if the user
-        is already following or scrolled near the end — not when browsing older
-        history above.
-        """
-        if self._follow_latest_task:
-            return True
-        if self._modal_open:
-            return False
-        win = self._task_window
-        info = getattr(win, "render_info", None)
-        if info is None:
-            return False
-        try:
-            content_h = int(info.content_height)
-            window_h = int(info.window_height)
-            max_scroll = max(0, content_h - window_h)
-            if max_scroll <= 0:
-                # Everything fits: treat as "at bottom" only if selection is latest.
-                tasks = self.ledger.snapshots()
-                return bool(
-                    tasks
-                    and self._task_selection_active
-                    and self._selected_task == len(tasks) - 1
-                )
-            # Within ~2 lines of the bottom counts as waiting on the latest.
-            return int(win.vertical_scroll) >= max(0, max_scroll - 2)
-        except Exception:  # noqa: BLE001
-            return False
-
-
-    def _move_task(self, delta: int) -> None:
-        tasks = self.ledger.snapshots()
-        if not tasks:
-            return
-        if not self._task_selection_active or self._selected_task < 0:
-            # First arrow from blank: pick latest (down) or first (up).
-            self._selected_task = (
-                len(tasks) - 1 if delta > 0 else 0
-            )
-            self._task_selection_active = True
-        else:
-            self._selected_task = (int(self._selected_task) + delta) % len(tasks)
-        # Browsing older tasks pauses follow; landing on the last resumes it.
-        self._follow_latest_task = self._selected_task == len(tasks) - 1
-        self._pinned_task_for_line = None
-        self.app.invalidate()
-
-    def _wheel_task_focus(self, delta: int) -> None:
-        """Mouse wheel → card focus, damped for high-resolution mice.
-
-        One physical notch often yields many SCROLL events. Accumulate
-        same-direction ticks and enforce a short cooldown after each move so
-        the list does not leap several cards per flick.
-        """
-        if not delta:
-            return
-        now = time.monotonic()
-        if now - float(self._wheel_task_last_move_at) < _WHEEL_TASK_COOLDOWN_S:
-            return
-        step = 1 if delta > 0 else -1
-        if self._wheel_task_accum and (self._wheel_task_accum > 0) != (step > 0):
-            self._wheel_task_accum = 0
-        self._wheel_task_accum += step
-        if abs(self._wheel_task_accum) < _WHEEL_TASK_NOTCHES:
-            return
-        move = 1 if self._wheel_task_accum > 0 else -1
-        self._wheel_task_accum = 0
-        self._wheel_task_last_move_at = now
-        self._move_task(move)
-        try:
-            self.app.layout.focus(self._task_window)
-        except Exception:  # noqa: BLE001
-            pass
-
-    def _move_task_agent(self, delta: int) -> None:
-        task = self._selected_task_view()
-        if task is None or not task.agents:
-            return
-        index = self._selected_agent_index(task)
-        self._selected_agent_by_task[task.id] = (index + delta) % len(task.agents)
-        self.app.invalidate()
-
     def _open_selected_task(self) -> None:
         task = self._selected_task_view()
-        if task is None or not task.agents:
+        if task is None:
             return
-        agent = task.agents[self._selected_agent_index(task)]
-        self._open_agent(task.id, agent.id)
+        if task.plan_state == "awaiting_approval":
+            self._open_plan_approval(task.id)
 
     def _reset_detail_cursor_state(self) -> None:
         """Drop stale detail height before the next body paint measures it."""
         self._detail_cursor_line = 0
         self._detail_line_count = 1
 
-    def _open_plan_detail_on_finish(self, task_id: str, *, status: str) -> None:
-        """After a task ends, open MAIN only when its default detail is a plan.
-
-        Ordinary conversation results stay in the task list until the user
-        explicitly opens them. Plan review remains automatic because it is a
-        decision surface, not merely another transcript.
-        """
-        if self._closing:
-            return
-        st = (status or "").strip().lower()
-        if st == "cancelled":
-            return
-        if self._default_detail_filter_for_task(task_id) != "plan":
-            return
-        if task_id in self._auto_opened_plan_tasks:
-            return
-        # Do not clobber login / questionnaire.
-        if self._ask_active or (
-            self._modal_open and self._modal_kind in {"auth", "ask"}
-        ):
-            return
-        # Already looking at this task — keep the view, mark as opened.
-        if (
-            self._modal_open
-            and self._modal_kind == "agent"
-            and self._modal_ref is not None
-            and self._modal_ref[0] == task_id
-        ):
-            self._auto_opened_plan_tasks.add(task_id)
-            return
-
-        main_id = f"{task_id}:main"
-        agent = self.ledger.get_agent(task_id, main_id)
-        if agent is None:
-            task = next(
-                (item for item in self.ledger.snapshots() if item.id == task_id),
-                None,
-            )
-            if task is None or not task.agents:
-                return
-            main_id = task.agents[0].id
-            agent = self.ledger.get_agent(task_id, main_id)
-            if agent is None:
-                return
-
-        snaps = self.ledger.snapshots()
-        for i, t in enumerate(snaps):
-            if t.id == task_id:
-                self._selected_task = i
-                self._task_selection_active = True
-                self._follow_latest_task = i == len(snaps) - 1
-                self._pinned_task_for_line = None
-                break
-        self._auto_opened_plan_tasks.add(task_id)
-        self._open_agent(task_id, main_id)
-
     def _open_agent(self, task_id: str, agent_id: str) -> None:
-        agent = self.ledger.get_agent(task_id, agent_id)
-        if agent is None:
+        """Jump to an Agent's inline transcript; no generic detail page."""
+        tasks = self.ledger.snapshots()
+        task_index = next(
+            (i for i, item in enumerate(tasks) if item.id == task_id),
+            None,
+        )
+        if task_index is None:
             return
-        self._modal_kind = "agent"
-        self._modal_ref = (task_id, agent_id)
-        # Plan is the decision surface: open on 计划 when drafting/awaiting.
-        self._detail_filter = self._default_detail_filter_for_task(task_id)
-        self._detail_collapsed = set()
-        self._detail_collapse_seeded_for = None
-        self._detail_known_fold_keys = set()
-        self._reset_detail_cursor_state()
-        self._invalidate_detail_body_cache()
-        self._plan_body_sync_key = None
-        self._detail_input.text = ""
-        self._modal_open = True
-        if self._plan_body_visible():
-            self._sync_plan_body_buffer(force=True)
-            try:
-                self.app.layout.focus(self._plan_body)
-            except Exception:  # noqa: BLE001
-                self.app.layout.focus(self._detail_window)
-        else:
-            self.app.layout.focus(self._detail_window)
+        task = tasks[task_index]
+        if not any(str(item.id) == str(agent_id) for item in task.agents):
+            return
+        self._modal_open = False
+        self._modal_ref = None
+        self._selected_task = task_index
+        self._task_selection_active = True
+        self._follow_latest_task = False
+        self._pinned_task_for_line = None
+        self._task_paint_cache = None
+        self._render_tasks()
+        anchor = self._agent_anchor_lines.get(
+            (task_id, str(agent_id)),
+            self._task_anchor_lines.get(task_id, 0),
+        )
+        self._selected_line = max(0, int(anchor))
+        try:
+            self._task_window.vertical_scroll = max(0, int(anchor) - 2)
+            self.app.layout.focus(self._task_window)
+        except Exception:  # noqa: BLE001
+            pass
         self.app.invalidate()
 
-    def _default_detail_filter_for_task(self, task_id: str) -> DetailFilter:
-        """Prefer plan tab when the task is in a plan lifecycle with a draft."""
-        for task in self.ledger.snapshots():
-            if task.id != task_id:
-                continue
-            state = str(task.plan_state or "")
-            if state == "awaiting_approval":
-                return "plan"
-            if state in {"planning", "approved"}:
-                if _task_has_plan_body(task):
-                    return "plan"
-            break
-        return "message"
+    def _open_plan_approval(self, task_id: str) -> None:
+        """Open the sole non-home product page for one awaiting revision."""
+        tasks = self.ledger.snapshots()
+        task_index = next(
+            (i for i, item in enumerate(tasks) if item.id == task_id),
+            None,
+        )
+        if task_index is None:
+            return
+        task = tasks[task_index]
+        if task.plan_state != "awaiting_approval":
+            self._set_feedback("当前没有待审批计划", "warning")
+            return
+        main_id = f"{task.id}:main"
+        if task.agents:
+            main_id = str(task.agents[0].id)
+            for agent in task.agents:
+                if (
+                    str(agent.id).endswith(":main")
+                    or str(agent.label).strip().upper() == "MAIN"
+                ):
+                    main_id = str(agent.id)
+                    break
+        self._close_tool_preview(restore_focus=False)
+        self._tool_hover_ref = None
+        self._selected_task = task_index
+        self._task_selection_active = True
+        self._follow_latest_task = task_index == len(tasks) - 1
+        self._plan_ui_task_id = task.id
+        self._modal_kind = "plan"
+        self._modal_ref = (task.id, main_id)
+        self._modal_open = True
+        self._plan_body_sync_key = None
+        self._detail_input.text = ""
+        self._sync_plan_body_buffer(force=True)
+        try:
+            self.app.layout.focus(self._plan_body)
+        except Exception:  # noqa: BLE001
+            pass
+        self.app.invalidate()
 
-    def _task_plan_approve_mouse(
+    def _leave_plan_approval(self) -> None:
+        """Return to the reading stream without changing approval state."""
+        self._modal_open = False
+        self._modal_kind = "plan"
+        self._modal_ref = None
+        self._detail_input.text = ""
+        try:
+            self.app.layout.focus(
+                self._task_window if self.ledger.snapshots() else self._input
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        self.app.invalidate()
+
+    def _task_plan_review_mouse(
         self, task_id: str
     ) -> Callable[[MouseEvent], object]:
-        """Task-card 批准 CTA — same path as detail `a`."""
+        """Homepage entry into the dedicated approval page."""
 
         def _on_up(_event: MouseEvent) -> None:
-            self._plan_ui_task_id = task_id
-            if self._plan_ui is None and not self._plan_exit_waiting:
-                # Resume-style chrome may not have parked _plan_ui; still OK.
-                self._plan_ui = "review"
-            self._resolve_plan_exit("approved")
-            self.app.invalidate()
+            self._open_plan_approval(task_id)
 
-        return self._only_mouse_up(_on_up, scroll_target="none")
+        return self._only_mouse_up(_on_up, scroll_target="tasks")
 
     def _open_auth_wizard(self) -> None:
         self._modal_kind = "auth"
@@ -6629,6 +5970,9 @@ class CodeDoggyTUI:
         self.app.invalidate()
 
     def _close_modal(self) -> None:
+        if self._modal_kind == "plan":
+            self._leave_plan_approval()
+            return
         was_auth = self._modal_kind == "auth"
         if self._modal_kind == "ask" and self._ask_active:
             # Closing × while questionnaire is open == cancel (do not hang worker).
@@ -6636,10 +5980,9 @@ class CodeDoggyTUI:
             return
         had_tasks = bool(self.ledger.snapshots())
         self._modal_open = False
-        self._modal_kind = "agent"
+        self._modal_kind = "plan"
         self._modal_ref = None
         self._reset_detail_cursor_state()
-        self._invalidate_detail_body_cache()
         self._detail_input.text = ""
         # Focus the prompt caret immediately — focusing the task window on empty
         # ledgers forced a heavy underlay paint before the user saw the close.
@@ -6656,8 +5999,13 @@ class CodeDoggyTUI:
         self.app.invalidate()
         if was_auth and self._pending_prompt and self._ensure_auth_ready():
             prompt = self._pending_prompt
+            image_attachments = self._pending_image_attachments
             self._pending_prompt = None
-            self._start_task(prompt)
+            self._pending_image_attachments = ()
+            self._start_task(
+                prompt,
+                image_attachments=image_attachments,
+            )
 
     def _render_ask_dialog_title(self) -> StyleAndTextTuples:
         n = max(1, len(self._ask_questions))
@@ -6754,27 +6102,549 @@ class CodeDoggyTUI:
         self._doggy_empty_cache = (key, fragments)
         return fragments
 
-    def _task_card_mouse(
+    def _task_chat_toggle_mouse(
+        self, task_id: str
+    ) -> Callable[[MouseEvent], object]:
+        """Collapse/expand only the homepage conversation body."""
+
+        def _toggle(_event: MouseEvent) -> None:
+            if task_id in self._collapsed_task_chats:
+                self._collapsed_task_chats.remove(task_id)
+            else:
+                self._collapsed_task_chats.add(task_id)
+            self._task_paint_cache = None
+            self._pinned_task_for_line = None
+            self.app.invalidate()
+
+        return self._only_mouse_up(_toggle, scroll_target="tasks")
+
+    def _task_link_mouse(
+        self,
+        target: str,
+    ) -> Callable[[MouseEvent], object]:
+        """Open an underlined transcript path or HTTPS link on plain click."""
+        from prompt_toolkit.mouse_events import MouseButton
+
+        clean_target = (target or "").strip().strip("\"'")
+
+        def handler(event: MouseEvent) -> object:
+            button = getattr(event, "button", None)
+            if event.event_type is MouseEventType.MOUSE_MOVE:
+                self._tool_hover_ref = None
+                if not self._tool_preview_pinned:
+                    self._close_tool_preview(restore_focus=False)
+                return None
+            if event.event_type is MouseEventType.MOUSE_DOWN:
+                return None
+            if event.event_type is not MouseEventType.MOUSE_UP:
+                return None
+            if button not in (None, MouseButton.LEFT, MouseButton.UNKNOWN):
+                return NotImplemented
+            self._tool_hover_ref = None
+            self._close_tool_preview(restore_focus=False)
+            if re.match(r"^https?://", clean_target, re.IGNORECASE):
+                try:
+                    opened = bool(webbrowser.open(clean_target, new=2))
+                except Exception:  # noqa: BLE001
+                    opened = False
+                message = (
+                    "已在浏览器打开链接"
+                    if opened
+                    else "无法打开链接"
+                )
+                self._set_feedback(
+                    message,
+                    "success" if opened else "warning",
+                )
+            else:
+                cwd = getattr(self.session, "cwd", None)
+                opened, message = open_local_path(clean_target, cwd=cwd)
+                self._set_feedback(
+                    message,
+                    "success" if opened else "warning",
+                )
+            self.app.invalidate()
+            return None
+
+        return handler
+
+    def _task_tool_mouse(
+        self,
+        ref: tuple[str, str, str],
+    ) -> Callable[[MouseEvent], object]:
+        """Ctrl+move previews; Ctrl+click pins. No tool-navigation mode."""
+        from prompt_toolkit.mouse_events import MouseButton
+
+        def handler(event: MouseEvent) -> object:
+            if event.event_type is MouseEventType.MOUSE_MOVE:
+                self._tool_hover_ref = ref
+                if _mouse_control_held(event):
+                    if not self._tool_preview_pinned:
+                        self._show_tool_preview(ref, pinned=False)
+                    return None
+                if not self._tool_preview_pinned:
+                    self._close_tool_preview(restore_focus=False)
+                return None
+            button = getattr(event, "button", None)
+            if event.event_type is MouseEventType.MOUSE_DOWN:
+                self._tool_hover_ref = ref
+                if button in (None, MouseButton.LEFT) and _mouse_control_held(event):
+                    self._show_tool_preview(ref, pinned=False)
+                    return None
+                self._close_tool_preview(restore_focus=False)
+                return None
+            if event.event_type is MouseEventType.MOUSE_UP:
+                self._tool_hover_ref = ref
+                if button in (None, MouseButton.LEFT) and _mouse_control_held(event):
+                    self._show_tool_preview(ref, pinned=True)
+                    return None
+                if not self._tool_preview_pinned:
+                    self._close_tool_preview(restore_focus=False)
+                return None
+            return NotImplemented
+
+        return handler
+
+    def _tool_record_for_ref(
+        self,
+        ref: tuple[str, str, str] | None = None,
+    ) -> tuple[TaskView, Any, DetailRecord] | None:
+        target = ref or self._tool_preview_ref
+        if target is None:
+            return None
+        task_id, agent_id, record_id = target
+        task = next(
+            (item for item in self.ledger.snapshots() if item.id == task_id),
+            None,
+        )
+        if task is None:
+            return None
+        agent = next(
+            (item for item in task.agents if str(item.id) == agent_id),
+            None,
+        )
+        if agent is None:
+            return None
+        snapshot = self._snapshot_for_task_agent(task, agent)
+        if snapshot is None:
+            return None
+        record = next(
+            (
+                item
+                for item in snapshot.records
+                if str(item.id) == record_id
+                and str(item.actor).strip().upper() == "TOOL"
+            ),
+            None,
+        )
+        if record is None:
+            return None
+        return task, agent, record
+
+    def _show_tool_preview(
+        self,
+        ref: tuple[str, str, str],
+        *,
+        pinned: bool,
+    ) -> None:
+        if self._modal_open or self._tool_record_for_ref(ref) is None:
+            return
+        if self._tool_preview_pinned and not pinned:
+            return
+        changed = self._tool_preview_ref != ref
+        self._tool_preview_ref = ref
+        self._tool_preview_pinned = bool(pinned)
+        if changed:
+            self._tool_preview_buffer_key = None
+        self._sync_tool_preview_buffer()
+        if pinned:
+            try:
+                self.app.layout.focus(self._tool_preview_body)
+            except Exception:  # noqa: BLE001
+                pass
+        self.app.invalidate()
+
+    def _close_tool_preview(self, *, restore_focus: bool) -> None:
+        if self._tool_preview_ref is None:
+            return
+        was_focused = False
+        try:
+            was_focused = bool(self.app.layout.has_focus(self._tool_preview_body))
+        except Exception:  # noqa: BLE001
+            pass
+        self._tool_preview_ref = None
+        self._tool_preview_pinned = False
+        self._tool_preview_buffer_key = None
+        if restore_focus and was_focused:
+            try:
+                self.app.layout.focus(self._task_window)
+            except Exception:  # noqa: BLE001
+                pass
+        self.app.invalidate()
+
+    def _tool_preview_visible(self) -> bool:
+        return bool(
+            not self._modal_open
+            and self._tool_preview_ref is not None
+            and self._tool_record_for_ref() is not None
+        )
+
+    def _sync_tool_preview_buffer(self) -> None:
+        resolved = self._tool_record_for_ref()
+        if resolved is None:
+            return
+        _task, _agent, record = resolved
+        parts: list[str] = []
+        for block in record.blocks:
+            label = (block.label or "").strip()
+            if label:
+                parts.append(label.upper())
+            parts.append(block.text or "（空）")
+        text = "\n\n".join(parts).strip() or "此工具没有正文输出。"
+        signature = (
+            self._tool_preview_ref,
+            record.status,
+            len(text),
+            text[:96],
+            text[-64:],
+        )
+        if signature == self._tool_preview_buffer_key:
+            return
+        buffer = self._tool_preview_body.buffer
+        cursor = min(int(buffer.cursor_position or 0), len(text))
+        try:
+            buffer.set_document(
+                Document(text, cursor_position=cursor),
+                bypass_readonly=True,
+            )
+        except TypeError:
+            was = buffer.read_only
+            try:
+                buffer.read_only = False  # type: ignore[assignment]
+                buffer.set_document(Document(text, cursor_position=cursor))
+            finally:
+                buffer.read_only = was  # type: ignore[assignment]
+        self._tool_preview_buffer_key = signature
+
+    def _render_tool_preview_header(self) -> StyleAndTextTuples:
+        resolved = self._tool_record_for_ref()
+        if resolved is None:
+            return [("class:tool.preview.meta", "  工具记录不可用\n")]
+        task, agent, record = resolved
+        width = max(12, _terminal_width() - 14)
+        status = str(record.status or "").lower()
+        if status in {"pending", "running", "waiting"}:
+            status_text, status_style = "运行中", "class:tool.preview.running"
+        elif status in {"failed", "error"}:
+            status_text, status_style = "失败", "class:tool.preview.failed"
+        else:
+            status_text, status_style = "完成", "class:tool.preview.done"
+        title = _truncate_display(f"  {record.title}", width)
+        scope = _truncate_display(
+            f"  {agent.label or 'AGENT'} · {task.title}", width
+        )
+        return [
+            ("class:tool.preview.title", title),
+            ("class:tool.preview.meta", "  "),
+            (status_style, status_text),
+            ("", "\n"),
+            ("class:tool.preview.meta", scope),
+        ]
+
+    def _render_tool_preview_footer(self) -> StyleAndTextTuples:
+        if self._tool_preview_pinned:
+            text = "  已固定 · 滚轮浏览 · 拖选复制 · Esc 关闭"
+        else:
+            text = "  Ctrl+点击固定 · 松开 Ctrl 关闭"
+        return [("class:tool.preview.footer", text)]
+
+    def _wire_buffer_outside_tool_preview(self, area: TextArea) -> None:
+        """A normal click in an input closes a pinned tool float."""
+        control = area.control
+        original = control.mouse_handler
+
+        def handler(event: MouseEvent) -> object:
+            if event.event_type is MouseEventType.MOUSE_DOWN:
+                if (
+                    self._task_copy_anchor is not None
+                    or self._task_copy_pending is not None
+                ):
+                    self._clear_task_text_selection(invalidate=False)
+                    self.app.invalidate()
+            if event.event_type is MouseEventType.MOUSE_MOVE:
+                self._tool_hover_ref = None
+                if not self._tool_preview_pinned:
+                    self._close_tool_preview(restore_focus=False)
+            if (
+                self._tool_preview_ref is not None
+                and event.event_type is MouseEventType.MOUSE_DOWN
+                and not _mouse_control_held(event)
+            ):
+                self._close_tool_preview(restore_focus=False)
+            return original(event)
+
+        control.mouse_handler = handler  # type: ignore[method-assign]
+
+    def _wire_task_text_selection_control(self) -> None:
+        """Let drag-copy win even over styled links and full-width padding."""
+        from prompt_toolkit.mouse_events import MouseButton
+
+        original = self._task_control.mouse_handler
+
+        def handler(event: MouseEvent) -> object:
+            button = getattr(event, "button", None)
+            is_left = button in (
+                None,
+                MouseButton.LEFT,
+                MouseButton.UNKNOWN,
+            )
+            if (
+                event.event_type is MouseEventType.MOUSE_DOWN
+                and is_left
+                and not _mouse_control_held(event)
+            ):
+                self._begin_task_text_selection(event)
+            elif (
+                event.event_type is MouseEventType.MOUSE_MOVE
+                and self._move_task_text_selection(event)
+            ):
+                return None
+            elif (
+                event.event_type is MouseEventType.MOUSE_UP
+                and is_left
+                and (
+                    self._task_copy_dragging
+                    or self._task_copy_pending is not None
+                )
+                and self._finish_task_text_selection(event)
+            ):
+                self._task_mouse_down_index = None
+                return None
+            return original(event)
+
+        self._task_control.mouse_handler = handler  # type: ignore[method-assign]
+
+    @staticmethod
+    def _task_mouse_point(event: MouseEvent) -> tuple[int, int]:
+        return (
+            max(0, int(event.position.y)),
+            max(0, int(event.position.x)),
+        )
+
+    def _begin_task_text_selection(self, event: MouseEvent) -> None:
+        point = self._task_mouse_point(event)
+        had_selection = self._task_copy_anchor is not None
+        self._task_copy_pending = point
+        self._task_copy_dragging = False
+        self._task_copy_anchor = None
+        self._task_copy_cursor = None
+        self._task_copy_text = ""
+        if had_selection:
+            self._task_paint_cache = None
+            self.app.invalidate()
+
+    def _move_task_text_selection(self, event: MouseEvent) -> bool:
+        point = self._task_mouse_point(event)
+        if not self._task_copy_dragging:
+            pending = self._task_copy_pending
+            if pending is None:
+                return False
+            if point == pending:
+                return True
+            self._task_copy_anchor = pending
+            self._task_copy_cursor = point
+            self._task_copy_pending = None
+            self._task_copy_dragging = True
+            self._follow_latest_task = False
+            self._task_paint_cache = None
+            self.app.invalidate()
+            return True
+        if self._task_copy_anchor is None:
+            return False
+        if point != self._task_copy_cursor:
+            self._task_copy_cursor = point
+            self._task_paint_cache = None
+            self.app.invalidate()
+        return True
+
+    def _finish_task_text_selection(self, event: MouseEvent) -> bool:
+        """Finish a drag selection; return whether it consumed the click."""
+        if not self._task_copy_dragging:
+            self._task_copy_pending = None
+            return False
+        anchor = self._task_copy_anchor
+        if anchor is None:
+            self._task_copy_dragging = False
+            self._task_copy_pending = None
+            return False
+        self._task_copy_cursor = self._task_mouse_point(event)
+        if self._task_copy_cursor == anchor:
+            self._clear_task_text_selection(invalidate=False)
+            self._task_paint_cache = None
+            return False
+
+        self._task_copy_text = self._extract_task_text_selection()
+        self._task_copy_dragging = False
+        self._task_copy_pending = None
+        self._task_paint_cache = None
+        self.app.invalidate()
+        return True
+
+    def _clear_task_text_selection(self, *, invalidate: bool = True) -> None:
+        self._task_copy_pending = None
+        self._task_copy_dragging = False
+        self._task_copy_anchor = None
+        self._task_copy_cursor = None
+        self._task_copy_text = ""
+        self._task_paint_cache = None
+        if invalidate:
+            self.app.invalidate()
+
+    def _task_text_selection_span(self, row: int) -> tuple[int, int] | None:
+        anchor = self._task_copy_anchor
+        cursor = self._task_copy_cursor
+        if anchor is None or cursor is None or anchor == cursor:
+            return None
+        start, end = sorted((anchor, cursor))
+        if row < start[0] or row > end[0]:
+            return None
+        start_col = start[1] if row == start[0] else 0
+        end_col = end[1] + 1 if row == end[0] else 1 << 30
+        return start_col, max(start_col, end_col)
+
+    def _paint_task_text_selection(
+        self,
+        parts: list[tuple[str, str, Callable[[MouseEvent], object]]],
+        row: int,
+    ) -> list[tuple[str, str, Callable[[MouseEvent], object]]]:
+        """Overlay selection without replacing each span's semantic color."""
+        span = self._task_text_selection_span(row)
+        if span is None:
+            return parts
+        start_col, end_col = span
+        output: list[tuple[str, str, Callable[[MouseEvent], object]]] = []
+        column = 0
+        previous_selected = False
+
+        def append(
+            style: str,
+            text: str,
+            mouse: Callable[[MouseEvent], object],
+        ) -> None:
+            if (
+                output
+                and output[-1][0] == style
+                and output[-1][2] is mouse
+            ):
+                previous = output[-1]
+                output[-1] = (style, previous[1] + text, mouse)
+            else:
+                output.append((style, text, mouse))
+
+        for style, text, mouse in parts:
+            for char in text:
+                cell_width = max(0, get_cwidth(char))
+                selected = (
+                    column < end_col
+                    and column + cell_width > start_col
+                )
+                if cell_width == 0:
+                    selected = previous_selected
+                painted_style = (
+                    f"{style} class:task.selection"
+                    if selected
+                    else style
+                )
+                append(painted_style, char, mouse)
+                previous_selected = selected
+                column += cell_width
+        return output
+
+    def _task_rendered_plain_lines(self) -> list[str]:
+        fragments = getattr(self._task_control, "_fragments", None) or []
+        return [
+            "".join(part[1] for part in row)
+            for row in split_lines(fragments)
+        ]
+
+    @staticmethod
+    def _display_start_index(text: str, column: int) -> int:
+        cell = 0
+        for index, char in enumerate(text):
+            width = max(0, get_cwidth(char))
+            if width and cell + width > column:
+                return index
+            cell += width
+        return len(text)
+
+    @staticmethod
+    def _display_end_index(text: str, column: int) -> int:
+        cell = 0
+        for index, char in enumerate(text):
+            width = max(0, get_cwidth(char))
+            if width and cell + width > column:
+                return index + 1
+            cell += width
+        return len(text)
+
+    def _extract_task_text_selection(self) -> str:
+        anchor = self._task_copy_anchor
+        cursor = self._task_copy_cursor
+        lines = self._task_rendered_plain_lines()
+        if anchor is None or cursor is None or not lines:
+            return ""
+        start, end = sorted((anchor, cursor))
+        first_row = min(start[0], len(lines) - 1)
+        last_row = min(end[0], len(lines) - 1)
+        if first_row > last_row:
+            return ""
+
+        selected: list[str] = []
+        for row in range(first_row, last_row + 1):
+            text = lines[row]
+            left = (
+                self._display_start_index(text, start[1])
+                if row == first_row
+                else 0
+            )
+            right = (
+                self._display_end_index(text, end[1])
+                if row == last_row
+                else len(text)
+            )
+            selected.append(text[left:right].rstrip())
+        return "\n".join(selected).rstrip("\n")
+
+    def _copy_task_text_to_clipboard(self, text: str) -> bool:
+        if not text:
+            return False
+        try:
+            self.app.clipboard.set_data(ClipboardData(text))
+        except Exception:  # noqa: BLE001
+            pass
+        # Copy is intentionally silent: adding a feedback row changes layout
+        # height and makes the reading viewport appear to jump.
+        return set_system_clipboard_text(text)
+
+    def _task_section_mouse(
         self, task_index: int
     ) -> Callable[[MouseEvent], object]:
-        """Whole-card click: select; double-click or Ctrl+left opens detail.
-
-        No hover chrome, no auto-scroll-to-bottom on single click.
-        """
+        """Reading-stream click selects a task; it never opens a detail page."""
         from prompt_toolkit.mouse_events import MouseButton
 
         def handler(event: MouseEvent) -> object:
             btn = getattr(event, "button", None)
+            if event.event_type is MouseEventType.MOUSE_MOVE:
+                self._tool_hover_ref = None
+                if not self._tool_preview_pinned:
+                    self._close_tool_preview(restore_focus=False)
+                return None
             if event.event_type is MouseEventType.MOUSE_DOWN:
                 if btn in (None, MouseButton.LEFT):
                     self._task_mouse_down_index = task_index
+                if not _mouse_control_held(event):
+                    self._close_tool_preview(restore_focus=False)
                 return None
-            if event.event_type in {
-                MouseEventType.SCROLL_UP,
-                MouseEventType.SCROLL_DOWN,
-            }:
-                # Wheel must not switch task cards on the homepage.
-                return NotImplemented
             if event.event_type is not MouseEventType.MOUSE_UP:
                 return NotImplemented
             if btn not in (None, MouseButton.LEFT):
@@ -6782,7 +6652,7 @@ class CodeDoggyTUI:
                 return NotImplemented
             down = self._task_mouse_down_index
             self._task_mouse_down_index = None
-            # Must press and release on the same card (not drag in from void).
+            # Must press and release inside the same task section.
             if down != task_index:
                 return None
             tasks = self.ledger.snapshots()
@@ -6796,19 +6666,7 @@ class CodeDoggyTUI:
                 self.app.layout.focus(self._task_window)
             except Exception:  # noqa: BLE001
                 pass
-            now = time.monotonic()
-            last = self._task_card_last_click
-            is_double = (
-                last is not None
-                and last[0] == task_index
-                and (now - last[1]) <= _DOUBLE_CLICK_S
-            )
-            if _mouse_control_held(event) or is_double:
-                self._task_card_last_click = None
-                self._open_selected_task()
-            else:
-                self._task_card_last_click = (task_index, now)
-                self.app.invalidate()
+            self.app.invalidate()
             return None
 
         return handler
@@ -6820,8 +6678,7 @@ class CodeDoggyTUI:
         self._selected_task = -1
         self._pinned_task_for_line = None
         self._task_mouse_down_index = None
-        self._task_card_last_click = None
-        self._wheel_task_accum = 0
+        self._clear_task_text_selection(invalidate=False)
         if focus_input:
             try:
                 self.app.layout.focus(self._input)
@@ -6831,16 +6688,18 @@ class CodeDoggyTUI:
         self.app.invalidate()
 
     def _task_gap_mouse(self) -> Callable[[MouseEvent], object]:
-        """1-line gap between cards: click clears selection (wheel does not switch)."""
+        """Gap between task sections: click clears selection."""
 
         def handler(event: MouseEvent) -> object:
-            if event.event_type in {
-                MouseEventType.SCROLL_UP,
-                MouseEventType.SCROLL_DOWN,
-            }:
-                return NotImplemented
+            if event.event_type is MouseEventType.MOUSE_MOVE:
+                self._tool_hover_ref = None
+                if not self._tool_preview_pinned:
+                    self._close_tool_preview(restore_focus=False)
+                return None
             if event.event_type is MouseEventType.MOUSE_DOWN:
                 self._task_mouse_down_index = None
+                self._clear_task_text_selection(invalidate=False)
+                self._close_tool_preview(restore_focus=False)
                 return None
             if event.event_type is MouseEventType.MOUSE_UP:
                 self._clear_task_selection(focus_input=True)
@@ -6850,17 +6709,19 @@ class CodeDoggyTUI:
         return handler
 
     def _task_void_mouse(self) -> Callable[[MouseEvent], object]:
-        """Empty area below cards: click clears selection (wheel does not switch)."""
+        """Empty area below the stream: click clears selection."""
 
         def handler(event: MouseEvent) -> object:
+            if event.event_type is MouseEventType.MOUSE_MOVE:
+                self._tool_hover_ref = None
+                if not self._tool_preview_pinned:
+                    self._close_tool_preview(restore_focus=False)
+                return None
             if event.event_type is MouseEventType.MOUSE_DOWN:
                 self._task_mouse_down_index = None
+                self._clear_task_text_selection(invalidate=False)
+                self._close_tool_preview(restore_focus=False)
                 return None
-            if event.event_type in {
-                MouseEventType.SCROLL_UP,
-                MouseEventType.SCROLL_DOWN,
-            }:
-                return NotImplemented
             if event.event_type is MouseEventType.MOUSE_UP:
                 self._clear_task_selection(focus_input=True)
                 return None
@@ -6904,9 +6765,6 @@ class CodeDoggyTUI:
             return NotImplemented
         self._close_modal()
         return None
-
-    def _current_provider_id(self) -> str:
-        return session_surface.provider_id(self.session)
 
     def _ensure_auth_ready(self) -> bool:
         """True when connection truth says we can sample."""
@@ -7161,64 +7019,12 @@ class CodeDoggyTUI:
 
         control.mouse_handler = mouse_handler  # type: ignore[method-assign]
 
-    def _image_path_mouse(self, path: str) -> Callable[[MouseEvent], object]:
-        """Click-to-open for image / script paths in the agent detail pane.
-
-        Dedicated link fragments open on plain left-click. Ctrl is optional
-        (and on Win32 must be detected via keyboard state — see
-        ``_mouse_control_held``).
-        """
-
-        def handler(event: MouseEvent) -> object:
-            from prompt_toolkit.mouse_events import MouseButton
-
-            if event.event_type in {
-                MouseEventType.SCROLL_UP,
-                MouseEventType.SCROLL_DOWN,
-            }:
-                step = -3 if event.event_type is MouseEventType.SCROLL_UP else 3
-                if self._modal_open or self._ask_active:
-                    self._scroll_detail(step)
-                    return None
-                return NotImplemented
-            if event.event_type is not MouseEventType.MOUSE_UP:
-                return NotImplemented
-            btn = getattr(event, "button", None)
-            if btn not in (None, MouseButton.LEFT, MouseButton.UNKNOWN):
-                return NotImplemented
-            cwd = getattr(self.session, "cwd", None)
-            ok, message = open_local_path(path, cwd=cwd)
-            self._set_feedback(message, "success" if ok else "warning")
-            try:
-                self.app.invalidate()
-            except Exception:  # noqa: BLE001
-                pass
-            return None
-
-        return handler
-
-
-def _render_doggy_idle_panel(width: int) -> StyleAndTextTuples:
-    """Post-splash empty task area with a calm text hierarchy."""
-    w = max(12, width)
-    lines: list[tuple[str, str]] = [
-        ("class:brand", "  DOGGY"),
-        ("class:task.title", "  散步完了，等你下一句。"),
-        ("class:meta", "  在下方输入框交代任务…"),
-    ]
-    out: StyleAndTextTuples = []
-    for style, raw in lines:
-        text = _truncate_display(raw, w)
-        pad = max(0, w - get_cwidth(text))
-        out.append((style, text + " " * pad + "\n"))
-    return out
-
 def run_tui(session: Any, *, initial_prompt: str | None = None) -> None:
     CodeDoggyTUI(session, initial_prompt=initial_prompt).run()
 
 
 def agent_summary_text_from_messages(messages: list[Any]) -> str:
-    """Return assistant prose for the compact overview, not the detail page."""
+    """Return assistant prose for the lightweight live-agent fallback."""
     from codedoggy.tui.agent_detail import strip_system_reminders
 
     parts: list[str] = []
@@ -7265,7 +7071,7 @@ def _agent_status_mark(status: str) -> str:
 def task_report_from_agent(text: str, *, max_chars: int | None = None) -> str:
     """Boss-list summary from MAIN wording — first paragraph, full text.
 
-    Display wraps on the task card; do not hard-crop with ellipsis here.
+    Display wraps in the task section; do not hard-crop with ellipsis here.
     ``max_chars`` remains optional for callers that still want a soft cap.
     """
     clean = text.strip()
@@ -7273,7 +7079,7 @@ def task_report_from_agent(text: str, *, max_chars: int | None = None) -> str:
         return "任务已结束。"
     soft = _friendly_failure_toast(clean)
     if soft != "任务未能完成" or _looks_like_transport_error(clean):
-        # Prefer the human one-liner on the card; detail modal keeps raw if needed.
+        # Prefer the human one-liner; canonical messages retain the full text.
         if _looks_like_transport_error(clean) or clean.lower().startswith("sampler"):
             clean = soft
     paragraphs = [" ".join(part.split()) for part in re.split(r"\n\s*\n", clean)]
@@ -7314,7 +7120,7 @@ def _friendly_failure_toast(text: str | None) -> str:
         return "模型响应超时 · 可以再试一次"
     if "sampler" in low:
         return "模型调用失败"
-    # Keep short; card should not reprint a novel.
+    # Keep the terminal status short; the transcript already contains the prose.
     one = " ".join(raw.split())
     if len(one) > 42:
         return one[:41] + "…"
@@ -7377,7 +7183,7 @@ def _format_elapsed(seconds: float) -> str:
 def _task_elapsed_seconds(
     task: TaskView, *, now: float | None = None
 ) -> float | None:
-    """Wall-clock seconds for a task card; None if never started."""
+    """Wall-clock seconds for a task section; None if never started."""
     started = float(getattr(task, "started_at", 0.0) or 0.0)
     if started <= 0:
         return None
@@ -7396,17 +7202,8 @@ def _task_elapsed_label(
     return _format_elapsed(seconds)
 
 
-def _task_is_terminal(task: TaskView) -> bool:
-    return task.phase in {"done", "failed", "cancelled"} or task.status in {
-        "completed",
-        "failed",
-        "cancelled",
-        "max_turns",
-    }
-
-
 def _is_tool_activity_line(text: str) -> bool:
-    """True for live tool chips that must never appear as card cover copy."""
+    """True when transport text describes a tool rather than assistant prose."""
     t = (text or "").strip()
     if not t:
         return False
@@ -7415,96 +7212,6 @@ def _is_tool_activity_line(text: str) -> bool:
     if "· 调用中" in t or "· 完成" in t or "· 失败" in t or "· 仍在 " in t:
         return True
     return False
-
-
-def _task_list_summary(
-    task: TaskView, *, interject: str | None = None
-) -> str:
-    """Task-card cover prose — never tools.
-
-    In-progress: keep newlines so the card can grow multi-line without the
-    finished 2-line abstract. Terminal: prefer report / MAIN, paint will wrap
-    to two lines.
-    """
-    if interject:
-        return f"↩ 插入中 · {interject}"
-
-    report = (task.report or "").strip()
-    main_prose = ""
-    main_prose_flat = ""
-    for agent in task.agents:
-        if agent.label.upper() == "MAIN" and (agent.output or "").strip():
-            raw = (agent.output or "").strip()
-            flat = " ".join(raw.split())
-            if _is_tool_activity_line(flat):
-                continue
-            main_prose = raw
-            main_prose_flat = flat
-            break
-
-    if _task_is_terminal(task):
-        if report:
-            return " ".join(report.split())
-        if main_prose_flat:
-            return main_prose_flat
-        return ""
-
-    # Live plan / stream cover — multi-line OK (paint does not 2-line-cap).
-    plan_excerpt = _plan_excerpt_from_task(task, max_chars=240)
-    if task.plan_state == "awaiting_approval":
-        if plan_excerpt:
-            return plan_excerpt
-        if main_prose:
-            return main_prose
-        if report:
-            return report
-        return "方案待你确认"
-    if task.plan_state == "planning" and task.phase in {
-        "planning",
-        "plan_review",
-        "dispatching",
-    }:
-        if plan_excerpt:
-            return plan_excerpt
-        if main_prose:
-            return main_prose
-        if report:
-            return report
-        return "正在和你对齐方案…"
-    if report:
-        return report
-    if main_prose:
-        return main_prose
-    return ""
-
-
-def _task_stage_text(task: TaskView, *, interject: str | None = None) -> str:
-    # Terminal first — never stick on「Plan · 起草中」after the turn finished.
-    if task.phase == "done" or task.status == "completed":
-        return f"已完成 · {len(task.agents)} 个 Agent"
-    if task.phase == "cancelled" or task.status == "cancelled":
-        return STATUS_TEXT.get("cancelled", "已取消")
-    if task.phase == "failed" or task.status in {"failed", "max_turns"}:
-        return STATUS_TEXT.get(task.status, "失败")
-
-    if interject:
-        return "↩ 插入中"
-    if task.phase == "planning" or (
-        task.plan_state == "planning" and task.phase in {"planning", "plan_review"}
-    ):
-        return "规划 · 起草中"
-    if task.phase == "plan_review" or task.plan_state == "awaiting_approval":
-        return "规划 · 待批"
-    if task.phase == "dispatching":
-        return "MAIN 拆解中"
-    if task.phase == "parallel":
-        active = sum(
-            agent.status in {"pending", "running"} for agent in task.agents
-        )
-        return f"{max(1, active)} 个 Agent 并行中"
-    if task.phase == "reporting":
-        return "MAIN 汇总中"
-    return STATUS_TEXT.get(task.status, task.status)
 
 
 def _compact_task_stage_text(
@@ -7550,378 +7257,17 @@ def _task_status_style(task: TaskView) -> str:
     return "class:task.status"
 
 
-def _task_has_plan_body(task: TaskView) -> bool:
-    """True when the task's plan file has non-empty content."""
-    return bool(_plan_excerpt_from_task(task, max_chars=8))
-
-
-def _plan_excerpt_from_task(task: TaskView, *, max_chars: int = 72) -> str:
-    """First heading or prose line from the plan file for card cover copy."""
-    path = (getattr(task, "plan_file", None) or "").strip()
-    if not path:
-        return ""
-    try:
-        p = Path(path)
-        if not p.is_file():
-            return ""
-        text = p.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return ""
-    return _plan_excerpt_text(text, max_chars=max_chars)
-
-
-def _plan_excerpt_text(text: str, *, max_chars: int = 72) -> str:
-    title = ""
-    for line in (text or "").splitlines():
-        s = line.strip()
-        if not s:
-            continue
-        if s.startswith("#"):
-            title = s.lstrip("#").strip()
-        else:
-            title = s
-        if title:
-            break
-    if not title:
-        return ""
-    title = " ".join(title.split())
-    return _truncate_display(title, max_chars)
-
-
-# Startup brand: neon street couple (concept image) — black void, not car city.
-# Keys: F fur · H golden fur · D dark cloth · B shades · M pink · C cyan ·
-# Y gold · W white · P hot pink · N nose · L cream shoe · S soft · . void
-_DOGGY_COUPLE_ART = (
-    "....................................................",
-    "........HHH.........HHHH............................",
-    "........HHSF.......HHHHF............................",
-    "........H..HH......FHHSH............................",
-    "........HSH.HH.HHHHHSFHF............................",
-    "........HFF.HFHHHHFFHHHF............................",
-    "........HFF.HFFFFFFFFFH.............................",
-    "........HHHHFFFFHHFFFHHH............................",
-    "........FHHFFHHHHSHS....FH..........................",
-    "........SHHHS.....H.....SS........HHHH.MMM..........",
-    "........HHHHHH....FFFFFSHHHS....HHHHHHHMMM.M........",
-    "........HHFFFH...HFLLFF...F....HHHFFFFHMMMMMM.......",
-    ".......HFFFFFLFFFLLLLLFF..F...HHHFFFFFHHHHMM........",
-    ".......HHFFFFLLLFFLLLLLLFFF...HHHFFFFFFFFHSSH.......",
-    "........HFFFLLLLFHFFFFFFHFF...FHHHFFFHFFFFHHH.......",
-    "..........HFFLLLLLFFFFFFFH...HHHFFFFHHHFFHFFFH......",
-    ".........MSHFFLLLLLLLFFFFSM..HHFF.HFFFFFFHHFFH......",
-    ".......MMMS..FFFFFFFF...MMMMSFHFFSFFFFLFHHFFFFH.....",
-    ".......MMMS.SFFFFFFFF..MMMMCCSHFFHFFHFLFFHFFFFHH....",
-    ".......MMHMMHFFFFFFFH.MMS.....HHFFFFFLLFHHFFFFFH....",
-    ".......CC.SM.HFFFFFH.MM..........HFFFLFH..HFFFFH....",
-    ".......C...MSHHFFF.HSS............HFFFS....HSHH.....",
-    "......C.....SSH...HHS........CC..MSHSMMM.HFFFS......",
-    ".....CC.....S.HH.HF.S..MM...CCHSSHHHMSHSHSHHHS......",
-    ".....CC.....S..HHH.SS..MMM..CSH.HFHHHFH.FHHFFFH.....",
-    ".....C..C...S..SSS.CC.MMMMS.CHH.HFFFFFHHFHFHFFF.....",
-    "....C...CC..M..HSH.CC..MMM..CHS.HHHHHH.FH.HHFHF.....",
-    "...CC...CC..M..HHH.CC..SSS..CCS..SSM....H..HHHH.....",
-    "..CC....CC..M......CC.......CC...MMMM...HC.HH.C.....",
-    "..C.....C..S.......CC.......CCC..MMM.....CC...CC....",
-    "..C..CCCC..S.......CC.......C.C...M.....CCC....C....",
-    "..C....C...M.......CC.......C.C.........C.C....CC...",
-    "..C.......SM.......CC.......C.CSHHHHHHHHC.CC....C...",
-    "..CC..MM..S.FFFF...CC.......C.CHFFFFFFFFSC.C....CC..",
-    "..CC.SMSHSS.FFFFHFHCC......SS.CCSSSSHHHSCC.C.....C..",
-    "...C.MHFH...........M...MSSS..CCCCCCCCCCCC.CC....C..",
-    "....CSHFS....C.C....SS..MSSS.C...CCC.....C..C...CC..",
-    ".....CSH.....CC.......SMS....C.C...C..C..CC.CCCCC...",
-    ".......C......C......CC.C...CC.C...C..S...C..CSSH...",
-    ".......C.....CC........CC..CC.S...C....C..CC..HHFH..",
-    ".......CC....C.........CC..S..S...S....S...SS.FHFH..",
-    "........C....C........CC..SSS.S...S....M..SSM.HSFH..",
-    "........CC..C......S..C...SMMMMMMSMMMMSMMMMMM...HH..",
-    ".........C..C......C..C......MMHMSSHHHHSMHM..H......",
-    ".........CCCC.....CC.C.........H..FFFFFF....HH......",
-    "..........CC.........CC........HHSFFFFFH.HHHFH......",
-    "..........SC......C.C.CC..HH...HHHFFFFFS.HFFFS......",
-    "..........CC.....C.CC..CFFFFH...HHFFFFH.C.HFH.......",
-    "..........C......C.C...CCHFH.....FFFFFH.SS..........",
-    ".........CC.....C..C....CHH......FFFFF...CS.........",
-    "........CCCCC...C.CC...CSH......SFFFFH..CCSH........",
-    "........C....CC...C...CC..H....CSSHFFH.CC..H........",
-    ".......FFFFH..SC.CC.CCC..FF.....FCCSH.SC...F........",
-    "......FFHHFFH..CSC..SH...F...HFFF..CS..H..HH........",
-    "......F.....FF..CC.HH...FF...F..FF..S.HS..H.....M...",
-    "......HS....FF..C.HS....F....F...HF.SS...HH.....M...",
-    "CCCCC..HH....HLHS..FFFFFH.SS.HH...FHSSFHFH.CCSSCCCCC",
-    "........SH....HF...SSSSS......SH...FF.SSS...........",
-    "MM.C.C...HFFFFFF..CCCCCCCCC....SFFFF...S...MM.SSS.MM",
-    "....................................................",
+# Doggy neon couple splash — single source in doggy_brand.py
+from codedoggy.tui.doggy_brand import (  # noqa: E402
+    _DOGGY_ART_PALETTE,
+    _DOGGY_COUPLE_ART,
+    _DOGGY_COUPLE_FRAMES,
+    _animate_doggy_couple,
+    _compose_doggy_night,
+    _half_block,
+    _render_doggy_empty,
+    _render_doggy_idle_panel,
 )
-
-# ``.`` is intentionally absent: empty pixels inherit the active Window/theme
-# background instead of painting a second canvas color behind the portrait.
-_DOGGY_ART_PALETTE = {
-    "C": "#00bac5",
-    "M": "#ee4b8d",
-    "c": "#0b6670",
-    "m": "#8f1b58",
-    "G": "#ff7a32",
-    "Y": "#d9ad32",
-    "T": "#f2ca55",
-    "P": "#ff68ad",
-    "R": "#0a0a0a",
-    "F": "#e1d2ae",
-    "H": "#c9a978",
-    "D": "#1a1a1a",
-    "S": "#75644a",
-    "W": "#f5f5f7",
-    "B": "#121212",
-    "N": "#3a2a22",
-    "L": "#f0e6cc",
-    "K": "#050507",
-    "E": "#3b2a20",
-}
-
-_DOGGY_COUPLE_FRAMES = 12
-
-# High-priority facial pixels survive terminal resizing instead of dissolving
-# into the surrounding tan fur.
-_DOGGY_FEMALE_EYE_DETAILS = (
-    (32, 13, "K"), (33, 13, "K"), (34, 13, "K"),
-    (32, 14, "K"), (33, 14, "W"), (34, 14, "K"),
-    (38, 13, "K"), (39, 13, "K"), (40, 13, "K"),
-    (38, 14, "K"), (39, 14, "W"), (40, 14, "K"),
-)
-
-_DOGGY_FEMALE_MASK_SPANS = (
-    (16, 33, 40),
-    (17, 31, 42),
-    (18, 31, 42),
-    (19, 31, 42),
-    (20, 33, 40),
-)
-
-_DOGGY_FEMALE_MASK_HIGHLIGHTS = (
-    (29, 17, "m"), (30, 17, "m"),
-    (43, 17, "m"), (44, 17, "m"),
-    (34, 18, "P"), (35, 18, "P"), (36, 18, "P"),
-    (37, 18, "P"), (38, 18, "P"), (39, 18, "P"),
-)
-
-_DOGGY_FEMALE_CROWN_SPANS = (
-    (7, 36, 42, "H"),
-    (8, 34, 44, "H"),
-    (9, 32, 45, "H"),
-)
-
-_DOGGY_FEMALE_BOW_DETAILS = (
-    (42, 7, "M"), (43, 7, "M"), (46, 7, "M"), (47, 7, "M"),
-    (42, 8, "M"), (43, 8, "M"), (44, 8, "M"),
-    (45, 8, "P"),
-    (46, 8, "M"), (47, 8, "M"), (48, 8, "M"),
-    (43, 9, "M"), (44, 9, "M"), (45, 9, "P"),
-    (46, 9, "M"), (47, 9, "M"),
-)
-
-_DOGGY_CHAIN_DETAILS = (
-    (17, 20), (18, 21), (19, 22),
-    (23, 20), (22, 21), (21, 22),
-    (20, 23), (36, 23),
-)
-
-
-def _animate_doggy_couple(rows: tuple[str, ...], frame: int) -> tuple[str, ...]:
-    """Keep the portrait still while tiny jewellery and bow highlights breathe."""
-
-    canvas = [list(row) for row in rows]
-    height = len(canvas)
-    width = len(canvas[0]) if canvas else 0
-    phase = frame % _DOGGY_COUPLE_FRAMES
-
-    for y, start, end, value in _DOGGY_FEMALE_CROWN_SPANS:
-        if 0 <= y < height:
-            for x in range(start, min(end + 1, width)):
-                canvas[y][x] = value
-
-    for x, y, value in _DOGGY_FEMALE_BOW_DETAILS:
-        if 0 <= y < height and 0 <= x < width:
-            canvas[y][x] = value
-
-    for x, y, value in _DOGGY_FEMALE_EYE_DETAILS:
-        if 0 <= y < height and 0 <= x < width:
-            canvas[y][x] = value
-
-    for y, start, end in _DOGGY_FEMALE_MASK_SPANS:
-        if 0 <= y < height:
-            for x in range(start, min(end + 1, width)):
-                canvas[y][x] = "m" if x in {start, end} else "M"
-
-    for x, y, value in _DOGGY_FEMALE_MASK_HIGHLIGHTS:
-        if 0 <= y < height and 0 <= x < width:
-            canvas[y][x] = value
-
-    for index, (x, y) in enumerate(_DOGGY_CHAIN_DETAILS):
-        if 0 <= y < height and 0 <= x < width:
-            canvas[y][x] = "T" if index == phase % len(_DOGGY_CHAIN_DETAILS) else "Y"
-
-    bow_pixels = [
-        (x, y)
-        for y in range(min(14, height))
-        for x in range(38, width)
-        if canvas[y][x] == "M"
-    ]
-    if bow_pixels:
-        x, y = bow_pixels[(phase // 2) % len(bow_pixels)]
-        canvas[y][x] = "P"
-
-    return tuple("".join(row) for row in canvas)
-
-
-def _compose_doggy_night(
-    art_rows: tuple[str, ...],
-    width: int,
-    scene_time: float,
-) -> tuple[str, ...]:
-    """Place the locked portrait in the reference image's sparse neon night."""
-
-    height = max(len(art_rows), 2)
-    if height % 2:
-        height += 1
-    scene_width = max(1, width)
-    tick = int(scene_time * 5)
-    canvas = [["."] * scene_width for _ in range(height)]
-
-    def put(x: int, y: int, value: str, *, soft: bool = False) -> None:
-        if 0 <= x < scene_width and 0 <= y < height:
-            if soft and canvas[y][x] != ".":
-                return
-            canvas[y][x] = value
-
-    # Pink crescent from the reference, left of the taller dog.
-    moon_x = max(2, round(scene_width * 0.25))
-    moon_y = max(1, round(height * 0.09))
-    for dy, span in ((0, (1, 2)), (1, (0, 3)), (2, (0, 3)), (3, (1, 2))):
-        for dx in range(span[0], span[1] + 1):
-            put(moon_x + dx, moon_y + dy, "M" if (tick // 3) % 2 == 0 else "m")
-    put(moon_x + 2, moon_y + 1, ".")
-    put(moon_x + 2, moon_y + 2, ".")
-
-    # Sparse pink/cyan stars; only their intensity changes, never their position.
-    spark_seed = (
-        (0.20, 0.25, "C", True),
-        (0.29, 0.17, "M", False),
-        (0.75, 0.13, "M", False),
-        (0.72, 0.29, "C", True),
-        (0.14, 0.38, "C", False),
-        (0.76, 0.48, "M", False),
-        (0.18, 0.62, "M", False),
-        (0.70, 0.70, "M", False),
-        (0.24, 0.78, "C", False),
-        (0.83, 0.58, "C", False),
-    )
-    for i, (fx, fy, color, cross) in enumerate(spark_seed):
-        if (tick + i) % 5 == 0:
-            continue
-        x = int(fx * (scene_width - 1))
-        y = int(fy * (height - 1))
-        dim = "c" if color == "C" else "m"
-        sparkle = color if (tick + i) % 2 == 0 else dim
-        put(x, y, sparkle, soft=True)
-        if cross and (tick + i) % 3:
-            put(x - 1, y, sparkle, soft=True)
-            put(x + 1, y, sparkle, soft=True)
-            put(x, y - 1, sparkle, soft=True)
-            put(x, y + 1, sparkle, soft=True)
-
-    # The couple never bobs: its approved 52x60 height and pose stay locked.
-    art_width = len(art_rows[0]) if art_rows else 0
-    art_height = len(art_rows)
-    art_left = max(0, (scene_width - art_width) // 2)
-    art_top = max(0, (height - art_height) // 2)
-    for y, row in enumerate(art_rows):
-        ty = art_top + y
-        if ty >= height:
-            break
-        for x, value in enumerate(row):
-            if value != ".":
-                put(art_left + x, ty, value)
-
-    return tuple("".join(row) for row in canvas)
-
-
-_DOGGY_DESIGN_WIDTH = 120
-_DOGGY_DESIGN_TOP_MARGIN = 1
-_DOGGY_DESIGN_BOTTOM_MARGIN = 1
-
-
-def _render_doggy_empty(
-    width: int,
-    *,
-    now: float | None = None,
-) -> StyleAndTextTuples:
-    """Render the locked 52x60 neon couple portrait and sparse night field."""
-    try:
-        clock = time.monotonic() if now is None else now
-        art_tick = int(clock * 5)
-        frame = art_tick % _DOGGY_COUPLE_FRAMES
-        rows = _animate_doggy_couple(_DOGGY_COUPLE_ART, frame)
-        terminal_height = _terminal_height()
-
-        task_height = max(1, terminal_height - 8)
-        # Keep the portrait on its native pixel grid. Fractional nearest-neighbour
-        # scaling changes which eye/mask rows survive as the terminal is resized.
-        stage_width = max(
-            1,
-            min(width, _DOGGY_DESIGN_WIDTH),
-        )
-
-        target_width = max(1, min(len(rows[0]), stage_width - 4))
-        if target_width < len(rows[0]):
-            crop_left = max(0, (len(rows[0]) - target_width) // 2)
-            rows = tuple(row[crop_left : crop_left + target_width] for row in rows)
-
-        rows = _compose_doggy_night(rows, stage_width, clock)
-        if len(rows) % 2:
-            rows = rows + (rows[-1] if rows else "." * max(1, stage_width),)
-        art_width = len(rows[0])
-        outer = max(0, (width - art_width) // 2)
-        palette = dict(_DOGGY_ART_PALETTE)
-
-        art_height = len(rows) // 2
-        top_margin = _DOGGY_DESIGN_TOP_MARGIN
-        bottom_margin = _DOGGY_DESIGN_BOTTOM_MARGIN
-        scaled_frame_height = top_margin + art_height + bottom_margin
-        vertical_slack = max(0, task_height - scaled_frame_height)
-        top_padding = top_margin + vertical_slack // 2
-
-        fragments: StyleAndTextTuples = [("", "\n" * top_padding)]
-        for top, bottom in zip(rows[::2], rows[1::2]):
-            fragments.append(("", " " * outer))
-            pairs = zip(top, bottom)
-            for pair, cells in groupby(pairs):
-                count = sum(1 for _ in cells)
-                style, glyph = _half_block(pair[0], pair[1], palette)
-                fragments.append((style, glyph * count))
-            fragments.append(("", "\n"))
-        return fragments if fragments else [("", "\n")]
-    except Exception:  # noqa: BLE001
-        # Splash must never take down the whole TUI paint path.
-        return _render_doggy_idle_panel(max(1, width))
-
-
-def _half_block(
-    top: str,
-    bottom: str,
-    palette: dict[str, str],
-) -> tuple[str, str]:
-    if top == bottom == ".":
-        return "", " "
-    top_color = palette.get(top, "#000000")
-    bottom_color = palette.get(bottom, "#000000")
-    if top == bottom:
-        return f"fg:{top_color}", "█"
-    if top == ".":
-        return f"fg:{bottom_color}", "▄"
-    if bottom == ".":
-        return f"fg:{top_color}", "▀"
-    return f"fg:{top_color} bg:{bottom_color}", "▀"
-
 
 def _task_activity_text(task: TaskView) -> str:
     if task.phase == "dispatching":
@@ -7952,12 +7298,308 @@ def _truncate_display(text: str, width: int) -> str:
     return "".join(out).rstrip() + "…"
 
 
+_TASK_MD_HEADING_RE = re.compile(r"^(#{1,3})\s+(.*)$")
+_TASK_MD_FENCE_RE = re.compile(r"^\s*```([^`]*)$")
+_TASK_MD_HR_RE = re.compile(r"^\s*(?:-{3,}|\*{3,}|_{3,})\s*$")
+_TASK_MD_TABLE_RULE_RE = re.compile(r"^\s*\|?[\s:|-]+\|?\s*$")
+_TASK_MD_QUOTE_RE = re.compile(r"^\s*>\s?(.*)$")
+_TASK_MD_ORDERED_RE = re.compile(r"^(\s*)(\d+[.)])\s+(.*)$")
+_TASK_MD_BULLET_RE = re.compile(r"^(\s*)[-*+•]\s+(.*)$")
+_TASK_MD_INLINE_RE = re.compile(
+    r"`([^`\n]+)`"
+    r"|\[([^\]\n]+)\]\(([^)\n]+)\)"
+    r"|\*\*(.+?)\*\*"
+    r"|__(.+?)__"
+    r"|~~(.+?)~~"
+    r"|(?<!\*)\*([^*\n]+)\*(?!\*)"
+)
+
+
+def _task_inline_open_target(text: str) -> str | None:
+    """Return a path/URL target for clickable inline-code spans."""
+    target = (text or "").strip().strip("\"'")
+    if not target or any(char.isspace() for char in target):
+        return None
+    if re.match(r"^https?://", target, re.IGNORECASE):
+        return target
+    if is_openable_file_path(target) or "/" in target or "\\" in target:
+        return target
+    return None
+
+
+def _task_inline_fragments(
+    text: str,
+    *,
+    base_style: str = "class:task.chat.body",
+    link_mouse: (
+        Callable[[str], Callable[[MouseEvent], object]] | None
+    ) = None,
+) -> StyleAndTextTuples:
+    """Render the small inline Markdown set used by homepage chat prose."""
+    if not text:
+        return [(base_style, "")]
+    out: StyleAndTextTuples = []
+    pos = 0
+    heading_style = base_style.startswith("class:task.chat.h")
+    for match in _TASK_MD_INLINE_RE.finditer(text):
+        if match.start() > pos:
+            out.append((base_style, text[pos : match.start()]))
+        if match.group(1) is not None:
+            code = match.group(1)
+            target = _task_inline_open_target(code)
+            if target is not None and link_mouse is not None:
+                out.append(
+                    (
+                        "class:task.chat.path",
+                        code,
+                        link_mouse(target),
+                    )
+                )
+            else:
+                out.append(("class:task.chat.code", code))
+        elif match.group(2) is not None:
+            label = match.group(2)
+            target = (match.group(3) or "").strip()
+            if target and link_mouse is not None:
+                out.append(
+                    (
+                        "class:task.chat.link",
+                        label,
+                        link_mouse(target),
+                    )
+                )
+            else:
+                out.append(("class:task.chat.link", label))
+        elif match.group(4) is not None or match.group(5) is not None:
+            strong = match.group(4) or match.group(5) or ""
+            out.append(
+                (
+                    base_style if heading_style else "class:task.chat.strong",
+                    strong,
+                )
+            )
+        elif match.group(6) is not None:
+            out.append(("class:task.chat.muted", match.group(6)))
+        else:
+            out.append(("class:task.chat.italic", match.group(7) or ""))
+        pos = match.end()
+    if pos < len(text):
+        out.append((base_style, text[pos:]))
+    return out or [(base_style, text)]
+
+
+def _wrap_task_chat_fragments(
+    fragments: StyleAndTextTuples,
+    width: int,
+) -> list[StyleAndTextTuples]:
+    """Wrap styled spans by terminal cell width without losing their styles."""
+    width = max(1, int(width))
+    rows: list[StyleAndTextTuples] = []
+    row: StyleAndTextTuples = []
+    used = 0
+
+    def append_piece(
+        style: str,
+        piece: str,
+        mouse: Callable[[MouseEvent], object] | None,
+    ) -> None:
+        last_mouse = (
+            row[-1][2]
+            if row and len(row[-1]) >= 3
+            else None
+        )
+        if row and row[-1][0] == style and last_mouse is mouse:
+            if mouse is None:
+                row[-1] = (style, row[-1][1] + piece)
+            else:
+                row[-1] = (style, row[-1][1] + piece, mouse)
+        else:
+            if mouse is None:
+                row.append((style, piece))
+            else:
+                row.append((style, piece, mouse))
+
+    for item in fragments:
+        style = item[0] if item else ""
+        text = item[1] if len(item) > 1 else ""
+        mouse = item[2] if len(item) >= 3 else None
+        for char in text:
+            char_width = max(0, get_cwidth(char))
+            if row and used + char_width > width:
+                rows.append(row)
+                row = []
+                used = 0
+            append_piece(style, char, mouse)
+            used += char_width
+    if row:
+        rows.append(row)
+    return rows or [[("class:task.chat.body", "")]]
+
+
+def _pad_task_chat_rows(
+    rows: list[StyleAndTextTuples],
+    width: int,
+    style: str,
+) -> list[StyleAndTextTuples]:
+    """Extend a semantic block background to the full reading column."""
+    out: list[StyleAndTextTuples] = []
+    for row in rows:
+        used = sum(get_cwidth(item[1]) for item in row)
+        padded = list(row)
+        if used < width:
+            padded.append((style, " " * (width - used)))
+        out.append(padded)
+    return out
+
+
+def _render_task_chat_rows(
+    text: str,
+    width: int,
+    *,
+    link_mouse: (
+        Callable[[str], Callable[[MouseEvent], object]] | None
+    ) = None,
+) -> list[StyleAndTextTuples]:
+    """Homepage Markdown-lite with readable hierarchy and no raw markers."""
+    width = max(1, int(width))
+    rows: list[StyleAndTextTuples] = []
+    in_fence = False
+    raw_text = (text or "").replace("\r\n", "\n").replace("\r", "\n")
+
+    for raw in raw_text.split("\n"):
+        fence = _TASK_MD_FENCE_RE.match(raw)
+        if fence:
+            if in_fence:
+                in_fence = False
+            else:
+                in_fence = True
+                language = (fence.group(1) or "").strip()
+                if language:
+                    rows.extend(
+                        _pad_task_chat_rows(
+                            _wrap_task_chat_fragments(
+                                [
+                                    ("class:task.chat.code.rail", "│ "),
+                                    ("class:task.chat.code.meta", language),
+                                ],
+                                width,
+                            ),
+                            width,
+                            "class:task.chat.code.block",
+                        )
+                    )
+            continue
+
+        if in_fence:
+            rows.extend(
+                _pad_task_chat_rows(
+                    _wrap_task_chat_fragments(
+                        [
+                            ("class:task.chat.code.rail", "│ "),
+                            *highlight_code_line(
+                                raw or " ",
+                                style_prefix="task.chat.code",
+                            ),
+                        ],
+                        width,
+                    ),
+                    width,
+                    "class:task.chat.code.block",
+                )
+            )
+            continue
+
+        heading = _TASK_MD_HEADING_RE.match(raw)
+        if heading:
+            level = len(heading.group(1))
+            style = {
+                1: "class:task.chat.h1",
+                2: "class:task.chat.h2",
+            }.get(level, "class:task.chat.h3")
+            rows.extend(
+                _wrap_task_chat_fragments(
+                    _task_inline_fragments(
+                        heading.group(2),
+                        base_style=style,
+                        link_mouse=link_mouse,
+                    ),
+                    width,
+                )
+            )
+            continue
+
+        if _TASK_MD_HR_RE.match(raw):
+            rows.append(
+                [("class:task.chat.rule", "─" * width)]
+            )
+            continue
+
+        if _TASK_MD_TABLE_RULE_RE.match(raw) and "|" in raw:
+            rows.extend(
+                _wrap_task_chat_fragments(
+                    [("class:task.chat.rule", raw.strip())],
+                    width,
+                )
+            )
+            continue
+
+        quote = _TASK_MD_QUOTE_RE.match(raw)
+        if quote:
+            spans: StyleAndTextTuples = [
+                ("class:task.chat.code.rail", "│ "),
+            ]
+            spans.extend(
+                _task_inline_fragments(
+                    quote.group(1),
+                    base_style="class:task.chat.quote",
+                    link_mouse=link_mouse,
+                )
+            )
+            rows.extend(_wrap_task_chat_fragments(spans, width))
+            continue
+
+        ordered = _TASK_MD_ORDERED_RE.match(raw)
+        if ordered:
+            indent, marker, body = ordered.groups()
+            spans = [
+                ("class:task.chat.muted", indent),
+                ("class:task.chat.marker", f"{marker} "),
+            ]
+            spans.extend(
+                _task_inline_fragments(body, link_mouse=link_mouse)
+            )
+            rows.extend(_wrap_task_chat_fragments(spans, width))
+            continue
+
+        bullet = _TASK_MD_BULLET_RE.match(raw)
+        if bullet:
+            indent, body = bullet.groups()
+            spans = [
+                ("class:task.chat.muted", indent),
+                ("class:task.chat.marker", "• "),
+            ]
+            spans.extend(
+                _task_inline_fragments(body, link_mouse=link_mouse)
+            )
+            rows.extend(_wrap_task_chat_fragments(spans, width))
+            continue
+
+        rows.extend(
+            _wrap_task_chat_fragments(
+                _task_inline_fragments(raw, link_mouse=link_mouse),
+                width,
+            )
+        )
+
+    return rows or [[("class:task.chat.body", "")]]
+
+
 def _wrap_display_lines(
     text: str, width: int, *, max_lines: int | None = 40
 ) -> list[str]:
     """Wrap text to display-cell width.
 
-    ``max_lines=None`` means no row cap (in-progress task cards). A positive
+    ``max_lines=None`` means no row cap in the reading stream. A positive
     int still hard-stops after that many display rows (finished 2-line abstract).
     """
     width = max(1, int(width))

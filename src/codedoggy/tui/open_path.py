@@ -53,6 +53,12 @@ _CODE_EXTS = (
 VIEW_IMAGE_LABEL = "查看图片"
 OPEN_FILE_LABEL = "打开文件"
 
+_IMAGE_CHIP_RE = re.compile(
+    rf"{re.escape(VIEW_IMAGE_LABEL)}\("
+    r"(?P<path>\"[^\"]+\"|'[^']+'|[^)]+)"
+    r"\)"
+)
+
 _TOOL_PATH_KEYS = (
     "path",
     "target_file",
@@ -108,6 +114,29 @@ def link_label_for_path(path: str) -> str:
 def extract_image_paths(text: str | None) -> list[str]:
     """Pull image paths from tool JSON / prose (order-preserving, unique)."""
     return [p for p in extract_file_paths(text) if is_image_path(p)]
+
+
+def extract_image_chip_paths(text: str | None) -> list[str]:
+    """Return the canonical local paths represented by pasted image chips."""
+    if not text:
+        return []
+    found: list[str] = []
+    seen: set[str] = set()
+    for match in _IMAGE_CHIP_RE.finditer(str(text)):
+        path = match.group("path").strip().strip("\"'")
+        key = path.replace("\\", "/").lower()
+        if not path or key in seen:
+            continue
+        seen.add(key)
+        found.append(path)
+    return found
+
+
+def strip_image_chips(text: str | None) -> str:
+    """Remove display-only image chips before sending text to the model."""
+    if not text:
+        return ""
+    return _IMAGE_CHIP_RE.sub("", str(text)).strip()
 
 
 def extract_file_paths(text: str | None) -> list[str]:
@@ -311,12 +340,9 @@ def path_under_cursor(text: str, index: int) -> str | None:
     """Best-effort path token covering ``index`` in a prompt buffer."""
     if not text or index < 0 or index > len(text):
         return None
-    for match in re.finditer(
-        rf"{re.escape(VIEW_IMAGE_LABEL)}\(([^)]+)\)",
-        text,
-    ):
+    for match in _IMAGE_CHIP_RE.finditer(text):
         if match.start() <= index <= match.end():
-            return match.group(1).strip().strip("\"'")
+            return match.group("path").strip().strip("\"'")
     # Expand to whitespace-delimited token.
     left = index
     while left > 0 and not text[left - 1].isspace():

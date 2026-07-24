@@ -21,6 +21,7 @@ from codedoggy.tui.open_path import (
     paths_from_detail_record,
     tool_paths_from_arguments,
 )
+from codedoggy.tui.syntax import highlight_code_line
 
 # Grok injects plan/MCP/scheduler hints as <system-reminder>...</system-reminder>
 # on the model-facing user turn. Never paint those in the TUI transcript.
@@ -149,6 +150,7 @@ def snapshot_from_messages(
     agent_id: str,
     agent_label: str,
     task_title: str,
+    initial_user_text: str | None = None,
     status: str = "running",
 ) -> AgentDetailSnapshot:
     """Build a full detail snapshot from existing OpenAI-style messages.
@@ -157,12 +159,15 @@ def snapshot_from_messages(
     ``Message`` instances and restored session records. System prompts stay
     hidden. User instructions, assistant prose, tool arguments, tool outputs,
     code, diffs and command results remain visible. The initial instruction is
-    suppressed only when it exactly duplicates the task title.
+    suppressed when it duplicates the separately rendered task prompt.
     """
 
     records: list[DetailRecord] = []
     tool_positions: dict[str, int] = {}
     sequence = 1
+    initial_instruction = _clean_text(
+        task_title if initial_user_text is None else initial_user_text
+    )
     for message in messages:
         role = _read_field(message, "role", "")
         role_value = str(getattr(role, "value", role)).lower()
@@ -173,9 +178,12 @@ def snapshot_from_messages(
             # Pure plan/MCP system-reminder injects: hide entirely from the UI.
             if not content:
                 continue
-            # Skip the first user line when it only restates the task title
-            # (the card / modal header already show that text).
-            if content and not (not records and content == _clean_text(task_title)):
+            # The homepage owns the initial user prompt. Image chips are
+            # display-only, so compare against the model-facing text rather
+            # than the structural title that still contains the chip.
+            if content and not (
+                not records and content == initial_instruction
+            ):
                 records.append(
                     DetailRecord(
                         id=f"message-{sequence}",
@@ -776,7 +784,7 @@ _UL_RE = re.compile(r"^(\s*)([-*•])\s+(.*)$")
 _HEADING_RE = re.compile(r"^(#{1,3})\s+(.*)$")
 _QUOTE_RE = re.compile(r"^(\s*)>\s?(.*)$")
 _FENCE_RE = re.compile(r"^(\s*)```([^\s`]*)?")
-# Inline spans (Grok markdown Strong/Emphasis spirit). Order: code, bold, italic.
+# Inline spans. Markdown strong uses color only; weight is intentionally absent.
 _INLINE_CODE_RE = re.compile(r"`([^`]+)`")
 _INLINE_BOLD_RE = re.compile(r"\*\*(.+?)\*\*|__(.+?)__")
 _INLINE_ITALIC_RE = re.compile(r"(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)|(?<!_)_(?!_)(.+?)(?<!_)_(?!_)")
@@ -1076,7 +1084,7 @@ def _render_text_block(text: str, width: int) -> StyleAndTextTuples:
             body = quote.group(2)
             for piece in _wrap_display(body, max(1, width - 6)):
                 fragments.append(("class:detail.code.rail", "  ┃ "))
-                # Quote body stays italic muted; still honor inline code/bold.
+                # Quote body stays italic muted; still honor inline code/strong.
                 for style, txt, *rest in _render_inline_md(piece):
                     if style == "class:detail.text":
                         style = "class:detail.md.quote"
@@ -1156,7 +1164,7 @@ def _render_text_block(text: str, width: int) -> StyleAndTextTuples:
 
 
 def _render_inline_md(text: str) -> StyleAndTextTuples:
-    """Grok-lite inline: `code`, **bold**, *italic*, ~~strike~~."""
+    """Grok-lite inline: code, strong color, italic, and strike."""
 
     if not text:
         return [("class:detail.text", "")]
@@ -1186,18 +1194,18 @@ def _render_inline_md(text: str) -> StyleAndTextTuples:
 
 
 def _render_inline_emphasis(text: str) -> StyleAndTextTuples:
-    """Apply bold / italic / strike on a non-code span."""
+    """Apply strong color / italic / strike on a non-code span."""
 
     if not text:
         return []
-    # Process bold first, then italic on remaining plain spans.
+    # Process Markdown strong first, then italic on remaining plain spans.
     out: StyleAndTextTuples = []
     pos = 0
     for match in _INLINE_BOLD_RE.finditer(text):
         if match.start() > pos:
             out.extend(_render_inline_italic_strike(text[pos : match.start()]))
-        bold = match.group(1) if match.group(1) is not None else match.group(2)
-        out.append(("class:detail.md.bold", bold or ""))
+        strong = match.group(1) if match.group(1) is not None else match.group(2)
+        out.append(("class:detail.md.strong", strong or ""))
         pos = match.end()
     if pos < len(text):
         out.extend(_render_inline_italic_strike(text[pos:]))
@@ -1236,141 +1244,8 @@ def _render_inline_italic_only(text: str) -> StyleAndTextTuples:
     return out or [("class:detail.text", text)]
 
 
-_CODE_KEYWORDS = frozenset(
-    {
-        "and",
-        "as",
-        "assert",
-        "async",
-        "await",
-        "break",
-        "class",
-        "continue",
-        "def",
-        "del",
-        "elif",
-        "else",
-        "except",
-        "False",
-        "finally",
-        "for",
-        "from",
-        "global",
-        "if",
-        "import",
-        "in",
-        "is",
-        "lambda",
-        "None",
-        "nonlocal",
-        "not",
-        "or",
-        "pass",
-        "raise",
-        "return",
-        "True",
-        "try",
-        "while",
-        "with",
-        "yield",
-        "const",
-        "let",
-        "var",
-        "function",
-        "return",
-        "typeof",
-        "new",
-        "this",
-        "void",
-        "null",
-        "undefined",
-        "export",
-        "default",
-        "interface",
-        "type",
-        "enum",
-        "public",
-        "private",
-        "protected",
-        "static",
-        "struct",
-        "impl",
-        "fn",
-        "mut",
-        "use",
-        "mod",
-        "pub",
-        "crate",
-        "self",
-        "Self",
-        "match",
-        "loop",
-        "move",
-        "package",
-        "func",
-        "go",
-        "defer",
-        "chan",
-        "map",
-        "range",
-        "select",
-        "case",
-        "switch",
-    }
-)
-
-_TOKEN_RE = re.compile(
-    r"(?P<cmt>//.*?$|#.*?$|/\*.*?\*/)"
-    r"|(?P<str>'''(?:\\.|[^'\\])*'''|\"\"\"(?:\\.|[^\"\\])*\"\"\""
-    r"|'(?:\\.|[^'\\])*'|\"(?:\\.|[^\"\\])*\"|`(?:\\.|[^`\\])*`)"
-    r"|(?P<num>\b\d+(?:\.\d+)?(?:[eE][+-]?\d+)?\b)"
-    r"|(?P<id>\b[A-Za-z_][A-Za-z0-9_]*\b)"
-    r"|(?P<sym>[^\sA-Za-z0-9_]+)"
-    r"|(?P<ws>\s+)",
-    re.MULTILINE,
-)
-
-
 def _highlight_code_line(line: str) -> StyleAndTextTuples:
-    """Heuristic token coloring — muted, no glowing pure white."""
-
-    if not line:
-        return [("class:detail.code.plain", "")]
-    # Full-line comments / shell prompts
-    stripped = line.lstrip()
-    if stripped.startswith("#") or stripped.startswith("//"):
-        return [("class:detail.code.cmt", line)]
-    return _highlight_mixed(line)
-
-
-def _highlight_mixed(line: str) -> StyleAndTextTuples:
-    fragments: StyleAndTextTuples = []
-    pos = 0
-    for match in _TOKEN_RE.finditer(line):
-        if match.start() > pos:
-            fragments.append(("class:detail.code.plain", line[pos : match.start()]))
-        if match.group("cmt") is not None:
-            fragments.append(("class:detail.code.cmt", match.group("cmt")))
-        elif match.group("str") is not None:
-            fragments.append(("class:detail.code.str", match.group("str")))
-        elif match.group("num") is not None:
-            fragments.append(("class:detail.code.num", match.group("num")))
-        elif match.group("id") is not None:
-            ident = match.group("id")
-            style = (
-                "class:detail.code.kw"
-                if ident in _CODE_KEYWORDS
-                else "class:detail.code.plain"
-            )
-            fragments.append((style, ident))
-        elif match.group("sym") is not None:
-            fragments.append(("class:detail.code.sym", match.group("sym")))
-        elif match.group("ws") is not None:
-            fragments.append(("class:detail.code.plain", match.group("ws")))
-        pos = match.end()
-    if pos < len(line):
-        fragments.append(("class:detail.code.plain", line[pos:]))
-    return fragments or [("class:detail.code.plain", line)]
+    return highlight_code_line(line, style_prefix="detail.code")
 
 
 def _tool_headline(name: str, arguments: Any) -> str:

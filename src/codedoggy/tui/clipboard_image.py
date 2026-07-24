@@ -1,8 +1,8 @@
-"""Clipboard image → local file path (for TUI paste).
+"""Clipboard image → local attachment (for TUI paste).
 
 Terminal paste only carries text. When the OS clipboard holds a bitmap,
 we dump it under ``.codedoggy/attachments/`` and return that path so the
-user (and image_edit tools) can use a normal filesystem reference.
+TUI can render a chip and submit the same file as structured model input.
 
 Windows notes
 -------------
@@ -70,6 +70,99 @@ def get_system_clipboard_text() -> str | None:
     return _linux_clipboard_text()
 
 
+def set_system_clipboard_text(text: str) -> bool:
+    """Write plain text to the OS clipboard."""
+    if sys.platform == "win32":
+        return _set_windows_clipboard_text(text)
+    if sys.platform == "darwin":
+        return _set_process_clipboard_text(["pbcopy"], text)
+    if shutil.which("wl-copy"):
+        return _set_process_clipboard_text(["wl-copy"], text)
+    if shutil.which("xclip"):
+        return _set_process_clipboard_text(
+            ["xclip", "-selection", "clipboard"],
+            text,
+        )
+    return False
+
+
+def _set_process_clipboard_text(command: list[str], text: str) -> bool:
+    try:
+        proc = subprocess.run(
+            command,
+            input=text,
+            text=True,
+            capture_output=True,
+            timeout=3,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return proc.returncode == 0
+
+
+def _set_windows_clipboard_text(text: str) -> bool:
+    """CF_UNICODETEXT writer; ownership transfers to Windows on success."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+    except ImportError:
+        return False
+
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    CF_UNICODETEXT = 13
+    GMEM_MOVEABLE = 0x0002
+
+    user32.OpenClipboard.argtypes = [wintypes.HWND]
+    user32.OpenClipboard.restype = wintypes.BOOL
+    user32.EmptyClipboard.argtypes = []
+    user32.EmptyClipboard.restype = wintypes.BOOL
+    user32.SetClipboardData.argtypes = [wintypes.UINT, wintypes.HANDLE]
+    user32.SetClipboardData.restype = wintypes.HANDLE
+    user32.CloseClipboard.argtypes = []
+    user32.CloseClipboard.restype = wintypes.BOOL
+    kernel32.GlobalAlloc.argtypes = [wintypes.UINT, ctypes.c_size_t]
+    kernel32.GlobalAlloc.restype = wintypes.HGLOBAL
+    kernel32.GlobalLock.argtypes = [wintypes.HGLOBAL]
+    kernel32.GlobalLock.restype = ctypes.c_void_p
+    kernel32.GlobalUnlock.argtypes = [wintypes.HGLOBAL]
+    kernel32.GlobalUnlock.restype = wintypes.BOOL
+    kernel32.GlobalFree.argtypes = [wintypes.HGLOBAL]
+    kernel32.GlobalFree.restype = wintypes.HGLOBAL
+
+    payload = (text or "") + "\0"
+    size = len(payload.encode("utf-16-le"))
+    handle = kernel32.GlobalAlloc(GMEM_MOVEABLE, size)
+    if not handle:
+        return False
+    owned_by_windows = False
+    try:
+        ptr = kernel32.GlobalLock(handle)
+        if not ptr:
+            return False
+        try:
+            source = ctypes.create_unicode_buffer(payload)
+            ctypes.memmove(ptr, source, size)
+        finally:
+            kernel32.GlobalUnlock(handle)
+
+        if not user32.OpenClipboard(None):
+            return False
+        try:
+            if not user32.EmptyClipboard():
+                return False
+            if not user32.SetClipboardData(CF_UNICODETEXT, handle):
+                return False
+            owned_by_windows = True
+            return True
+        finally:
+            user32.CloseClipboard()
+    finally:
+        if not owned_by_windows:
+            kernel32.GlobalFree(handle)
+
+
 def coerce_image_path_text(
     text: str | None, *, cwd: Path | str | None = None
 ) -> Path | None:
@@ -122,7 +215,7 @@ def insert_path_token(path: Path | str, *, cwd: Path | str | None = None) -> str
 
 
 def insert_image_chip(path: Path | str, *, cwd: Path | str | None = None) -> str:
-    """Paste form: visible「查看图片」+ path for the model / Ctrl+click."""
+    """Paste form: visible image chip for Ctrl+click and attachment lookup."""
     from codedoggy.tui.open_path import VIEW_IMAGE_LABEL
 
     return f"{VIEW_IMAGE_LABEL}({insert_path_token(path, cwd=cwd)})"

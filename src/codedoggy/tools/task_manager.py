@@ -124,6 +124,7 @@ class BackgroundTaskManager:
     ) -> None:
         self._lock = threading.RLock()
         self._tasks: dict[str, _LiveTask] = {}
+        self._listeners: list[Callable[[str, TaskSnapshot], None]] = []
         self._max_runtime_s = max_runtime_s
         self._completed_ttl_s = completed_ttl_s
         self._max_output_chars = max_output_chars
@@ -135,6 +136,29 @@ class BackgroundTaskManager:
     @property
     def work_dir(self) -> Path:
         return self._work_dir
+
+    def add_listener(self, cb: Callable[[str, TaskSnapshot], None]) -> None:
+        with self._lock:
+            if cb not in self._listeners:
+                self._listeners.append(cb)
+
+    def remove_listener(self, cb: Callable[[str, TaskSnapshot], None]) -> None:
+        with self._lock:
+            try:
+                self._listeners.remove(cb)
+            except ValueError:
+                pass
+
+    def _notify(self, event: str, snap: TaskSnapshot) -> None:
+        """Fire lifecycle listeners outside the manager lock. Swallows listener errors."""
+        with self._lock:
+            listeners = list(self._listeners)
+        snap_copy = snap.copy()
+        for cb in listeners:
+            try:
+                cb(event, snap_copy)
+            except Exception:  # noqa: BLE001
+                pass
 
     def spawn(
         self,
@@ -195,7 +219,11 @@ class BackgroundTaskManager:
                     out_path.write_text(live.snap.output, encoding="utf-8", errors="replace")
                 except OSError:
                     pass
+                fail_snap = live.snap.copy()
             live.done.set()
+            # Already completed at spawn: started then failed
+            self._notify("started", fail_snap)
+            self._notify("failed", fail_snap)
             return BackgroundHandle(task_id=task_id, output_file=str(out_path), pid=None)
 
         if sys.platform == "win32":
@@ -209,6 +237,7 @@ class BackgroundTaskManager:
         with live.lock:
             live.proc = proc
             live.snap.pid = proc.pid
+            started_snap = live.snap.copy()
 
         runtime = self._max_runtime_s if max_runtime_s is None else max_runtime_s
         t = threading.Thread(
@@ -218,6 +247,7 @@ class BackgroundTaskManager:
             daemon=True,
         )
         t.start()
+        self._notify("started", started_snap)
         return BackgroundHandle(task_id=task_id, output_file=str(out_path), pid=proc.pid)
 
     def adopt(
@@ -337,6 +367,7 @@ class BackgroundTaskManager:
             _kill_process_tree(proc)
         # Wait briefly for reaper
         live.done.wait(timeout=3.0)
+        notify_snap: TaskSnapshot | None = None
         with live.lock:
             live.snap.explicitly_killed = True
             if not live.snap.completed:
@@ -345,6 +376,10 @@ class BackgroundTaskManager:
                 live.snap.signal = live.snap.signal or "killed"
                 live.snap.exit_code = live.snap.exit_code if live.snap.exit_code is not None else -1
                 live.done.set()
+                # Reaper did not finish first — notify killed here
+                notify_snap = live.snap.copy()
+        if notify_snap is not None:
+            self._notify("killed", notify_snap)
         return "killed", "Task was terminated successfully"
 
     def known_ids(self) -> list[str]:
@@ -444,15 +479,29 @@ class BackgroundTaskManager:
             text = text[: self._max_output_chars]
 
         with live.lock:
+            # Kill may have force-completed already; still refresh fields, skip re-notify
+            already_completed = live.snap.completed
             live.snap.output = text
             live.snap.truncated = truncated or live.snap.truncated
             live.snap.exit_code = exit_code
             live.snap.signal = signal_name or live.snap.signal
             live.snap.completed = True
-            live.snap.end_time = time.time()
+            live.snap.end_time = live.snap.end_time if already_completed else time.time()
             if live.kill_requested:
                 live.snap.explicitly_killed = True
+            done_snap = live.snap.copy()
         live.done.set()
+
+        if not already_completed:
+            if done_snap.explicitly_killed:
+                event = "killed"
+            else:
+                label = done_snap.status_label()
+                if label == "completed":
+                    event = "completed"
+                else:
+                    event = "failed"
+            self._notify(event, done_snap)
 
     def _refresh_output_locked(self, live: _LiveTask) -> None:
         """If still running, refresh output from file for snapshots."""

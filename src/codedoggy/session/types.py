@@ -7,6 +7,8 @@ from enum import Enum
 from typing import Any
 from uuid import uuid4
 
+from codedoggy.attachments import ImageAttachment
+
 
 class SessionId(str):
     """Opaque session identifier."""
@@ -41,6 +43,7 @@ class TurnRequest:
     """Input for one agent turn."""
 
     text: str
+    attachments: tuple[ImageAttachment, ...] = ()
     prompt_id: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 

@@ -65,7 +65,22 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         interactive = not args.plain and sys.stdin.isatty() and sys.stdout.isatty()
         if interactive:
-            from codedoggy.tui import run_tui
+            # Grok-shell port lives in tui_v2 (source translation of xai-grok-pager).
+            # CODEDOGGY_TUI=legacy forces the old task-card cockpit.
+            import os
+
+            if (os.environ.get("CODEDOGGY_TUI") or "").strip().lower() in {
+                "legacy",
+                "v1",
+                "cockpit",
+                "old",
+            }:
+                from codedoggy.tui import run_tui
+            else:
+                try:
+                    from codedoggy.tui_v2 import run_tui
+                except ImportError:
+                    from codedoggy.tui import run_tui
 
             run_tui(session, initial_prompt=args.prompt)
             return 0

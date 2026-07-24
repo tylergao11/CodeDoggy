@@ -8,6 +8,7 @@ from uuid import uuid4
 
 from codedoggy.session.types import TurnRequest, TurnResult, TurnStatus
 from codedoggy.tools.registry import FinalizedToolset
+from codedoggy.attachments import provider_data_with_attachments
 from codedoggy.turn.hooks import LoopHooks
 from codedoggy.turn.loop import run_agent_loop
 from codedoggy.turn.sampler import Sampler
@@ -321,7 +322,10 @@ class AgentTurnRunner:
                     tool_call_id=msg.tool_call_id,
                     tool_calls=tool_calls,
                     reasoning_content=msg.reasoning_content,
-                    provider_data=msg.provider_data,
+                    provider_data=provider_data_with_attachments(
+                        msg.provider_data,
+                        msg.attachments,
+                    ),
                     turn_id=archive_turn_id,
                     outcome="pending",
                 )
@@ -387,6 +391,7 @@ class AgentTurnRunner:
 
         loop = run_agent_loop(
             user_text=request.text,
+            user_attachments=request.attachments,
             sampler=self.sampler,
             tools=tools,
             cwd=cwd,

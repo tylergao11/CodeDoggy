@@ -23,6 +23,13 @@ htmlcov/
 .stress_workspace/
 *.db
 .goto_index.json
+.grok/
+sessions/
+
+# One-shot / local scratch (never commit)
+scripts/_extract_*.py
+scripts/_patch_*.py
+scripts/stress_*.py
 
 # IDE / OS
 .idea/

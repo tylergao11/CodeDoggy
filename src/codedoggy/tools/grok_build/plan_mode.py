@@ -201,7 +201,10 @@ def format_enter_plan_prompt(
         "3. Talk with the user in ordinary conversation; "
         f"optionally use {ask} only for structured multi-choice when that helps\n"
         "4. Design a concrete implementation strategy\n"
-        "5. Write your plan to the plan file above\n"
+        "5. Write the plan file as the approval contract itself. Keep only "
+        "decision-critical sections: Goal, Execution Steps, Impact Scope, "
+        "Risks / Irreversible Actions, and Verification. Do not include private "
+        "reasoning, tool logs, agent rosters, plan history, or debug metadata.\n"
         f"6. When ready, use {exit_name} so the user can approve — then implement "
         "in auto mode after approval."
     )

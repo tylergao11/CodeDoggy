@@ -3,7 +3,8 @@
 CodeDoggy 的运行时结构说明。实现以本仓库源码为准。
 
 **整合定位：** **GrokBuild** 基础工程 + **Hermes** 记忆，在 CodeDoggy 壳上融合。
-不是完整 Grok pager 或完整 Hermes 宿主的逐文件复刻。
+TUI 默认产品面为 **Grok 会话壳**（`codedoggy.tui_v2`，对照 `D:\grok-build` pager）；
+旧任务卡驾驶舱仅 `CODEDOGGY_TUI=legacy`。品牌 / Ctrl+L / 粘贴图片为 Doggy 例外。
 
 ## 融合硬规则（禁止混用）
 

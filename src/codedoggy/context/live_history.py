@@ -12,7 +12,16 @@ from __future__ import annotations
 
 from copy import deepcopy
 
+from codedoggy.attachments import ImageAttachment
 from codedoggy.turn.types import Message, Role
+
+_DIRECT_IMAGE_REMINDER = (
+    "<system-reminder>\n"
+    "This user message includes direct multimodal image input. Inspect the "
+    "image pixels directly. Local filesystem tools return image metadata, not "
+    "vision; do not use them to decide whether you can see the attached image."
+    "\n</system-reminder>"
+)
 
 
 def strip_system_messages(messages: list[Message]) -> list[Message]:
@@ -24,6 +33,7 @@ def seed_messages(
     *,
     system_prompt: str | None,
     user_text: str,
+    user_attachments: tuple[ImageAttachment, ...] = (),
     prior_messages: list[Message] | None = None,
 ) -> list[Message]:
     """Build the opening transcript for one prompt (Grok continuous session).
@@ -41,7 +51,13 @@ def seed_messages(
         # Grok: never carry orphan tool_result / broken pairs into next sample
         prior = sanitize_tool_pairs(prior)
         out.extend(prior)
-    out.append(Message(role=Role.USER, content=user_text))
+    out.append(
+        Message(
+            role=Role.USER,
+            content=user_text,
+            attachments=tuple(user_attachments),
+        )
+    )
     return out
 
 
@@ -65,11 +81,23 @@ def model_sample_messages(
         if msg.role is not Role.USER:
             continue
         content = msg.content or ""
-        if not isinstance(content, str):
-            content = str(content)
-        if _is_synthetic_user_content(content):
+        if isinstance(content, str):
+            if not _is_synthetic_user_content(content):
+                content = user_query(content)
+            if msg.attachments:
+                content = f"{content}\n\n{_DIRECT_IMAGE_REMINDER}"
+                msg.content = [
+                    {"type": "text", "text": content},
+                    *(item.as_content_part() for item in msg.attachments),
+                ]
+            else:
+                msg.content = content
             continue
-        msg.content = user_query(content)
+
+        if msg.attachments:
+            parts = list(content) if isinstance(content, list) else []
+            parts.extend(item.as_content_part() for item in msg.attachments)
+            msg.content = parts
 
     prefix = (user_message_prefix or "").strip()
     if prefix:
@@ -101,7 +129,8 @@ def copy_message(m: Message) -> Message:
     """Shallow copy so later prune/fold cannot mutate archived siblings."""
     return Message(
         role=m.role,
-        content=m.content,
+        content=deepcopy(m.content),
+        attachments=tuple(m.attachments),
         tool_calls=deepcopy(m.tool_calls) if m.tool_calls else None,
         tool_call_id=m.tool_call_id,
         name=m.name,

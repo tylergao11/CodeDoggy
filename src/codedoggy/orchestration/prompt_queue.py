@@ -69,9 +69,21 @@ class InterjectionBuffer:
         self._items: deque[Interjection] = deque()
         self._lock = threading.Lock()
 
-    def push(self, text: str, *, prompt_id: str | None = None) -> None:
+    def push(
+        self,
+        text: str,
+        *,
+        prompt_id: str | None = None,
+        images: list[Any] | None = None,
+    ) -> None:
         with self._lock:
-            self._items.append(Interjection(text=text, prompt_id=prompt_id))
+            self._items.append(
+                Interjection(
+                    text=text,
+                    images=list(images or []),
+                    prompt_id=prompt_id,
+                )
+            )
 
     def is_empty(self) -> bool:
         with self._lock:

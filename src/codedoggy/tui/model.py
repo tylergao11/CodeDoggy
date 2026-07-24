@@ -1,4 +1,4 @@
-"""Thread-safe presentation snapshots for the boss-view TUI."""
+"""Thread-safe presentation snapshots for the TUI reading stream."""
 
 from __future__ import annotations
 
@@ -21,20 +21,23 @@ class AgentView:
 
 @dataclass(slots=True)
 class TaskView:
-    """A boss-level task and the reports that belong to it."""
+    """One task boundary and the canonical chat participants it contains."""
 
     id: str
     title: str
+    # Exact user text shown in the reading stream. ``title`` is only the
+    # whitespace-normalized structural label; it must never replace chat truth.
+    prompt: str = ""
     status: str = "running"
     phase: str = "dispatching"
     reporter: str = "MAIN"
     report: str = ""
     agents: list[AgentView] = field(default_factory=list)
-    # GrokBuild plan lifecycle hung on the task card (not go-steer plan-first).
-    # none | consent | planning | awaiting_approval | approved | abandoned
+    # GrokBuild plan lifecycle exposed only when approval is required.
+    # none | planning | awaiting_approval | approved | abandoned
     plan_state: str = "none"
     plan_file: str = ""
-    # Wall-clock duration for the homepage card (set on create / terminal).
+    # Wall-clock duration for the homepage task section (set on create / terminal).
     started_at: float = 0.0
     ended_at: float | None = None
 
@@ -56,6 +59,7 @@ class TaskLedger:
             task = TaskView(
                 id=task_id,
                 title=title,
+                prompt=prompt,
                 agents=[AgentView(id=f"{task_id}:main", label="MAIN", status="running")],
                 started_at=time.time(),
             )
@@ -113,10 +117,9 @@ class TaskLedger:
                 task.ended_at = time.time()
             if task.started_at <= 0:
                 task.started_at = task.ended_at
-            # Finished cards must not keep draft/review chrome ("计划起草中").
+            # Finished tasks must not retain stale planning/approval state.
             if task.plan_state in {
                 "planning",
-                "consent",
                 "awaiting_approval",
             }:
                 task.plan_state = "none"
@@ -232,7 +235,7 @@ class TaskLedger:
         Model stream owners are intentionally abandonable on cancellation.  A
         callback already in flight may therefore arrive after the turn commits
         its terminal state.  This atomic ledger fence prevents that old write
-        from reviving a completed/failed/cancelled card as ``running``.
+        from reviving a completed/failed/cancelled task as ``running``.
         """
         with self._lock:
             task = self._find_task(task_id)
